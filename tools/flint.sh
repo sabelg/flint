@@ -496,6 +496,131 @@ cmd_pack() {
     (cd "$CALLER_PWD" && "${ROOT}/build/flint-pack" "$@")
 }
 
+# Studio editor-model suites. They each import the whole Studio app, so they build at -O1
+# (an -O3 build of each takes 4-8 min); `FLINT_STUDIO_TEST_OPT=-O3` restores full optimisation.
+STUDIO_TEST_SUITES=(test_studio_phase0 test_studio_viewport test_studio_identity test_studio_sessions test_studio_core_bugs test_studio_redesign_ui test_studio_agent_theatre test_studio_review_fixes test_studio_scene_integrity test_studio_palette_ux test_studio_hierarchy_cache test_debug_line_handedness)
+
+# Parallel Studio suite builds: FLINT_STUDIO_TEST_JOBS, else one job per ~8 GB of available
+# memory (each compile of the whole editor peaks at a few GB), capped at 4.
+studio_test_jobs() {
+    if [[ -n "${FLINT_STUDIO_TEST_JOBS:-}" ]]; then
+        echo "$FLINT_STUDIO_TEST_JOBS"
+        return
+    fi
+    local avail_kb jobs
+    avail_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    jobs=$(( ${avail_kb:-0} / (8 * 1024 * 1024) ))
+    (( jobs > 4 )) && jobs=4
+    (( jobs < 1 )) && jobs=1
+    echo "$jobs"
+}
+
+build_studio_suites() {
+    local opt="${FLINT_STUDIO_TEST_OPT:--O1}"
+    local name jobs fail=0
+    local pids=()
+    jobs="$(studio_test_jobs)"
+    resolve_mojo
+    write_build_stamp "$MOJO_BIN"
+    mkdir -p "${ROOT}/build/studio-tests"
+    for name in "${STUDIO_TEST_SUITES[@]}"; do
+        [[ -f "${ROOT}/tests/${name}.mojo" ]] || continue
+        echo "[Flint] Building tests/${name}.mojo -> build/studio-tests/${name} (${opt}) ..."
+        if [[ "$jobs" -le 1 ]]; then
+            compile_mojo "${ROOT}/tests/${name}.mojo" "${ROOT}/build/studio-tests/${name}" "$opt"
+            continue
+        fi
+        compile_mojo "${ROOT}/tests/${name}.mojo" "${ROOT}/build/studio-tests/${name}" "$opt" &
+        pids+=($!)
+        if [[ "${#pids[@]}" -ge "$jobs" ]]; then
+            wait "${pids[0]}" || fail=1
+            pids=("${pids[@]:1}")
+        fi
+    done
+    local p
+    for p in "${pids[@]}"; do
+        wait "$p" || fail=1
+    done
+    return "$fail"
+}
+
+run_studio_suite_bin() {
+    local bin="$1" state_dir
+    echo "[Flint] Running ${bin#${ROOT}/}..."
+    # Each suite gets an empty XDG state dir: Studio saves its dock layout on shutdown, and a
+    # layout left behind by one suite (or by the user's own Studio) changes panel sizes in the next.
+    # The suites' async gameplay builds need a real compiler (a missing one must not pass as a
+    # "failed build"), so hand them the resolved toolchain.
+    resolve_mojo
+    state_dir="$(mktemp -d "${TMPDIR:-/tmp}/flint-studio-test-state.XXXXXX")"
+    local mojo_dir
+    mojo_dir="$(dirname -- "$MOJO_BIN")"
+    XDG_STATE_HOME="$state_dir" FLINT_MOJO_BIN="${FLINT_MOJO_BIN:-$MOJO_BIN}" \
+        MOJO_PREFIX="${MOJO_PREFIX:-$(dirname -- "$mojo_dir")}" PATH="${mojo_dir}:${PATH}" "$bin"
+    rm -rf "$state_dir"
+}
+
+run_studio_suites() {
+    local name
+    for name in "${STUDIO_TEST_SUITES[@]}"; do
+        [[ -x "${ROOT}/build/studio-tests/${name}" ]] || continue
+        run_studio_suite_bin "${ROOT}/build/studio-tests/${name}"
+    done
+}
+
+# One Studio suite at the gate's -O3, so optimiser-only miscompiles in the Studio app surface
+# (every other Studio suite builds at -O1 to keep the gate's compile time down).
+STUDIO_O3_SUITE="${FLINT_STUDIO_O3_SUITE:-test_studio_core_bugs}"
+
+build_and_run_studio_o3_suite() {
+    mkdir -p "${ROOT}/build/studio-tests-o3"
+    echo "[Flint] Building tests/${STUDIO_O3_SUITE}.mojo -> build/studio-tests-o3/${STUDIO_O3_SUITE} (-O3) ..."
+    compile_mojo "${ROOT}/tests/${STUDIO_O3_SUITE}.mojo" "${ROOT}/build/studio-tests-o3/${STUDIO_O3_SUITE}" "-O3"
+    run_studio_suite_bin "${ROOT}/build/studio-tests-o3/${STUDIO_O3_SUITE}"
+}
+
+# The motion editor (examples/motion) has a headless self-test: `--check` verifies wall
+# placement, reverse seek, contact drift and timing crossings on a real GLB preset.
+MOTION_FIXTURE="examples/motion/fixtures/hero_ledge.motion.json"
+
+build_and_check_motion_editor() {
+    resolve_mojo
+    echo "[Flint] Building examples/motion/main.mojo -> build/flint-motion ..."
+    compile_mojo "${ROOT}/examples/motion/main.mojo" "${ROOT}/build/flint-motion" "-O3" ""
+    echo "[Flint] Motion editor self-test (${MOTION_FIXTURE} --check)..."
+    "${ROOT}/build/flint-motion" "${ROOT}/${MOTION_FIXTURE}" --check
+}
+
+# Studio E2E suite (tests/e2e_studio). The gate runs tier 1 with its .mojo tests compiled in
+# parallel at -O1; `FLINT_GATE_E2E_TIERS="1 2"` (or "all") widens it. Tiers 2-4 take far longer
+# (tier 2 alone ~11 min), so they run in CI's e2e-studio job / `flint.sh test e2e-studio --extended`.
+run_studio_e2e() {
+    resolve_mojo
+    local tier
+    for tier in ${FLINT_GATE_E2E_TIERS:-1}; do
+        MOJO="$MOJO_BIN" bash "${ROOT}/tests/e2e_studio/run_studio_e2e.sh" --tier "$tier" \
+            --opt "${FLINT_STUDIO_E2E_OPT:--O1}" --jobs "${FLINT_STUDIO_E2E_JOBS:-6}"
+    done
+}
+
+# True when a Vulkan loader, an ICD manifest and a GPU device node are all present: the same
+# signals `flint.sh doctor` reports. The gate then requires GPU-only test blocks to really run.
+gpu_present() {
+    local have_loader=0 icd=0 dev=0 f
+    for f in /usr/lib/x86_64-linux-gnu/libvulkan.so.1 /usr/lib/aarch64-linux-gnu/libvulkan.so.1 \
+             /usr/lib64/libvulkan.so.1 /usr/lib/libvulkan.so.1; do
+        [[ -e "$f" ]] && { have_loader=1; break; }
+    done
+    [[ "$have_loader" == 1 ]] || ldconfig -p 2>/dev/null | grep -q 'libvulkan\.so\.1' && have_loader=1
+    for f in /usr/share/vulkan/icd.d/*.json /etc/vulkan/icd.d/*.json; do
+        [[ -e "$f" && "$(basename "$f")" != lvp_icd* ]] && { icd=1; break; }
+    done
+    for f in /dev/dri/renderD* /dev/nvidia0; do
+        [[ -e "$f" ]] && { dev=1; break; }
+    done
+    [[ "$have_loader" == 1 && "$icd" == 1 && "$dev" == 1 ]]
+}
+
 run_v5_suites() {
     local v5_bin
     for v5_bin in "${ROOT}"/build/v5/test_flint_v5_*; do
@@ -522,6 +647,28 @@ cmd_test() {
     elif [[ "$sub" == "v5" ]]; then
         cmd_build v5
         run_v5_suites
+    elif [[ "$sub" == "studio" ]]; then
+        resolve_mojo  # the other branches get it via cmd_build
+        build_studio_suites
+        if [[ "${2:-}" == "--build-only" ]]; then
+            return 0
+        fi
+        run_studio_suites
+        bash "${ROOT}/tests/test_studio_ide.sh"
+        bash "${ROOT}/tests/test_studio_profile_compare.sh"
+    elif [[ "$sub" == "e2e-studio" ]]; then
+        shift
+        resolve_mojo
+        if [[ "${1:-}" == "--all" || "${1:-}" == "--extended" ]]; then
+            # --all: tiers 1-4; --extended: the tiers the gate skips (2-4). Same -O1 / parallel
+            # compile settings as the gate's tier 1 (CI's e2e-studio job runs --extended).
+            local e2e_tiers="1 2 3 4"
+            [[ "$1" == "--extended" ]] && e2e_tiers="2 3 4"
+            shift
+            FLINT_GATE_E2E_TIERS="$e2e_tiers" run_studio_e2e
+        else
+            MOJO="$MOJO_BIN" bash "${ROOT}/tests/e2e_studio/run_studio_e2e.sh" "$@"
+        fi
     else
         cmd_build test
         echo "[Flint] Running Flint Engine test suite..."
@@ -533,6 +680,9 @@ cmd_test() {
         echo "[Flint] Running Flint Engine E2E test suite..."
         "${ROOT}/build/flint-e2e"
         run_v5_suites
+        echo "[Flint] Running Studio editor-model suites (-O1)..."
+        build_studio_suites
+        run_studio_suites
         echo "[Flint] Running Studio IDE & Profile Compare headless suites..."
         bash "${ROOT}/tests/test_studio_ide.sh"
         bash "${ROOT}/tests/test_studio_profile_compare.sh"
@@ -1129,12 +1279,21 @@ cmd_gate() {
     echo " FLINT ENGINE STANDALONE VERIFICATION GATE"
     echo "============================================================"
     cmd_sync --verify
+    # With a GPU on this machine, GPU-only test blocks must run, not print SKIP and pass.
+    if [[ -z "${FLINT_REQUIRE_GPU:-}" ]] && gpu_present; then
+        export FLINT_REQUIRE_GPU=1
+    fi
+    echo "[Flint Gate] FLINT_REQUIRE_GPU=${FLINT_REQUIRE_GPU:-0}"
     cmd_build all
     "${ROOT}/build/flint-test"
     "${ROOT}/build/flint-embedded-ide-test"
     "${ROOT}/build/flint-hygiene-cooker-test"
     bash "${ROOT}/tests/test_studio_ide.sh"
     bash "${ROOT}/tests/test_studio_profile_compare.sh"
+    build_studio_suites
+    run_studio_suites
+    build_and_run_studio_o3_suite
+    build_and_check_motion_editor
     # Render all showcase & Studio headless shots before E2E and FLIP checks.
     mkdir -p "${ROOT}/build/shots"
     "${ROOT}/build/flint-spark" --shots
@@ -1147,6 +1306,8 @@ cmd_gate() {
     cmd_character_course --capture
     cmd_character_course --recovery-bench --check
     cmd_world --check-recovery
+    echo "[Flint Gate] Running Studio E2E suite (tests/e2e_studio)..."
+    run_studio_e2e
     cmd_lab all
     echo "[Flint Gate] Running golden-frame FLIP and perf_history p99 verification..."
     compile_mojo "${ROOT}/tools/gate_verify.mojo" "${ROOT}/build/flint-gate-verify" "-O3"
@@ -2798,6 +2959,7 @@ case "$subcmd" in
         echo "  gameplay-so [--fast|--debug|--release] [--out path.so]  Compile hot-reloadable gameplay .so plugin"
         echo "  run [...]            Build and run a scaffolded game project using flint.toml [project] entry"
         echo "  test [unit|e2e|v5]   Build and run standalone Flint Engine verification suites"
+        echo "  test e2e-studio [--all|--extended|runner args]  Studio e2e tiers (gate: 1; --extended: 2-4)"
         echo "  play                 Launch interactive 'minimal_spark' 2D+3D showcase"
         echo "  preview <program>    Live preview: rebuild on save and swap window (spark|world|studio|cycles|file|dir)"
         echo "  character-course [--capture|--frames|--recovery-bench]   Play, capture or benchmark the character"

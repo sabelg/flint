@@ -1635,6 +1635,88 @@ def _collect_sorted_world_entities(world: World) -> List[Entity]:
     return out^
 
 
+def duplicate_entities(mut world: World, registry: ComponentRegistry, sources: List[Entity]) -> List[Entity]:
+    """Copies `sources` with every registered component (through the registry's binary codecs, so a
+    newly registered component type is copied without touching this code) plus unknown components.
+    References inside the set (parent links, slot-hooked fields such as bone sockets) point at the
+    copies; references to entities outside the set keep pointing at the originals, and a source whose
+    parent is outside the set is parented to that same parent. Returns the copies in `sources` order,
+    or an empty list (and a world without any partial copy) when a component fails to round-trip."""
+    var n = len(sources)
+    var out = List[Entity](capacity=n)
+    if n == 0:
+        return out^
+    var max_idx = len(world.entities)
+    var ent_to_slot = List[Int](length=max(1, max_idx), fill=-1)
+    for k in range(n):
+        if not world.is_alive(sources[k]) or ent_to_slot[Int(sources[k].index)] >= 0:
+            return out^  # dead or repeated source
+        ent_to_slot[Int(sources[k].index)] = k
+    # Live entities outside the set get slots after the copies that resolve back to themselves.
+    var outside = List[Entity]()
+    for idx in range(max_idx):
+        if world.entities[idx].alive and ent_to_slot[idx] < 0:
+            ent_to_slot[idx] = n + len(outside)
+            outside.append(Entity(UInt32(idx), world.entities[idx].generation))
+    var sorted_codecs = registry.sorted_entry_indices()
+    var blobs = List[List[UInt8]](capacity=n)
+    var counts = List[Int](capacity=n)
+    for k in range(n):
+        var w = BlobWriter()
+        var c = 0
+        for ci in range(len(sorted_codecs)):
+            var cidx = sorted_codecs[ci]
+            if registry.has_on_entity(cidx, world, sources[k]):
+                if not registry.write_entity_bin_slots(cidx, world, sources[k], ent_to_slot, w):
+                    return out^
+                c += 1
+        var data = List[UInt8]()
+        swap(data, w.data)
+        blobs.append(data^)
+        counts.append(c)
+    registry.ensure_registered_in_world(world)
+    for _ in range(n):
+        out.append(world.spawn_empty())
+    var ok = True
+    for k in range(n):
+        if not ok:
+            break
+        var r = BlobReader(blobs[k].copy())
+        for _ in range(counts[k]):
+            var cidx = registry.find_by_fourcc(r.peek_tag())
+            if cidx < 0 or not registry.read_entity_bin(cidx, world, out[k], r) or r.failed:
+                ok = False
+                break
+        if ok:
+            var unk_opt = world.get_ptr[UnknownComponentsComponent](sources[k])
+            if unk_opt:
+                var unk = unk_opt.value()[unsafe_offset=0].copy()
+                _ = world.insert[UnknownComponentsComponent](out[k], unk^)
+    if not ok:
+        for k in range(n):
+            _ = world.despawn(out[k])
+        return List[Entity]()
+    for k in range(n):
+        var p_opt = world.get_ptr[Parent](sources[k])
+        if not p_opt:
+            continue
+        var pe = p_opt.value()[unsafe_offset=0].entity
+        if not world.is_alive(pe):
+            continue
+        var ps = ent_to_slot[Int(pe.index)] if Int(pe.index) < len(ent_to_slot) else -1
+        var target = out[ps] if ps >= 0 and ps < n else pe
+        _ = set_parent(world, out[k], target)
+    var spawned = out.copy()
+    for oi in range(len(outside)):
+        spawned.append(outside[oi])
+    for ci in range(len(registry.entries)):
+        if registry.entries[ci].has_slot_hooks:
+            for k in range(n):
+                if registry.has_on_entity(ci, world, out[k]):
+                    registry.resolve_entity_slots(ci, world, out[k], spawned)
+    return out^
+
+
 struct Scene(Movable):
     """Flint v5 Scene container supporting `.flscn` JSON, `.flscnb` LZ4 binary, and PIE snapshots."""
     var name: String
@@ -1759,7 +1841,7 @@ struct Scene(Movable):
 
     def save_flscn_file(self, path: String, world: World, registry: ComponentRegistry) raises -> Bool:
         var data = self.save_flscn_bytes(world, registry)
-        return write_file_durable(path, data)
+        return write_file_durable(path, data)  # tmp + fsync + rename: a crash never leaves half a scene
 
     def load_flscn_bytes(
         mut self,
@@ -2018,7 +2100,7 @@ struct Scene(Movable):
 
     def save_flscnb_file(self, path: String, world: World, registry: ComponentRegistry) -> Bool:
         var packed = self.save_flscnb_bytes(world, registry)
-        return write_file_durable(path, packed)
+        return write_file_durable(path, packed)  # tmp + fsync + rename: a crash never leaves half a scene
 
     def load_flscnb_bytes(
         mut self,
@@ -2035,7 +2117,12 @@ struct Scene(Movable):
         if not clear_existing:
             raw_backup = raw.copy()
         var reader = BlobReader(raw^)
-        _ = reader.enter(SCENE_BIN_MAGIC, SCENE_SCHEMA_VERSION)
+        var version = reader.enter(SCENE_BIN_MAGIC, SCENE_SCHEMA_VERSION)
+        # v1 (pre unknown-component blobs) wrote entity references as raw handles, not scene slots;
+        # v2 adds UKJS / unknown FourCC blobs and slot-relative references. Anything else is refused.
+        if version != 1 and version != SCENE_SCHEMA_VERSION:
+            raise Error(".flscnb version " + String(version) + " is not supported by this build")
+        var legacy_v1 = version == 1
         var new_name = reader.text()
         var count = reader.integer()
         if (
@@ -2068,6 +2155,8 @@ struct Scene(Movable):
             for _ in range(num_comps):
                 var tag = reader.peek_tag()
                 var cidx = registry.find_by_fourcc(tag)
+                if cidx < 0 and legacy_v1:
+                    raise Error("unregistered component FourCC in v1 .flscnb")
                 if cidx < 0:
                     if tag == SCENE_UNKNOWN_JSON_FOURCC:
                         var jver = reader.enter(SCENE_UNKNOWN_JSON_FOURCC, 1)
@@ -2119,7 +2208,7 @@ struct Scene(Movable):
                     raise Error("cycle or invalid parent in .flscnb")
 
         for ci in range(len(registry.entries)):
-            if registry.entries[ci].has_slot_hooks:
+            if registry.entries[ci].has_slot_hooks and not legacy_v1:  # v1 refs are raw handles
                 for slot in range(count):
                     if registry.has_on_entity(ci, staging, spawned[slot]):
                         registry.resolve_entity_slots(ci, staging, spawned[slot], spawned)
@@ -2175,7 +2264,7 @@ struct Scene(Movable):
             if p >= 0 and p < count:
                 _ = set_parent(world, live_spawned[slot], live_spawned[p])
         for ci in range(len(registry.entries)):
-            if registry.entries[ci].has_slot_hooks:
+            if registry.entries[ci].has_slot_hooks and not legacy_v1:  # v1 refs are raw handles
                 for slot in range(count):
                     if registry.has_on_entity(ci, world, live_spawned[slot]):
                         registry.resolve_entity_slots(ci, world, live_spawned[slot], live_spawned)

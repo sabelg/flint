@@ -19,6 +19,9 @@ from std.math import isfinite, max
 from flint.assets.json import JsonDocument, parse_json
 from flint.core.math import Quat, Vec3
 from flint.devtools.acp_client import (
+    ACP_ERR_INVALID_PARAMS,
+    ACP_ERR_NOT_FOUND,
+    ACP_ERR_REFUSED,
     AE_CMD_APPROVAL,
     AE_DONE,
     AE_ERROR,
@@ -27,6 +30,7 @@ from flint.devtools.acp_client import (
     AE_PERMISSION,
     AE_PLAN,
     AE_READY,
+    AE_SERVICE,
     AE_THOUGHT,
     AE_TOOL,
     AE_TOOL_UPDATE,
@@ -46,7 +50,17 @@ from flint.devtools.problems import (
     DIAG_WARNING,
     Diagnostic,
 )
-from flint.platform.os import read_bytes
+from flint.assets.json_write import json_quote
+from flint.devtools.safe_fs import (
+    SAFE_FS_MISSING,
+    SAFE_FS_OK,
+    ConfinedPath,
+    read_agent_file,
+    read_confined_regular,
+    resolve_confined_path,
+    text_hash64,
+    write_confined_durable,
+)
 from flint.studio.agent_bus import (
     ACT_BUILD_HOTRELOAD,
     ACT_ENTITY_DESPAWN,
@@ -104,6 +118,11 @@ struct BridgedMcpEvent(Copyable, Movable):
     var ok: Bool
     var is_mutating: Bool
     var blocked_by_gate: Bool
+    var mcp_client_key: Int
+    """MCP connection that made the call (0 = in-process / stdio)."""
+    var mcp_client_name: String
+    var replay_step_id: UInt64
+    """Non-zero when this is Studio re-running an approved call: the waiting step it completes."""
 
     # Optional spatial hints supplied by Studio when entity world positions are known
     var world_pos: Vec3
@@ -134,6 +153,9 @@ struct BridgedMcpEvent(Copyable, Movable):
         self.ok = ok
         self.is_mutating = is_mutating
         self.blocked_by_gate = blocked_by_gate
+        self.mcp_client_key = 0
+        self.mcp_client_name = String("")
+        self.replay_step_id = 0
         self.world_pos = Vec3()
         self.has_world_pos = False
         self.prev_world_pos = Vec3()
@@ -332,6 +354,46 @@ struct ScriptedDemoState(Copyable, Movable):
         self.move_step_id = 0
 
 
+def _slice_lines(text: String, line_1based: Int, limit: Int) -> String:
+    """`fs/read_text_file` `line` / `limit` (1-based first line, max line count; <= 0 = no bound)."""
+    if line_1based <= 1 and limit <= 0:
+        return text
+    var b = text.as_bytes()
+    var n = len(b)
+    var start = 0
+    var ln = 1
+    var first = max(1, line_1based)
+    while ln < first and start < n:
+        if b[start] == 10:
+            ln += 1
+        start += 1
+    if limit <= 0:
+        return String(text[byte=start:n])
+    var end = start
+    var taken = 0
+    while end < n and taken < limit:
+        if b[end] == 10:
+            taken += 1
+        end += 1
+    return String(text[byte=start:end])
+
+
+def _acp_file_snapshot(root: String, user_path: String) -> Tuple[Bool, String, String, Bool, String]:
+    """Resolves an agent file path inside `root` and reads its current text from disk.
+    Returns `(ok, rel_path, old_text, existed, error)`."""
+    var cp: ConfinedPath
+    try:
+        cp = resolve_confined_path(root, user_path)
+    except e:
+        return (False, String(""), String(""), False, "path rejected: " + String(e))
+    var rd = read_confined_regular(cp)
+    if rd[0] == SAFE_FS_OK:
+        return (True, cp.rel(), String(unsafe_from_utf8=rd[1]), True, String(""))
+    if rd[0] == SAFE_FS_MISSING:
+        return (True, cp.rel(), String(""), False, String(""))
+    return (False, cp.rel(), String(""), False, "target is not a readable regular file (symlink, FIFO or too large)")
+
+
 # ============================================================================
 # 3. `StudioAgentRuntime`: Unified ACP + MCP + Jobs + Theatre + CodeDrawer Bridge
 # ============================================================================
@@ -436,17 +498,22 @@ struct StudioAgentRuntime(Movable):
     ):
         if self.acp.busy() and (self.acp_agent_id == 0 or self.acp_agent_id == agent_id):
             self.acp.cancel()
+            self._drop_answered_acp_approvals(bus, agent_id)
         if self.demo.active and (agent_id == self.demo.scene_agent_id or agent_id == self.demo.coder_agent_id):
             self.demo.active = False
         bus.end_turn(agent_id, "cancelled", now_sec)
 
     def answer_acp_approval(
         mut self,
+        mut bus: AgentTelemetryBus,
         pa: PendingApproval,
         approved: Bool,
         allow_turn: Bool = False,
+        now_sec: Float64 = 0.0,
     ) -> Bool:
-        """Replies to a parked ACP permission, file-write proposal, or terminal run request."""
+        """Replies to a parked ACP permission or file-write proposal. An approved write is written
+        here (confined to the workspace, atomically) and only then recorded as a step; a failed
+        write is answered with an error, so the agent never believes a write that did not happen."""
         if not self.acp.active() or pa.request_id_raw.byte_length() == 0:
             return False
         if pa.source == APPROVAL_SRC_ACP_PERM:
@@ -458,14 +525,71 @@ struct StudioAgentRuntime(Movable):
             else:
                 opt = pa.option_reject
             return self.acp.answer_permission(pa.request_id_raw, opt)
-        if pa.source == APPROVAL_SRC_ACP_WRITE or pa.source == APPROVAL_SRC_ACP_RUN:
-            if approved:
-                self.acp.answer_service(pa.request_id_raw, "{}")
-            else:
+        if pa.source == APPROVAL_SRC_ACP_WRITE:
+            if not approved:
                 var why = pa.reject_reason if pa.reject_reason.byte_length() > 0 else String("Rejected by user")
-                self.acp.answer_service_error(pa.request_id_raw, -32000, why)
-            return True
+                return self.acp.answer_service_error(pa.request_id_raw, ACP_ERR_REFUSED, why)
+            var wr = self.write_approved_file(bus, pa, now_sec)
+            if not wr[0]:
+                return self.acp.answer_service_error(pa.request_id_raw, ACP_ERR_REFUSED, wr[1])
+            return self.acp.answer_service(pa.request_id_raw, "{}")
+        if pa.source == APPROVAL_SRC_ACP_RUN:
+            # Terminals are not offered (ACP `terminal: false`); never report a run that did not happen.
+            return self.acp.answer_service_error(pa.request_id_raw, ACP_ERR_REFUSED, "terminals are not supported")
         return False
+
+    def write_approved_file(
+        mut self,
+        mut bus: AgentTelemetryBus,
+        pa: PendingApproval,
+        now_sec: Float64 = 0.0,
+    ) -> Tuple[Bool, String]:
+        """Writes an approved proposal (`pa.new_text`, possibly narrowed to the accepted hunks) to
+        `pa.file_path` inside the workspace with `write_file_durable`, refusing when the file changed
+        on disk since the proposal was shown. Records the code-edit step on success."""
+        var cp: ConfinedPath
+        try:
+            cp = resolve_confined_path(self.workspace_root, pa.file_path)
+        except e:
+            return (False, "path rejected: " + String(e))
+        var cur = read_confined_regular(cp)
+        if cur[0] == SAFE_FS_OK:
+            if not pa.file_existed or text_hash64(String(unsafe_from_utf8=cur[1])) != text_hash64(pa.old_text):
+                return (False, "file changed on disk since the proposal; ask the agent to re-read it")
+        elif cur[0] == SAFE_FS_MISSING:
+            if pa.file_existed:
+                return (False, "file was deleted since the proposal")
+        else:
+            return (False, "target is not a regular file")
+        var w = write_confined_durable(cp, pa.new_text)
+        if not w[0]:
+            return (False, w[1])
+        _ = bus.record_acp_file_edit(
+            pa.agent_id, cp.rel(), pa.old_text, pa.new_text, pa.file_existed, now_sec,
+            post_hash=text_hash64(pa.new_text),
+        )
+        return (True, String(""))
+
+    def _drop_answered_acp_approvals(mut self, mut bus: AgentTelemetryBus, agent_id: UInt32):
+        """Resolves queued ACP approvals whose request the client already answered (turn ended,
+        cancelled, agent stopped), so the panel never offers an approval nobody waits for."""
+        var i = len(bus.pending_approvals) - 1
+        while i >= 0:
+            var src = bus.pending_approvals[i].source
+            var candidate = (
+                not bus.pending_approvals[i].resolved
+                and bus.pending_approvals[i].agent_id == agent_id
+                and src != APPROVAL_SRC_MCP_TOOL
+            )
+            if candidate:
+                var rid = bus.pending_approvals[i].request_id_raw
+                var appr_id = bus.pending_approvals[i].approval_id
+                var still_open = (
+                    self.acp.is_open_service(rid) if src != APPROVAL_SRC_ACP_PERM else (rid in self.acp.open_permissions)
+                )
+                if not still_open or not self.acp.active():
+                    _ = bus.resolve_approval(appr_id, False, False, "Request no longer open")
+            i -= 1
 
     def _ensure_role_session(mut self, mut bus: AgentTelemetryBus, role: UInt8) -> UInt32:
         for i in range(len(bus.sessions)):
@@ -530,28 +654,49 @@ struct StudioAgentRuntime(Movable):
                     _ = toasts.push(TOAST_AGENT, "Agent Edited File", e.diffs[0])
 
             elif e.kind == AE_FILE_PROPOSAL:
-                var old_txt = String("")
-                var existed = False
-                var tab_i = code_drawer.find_tab(e.path)
-                if tab_i >= 0:
-                    old_txt = code_drawer.tabs[tab_i].text
-                    existed = True
-                elif e.path.byte_length() > 0:
-                    var disk_bytes = read_bytes(e.path)
-                    if len(disk_bytes) > 0:
-                        old_txt = String(unsafe_from_utf8=disk_bytes)
-                        existed = True
-                _ = code_drawer.show_agent_proposal(e.path, old_txt, e.text, e.request_id, split_mode=False)
-
-                var sid = bus.record_acp_file_edit(aid, e.path, old_txt, e.text, existed, now_sec)
-                var pa = PendingApproval(0, aid, sid, APPROVAL_SRC_ACP_WRITE, "Write " + e.path, "Proposed file diff ready in Code Drawer")
+                # The agent's path is confined to the workspace and the "before" text always comes
+                # from disk (never from a drawer tab, which may hold unsaved edits). Nothing is
+                # written or recorded until the user approves; see `answer_acp_approval`.
+                var snap = _acp_file_snapshot(self.workspace_root, e.path)
+                if not snap[0]:
+                    _ = self.acp.answer_service_error(e.request_id, ACP_ERR_INVALID_PARAMS, snap[4])
+                    _ = toasts.push(TOAST_ERROR, "Agent File Write Refused", snap[4], own_job=True)
+                    continue
+                var rel = snap[1]
+                var old_txt = snap[2]
+                var existed = snap[3]
+                _ = code_drawer.show_agent_proposal(rel, old_txt, e.text, e.request_id, split_mode=False)
+                var pa = PendingApproval(0, aid, 0, APPROVAL_SRC_ACP_WRITE, "Write " + rel, "Proposed file diff ready in Code Drawer")
                 pa.request_id_raw = e.request_id
-                pa.file_path = e.path
+                pa.file_path = rel
                 pa.old_text = old_txt
                 pa.new_text = e.text
                 pa.file_existed = existed
-                _ = bus.queue_approval(pa^)
-                _ = toasts.push(TOAST_WARN, "Agent Proposes File Edit", e.path, own_job=True)
+                if bus.queue_approval(pa^) == 0:
+                    _ = self.acp.answer_service_error(e.request_id, ACP_ERR_REFUSED, "too many pending approvals")
+                    continue
+                _ = toasts.push(TOAST_WARN, "Agent Proposes File Edit", rel, own_job=True)
+
+            elif e.kind == AE_SERVICE:
+                if e.kind_name == "fs/read_text_file":
+                    var rd = read_agent_file(self.workspace_root, e.path)
+                    if rd[0] != SAFE_FS_OK:
+                        var code = ACP_ERR_NOT_FOUND if rd[0] == SAFE_FS_MISSING else ACP_ERR_REFUSED
+                        _ = self.acp.answer_service_error(e.request_id, code, rd[2])
+                    else:
+                        var line_no = 0
+                        var limit = 0
+                        try:
+                            if e.status.byte_length() > 0:
+                                line_no = atol(e.status)
+                            if e.stop_reason.byte_length() > 0:
+                                limit = atol(e.stop_reason)
+                        except:
+                            pass
+                        var txt = _slice_lines(String(unsafe_from_utf8=rd[1]), line_no, limit)
+                        _ = self.acp.answer_service(e.request_id, '{"content":' + json_quote(txt) + "}")
+                else:
+                    _ = self.acp.answer_service_error(e.request_id, ACP_ERR_REFUSED, "Flint Studio does not offer " + e.kind_name)
 
             elif e.kind == AE_PERMISSION:
                 var ttl = e.title if e.title.byte_length() > 0 else String("Permission Request")
@@ -564,7 +709,10 @@ struct StudioAgentRuntime(Movable):
                 pa.option_reject = _first_option_of_kind(e.option_kinds, e.option_ids, "reject_once")
                 if pa.option_reject.byte_length() == 0:
                     pa.option_reject = _first_option_of_kind(e.option_kinds, e.option_ids, "reject_always")
-                _ = bus.queue_approval(pa^)
+                var rej_opt = pa.option_reject
+                if bus.queue_approval(pa^) == 0:
+                    _ = self.acp.answer_permission(e.request_id, rej_opt)
+                    continue
                 _ = toasts.push(TOAST_WARN, "Agent Permission Required", ttl, own_job=True)
 
             elif e.kind == AE_CMD_APPROVAL:
@@ -578,11 +726,14 @@ struct StudioAgentRuntime(Movable):
                 var pa = PendingApproval(0, aid, sid, APPROVAL_SRC_ACP_RUN, "Run Command", cmd_title)
                 pa.request_id_raw = e.request_id
                 pa.tool_kind = "execute"
-                _ = bus.queue_approval(pa^)
+                if bus.queue_approval(pa^) == 0:
+                    _ = self.acp.answer_service_error(e.request_id, ACP_ERR_REFUSED, "too many pending approvals")
+                    continue
                 _ = toasts.push(TOAST_WARN, "Agent Wants to Run Command", cmd_title, own_job=True)
 
             elif e.kind == AE_DONE:
                 var reason = e.stop_reason if e.stop_reason.byte_length() > 0 else String("end_turn")
+                self._drop_answered_acp_approvals(bus, aid)
                 bus.end_turn(aid, reason, now_sec)
                 if reason == "end_turn":
                     _ = toasts.push(TOAST_SUCCESS, "Agent Turn Complete", "Ready for review or next task")
@@ -590,6 +741,7 @@ struct StudioAgentRuntime(Movable):
                     _ = toasts.push(TOAST_WARN, "Agent Turn Ended", reason)
 
             elif e.kind == AE_ERROR:
+                self._drop_answered_acp_approvals(bus, aid)
                 bus.end_turn(aid, "error", now_sec)
                 _ = toasts.push(TOAST_ERROR, "Agent Error", e.text, own_job=True)
 
@@ -642,6 +794,22 @@ struct StudioAgentRuntime(Movable):
                         wpos = sv[1]
 
             var summary = _summarize_mcp_event(ev, pdoc, rdoc)
+            if ev.replay_step_id != 0:
+                # The approved call ran: finish the step that has been waiting on the user.
+                _ = bus.complete_mcp_tool_step(
+                    agent_id=aid,
+                    step_id=ev.replay_step_id,
+                    ok=ev.ok,
+                    result_json=ev.result_json,
+                    elapsed_ms=Float32(ev.elapsed_ms),
+                    entity_id=eid,
+                    world_pos=wpos,
+                    has_world_pos=has_pos,
+                    half_extents=ev.half_extents,
+                )
+                if not ev.ok:
+                    _ = toasts.push(TOAST_ERROR, "Approved Call Failed", summary, own_job=True, action_entity_id=eid)
+                continue
             var sid = bus.begin_mcp_tool_step(
                 agent_id=aid,
                 tool_name=ev.tool_name,
@@ -661,6 +829,7 @@ struct StudioAgentRuntime(Movable):
                 var pa = PendingApproval(0, aid, sid, APPROVAL_SRC_MCP_TOOL, summary, "Gated MCP tool: " + ev.tool_name)
                 pa.tool_name = ev.tool_name
                 pa.raw_payload_json = ev.params_json
+                pa.mcp_client_key = ev.mcp_client_key
                 var gk = _ghost_kind_for_mcp_tool(ev.tool_name)
                 if gk != GHOST_NONE and has_pos:
                     var accent = agent_role_accent_rgba8(ROLE_SCENE_BUILDER)
@@ -777,6 +946,9 @@ struct StudioAgentRuntime(Movable):
                     bus.sessions[coder_si].steps[s_idx].kind = ACT_BUILD_HOTRELOAD
                     bus.sessions[coder_si].steps[s_idx].terminal_tail = job.output_text()
 
+        # Harvested: the job list stays bounded (`JobRunner.prune_finished` keeps the newest few).
+        if len(finished) > 0:
+            self.jobs.prune_finished()
         return len(finished)
 
     # ---- Deterministic Visual Agent Showcase Fixture (Gallery & Instant Demo) ----
@@ -1102,6 +1274,8 @@ struct StudioAgentRuntime(Movable):
         if self.acp.active():
             self.acp.pump(now_sec)
             _ = self.drain_acp_events(bus, code_drawer, toasts, now_sec)
+        else:
+            _ = self.acp.proc.poll_reap()  # a stopped agent's process group, reaped without blocking
         _ = self.poll_jobs(bus, code_drawer, toasts, now_sec)
         if self.demo.active:
             _ = self.tick_scripted_demo(dt, bus, code_drawer, toasts)

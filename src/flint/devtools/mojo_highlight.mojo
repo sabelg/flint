@@ -1,8 +1,10 @@
 """Pure-Mojo 1.2 polyglot syntax highlighter (`flint.devtools.mojo_highlight`).
 
 Provides a fast, zero-dependency, line-based incremental lexer with multi-line
-state tracking for Mojo 1.2, Python, C/C++/CUDA, TOML, JSON, Shell/YAML, and
-Markdown. Produces coalesced `HighlightSpan` byte ranges suitable for GPU SDF
+state tracking for Mojo 1.2, Python, C/C++/CUDA, Rust, JavaScript/TypeScript,
+TOML, JSON, Shell/YAML, and Markdown (fenced code blocks are highlighted in the
+fence's language and keep that language's multi-line state, packed into the
+Markdown state with `md_fence_state`). Produces coalesced `HighlightSpan` byte ranges suitable for GPU SDF
 UI rendering (`UiDrawList`) and Tier-0 CPU SIMD rasterizer parity.
 """
 from std.collections import Dict, List
@@ -30,12 +32,178 @@ comptime LANG_TOML: Int = 3
 comptime LANG_JSON: Int = 4
 comptime LANG_SHELL_YAML: Int = 5
 comptime LANG_MARKDOWN: Int = 6
+comptime LANG_RUST: Int = 7
+comptime LANG_JS: Int = 8
 
 comptime STATE_NORMAL: Int = 0
 comptime STATE_TRIPLE_DOUBLE: Int = 1  # """..."""
 comptime STATE_TRIPLE_SINGLE: Int = 2  # '''...'''
 comptime STATE_BLOCK_COMMENT: Int = 3  # /* ... */
-comptime STATE_MD_FENCE: Int = 4       # ``` ... ```
+comptime STATE_MD_FENCE: Int = 4       # ``` ... ``` (low 3 bits; see `md_fence_state`)
+comptime STATE_JS_TEMPLATE: Int = 5    # JS/TS `...` template literal (low 3 bits; see `js_template_frames`)
+comptime _JS_MAX_FRAMES: Int = 7       # template / `${` interpolation nesting carried across lines
+comptime _JS_MAX_BRACES: Int = 15      # `{` depth inside one interpolation (4 bits)
+comptime _JS_CODE: Int = -1            # scanner marker: byte is JS code, classified afterwards
+
+
+def md_fence_state(inner_lang: Int = LANG_MOJO, inner_state: Int = STATE_NORMAL) -> Int:
+    """Markdown state inside a fenced block: `STATE_MD_FENCE` in the low 3 bits, the fence's
+    language in bits 3-6 and that language's own multi-line state above. A plain fence with
+    no info string is exactly `STATE_MD_FENCE`."""
+    return STATE_MD_FENCE | (inner_lang << 3) | (inner_state << 7)
+
+
+@always_inline
+def md_in_fence(state: Int) -> Bool:
+    return state > 0 and (state & 7) == STATE_MD_FENCE
+
+
+@always_inline
+def md_fence_lang(state: Int) -> Int:
+    return (state >> 3) & 15
+
+
+@always_inline
+def md_fence_inner(state: Int) -> Int:
+    return state >> 7
+
+
+@always_inline
+def js_in_template(state: Int) -> Bool:
+    """True when a JS/TS line state continues inside a template literal (text or `${}`)."""
+    return state > 0 and (state & 7) == STATE_JS_TEMPLATE
+
+
+def js_template_frames(state: Int) -> List[Int]:
+    """Unpacks a JS/TS template state into its nesting stack, outermost first: `-1` is a
+    template-literal text frame, `d >= 0` a `${` interpolation with `d` open `{` braces.
+    Frames alternate text / interpolation starting with text; packed as `STATE_JS_TEMPLATE`
+    in bits 0-2, the frame count in bits 3-5 and 4 bits of brace depth per interpolation."""
+    var frames = List[Int]()
+    if not js_in_template(state):
+        return frames^
+    var count = (state >> 3) & 7
+    for f in range(count):
+        if f % 2 == 0:
+            frames.append(-1)
+        else:
+            frames.append((state >> (6 + 4 * (f // 2))) & 15)
+    return frames^
+
+
+def _js_pack(frames: List[Int], block_comment: Bool) -> Int:
+    if len(frames) == 0:
+        return STATE_BLOCK_COMMENT if block_comment else STATE_NORMAL
+    var st = STATE_JS_TEMPLATE | (len(frames) << 3)
+    for f in range(1, len(frames), 2):
+        st |= frames[f] << (6 + 4 * (f // 2))
+    return st
+
+
+def _js_scan(b: Span[UInt8, _], state: Int, mut cls: List[Int], mark: Bool) -> Int:
+    """Structural JS/TS lexer shared by highlighting (`mark`) and `next_line_state`: comments,
+    quoted strings and template literals, with `${ ... }` interpolations (balanced braces,
+    nested templates) carried across lines. Marks code bytes `_JS_CODE` for word classing."""
+    var n = len(b)
+    var frames = js_template_frames(state)
+    var in_block = state == STATE_BLOCK_COMMENT
+    var i = 0
+    while i < n:
+        if in_block:
+            var closed = -1
+            var j = i
+            while j + 1 < n:
+                if b[j] == 42 and b[j + 1] == 47:
+                    closed = j + 2
+                    break
+                j += 1
+            var stop = closed if closed >= 0 else n
+            if mark:
+                for k in range(i, stop):
+                    cls[k] = TOK_COMMENT
+            if closed < 0:
+                break
+            in_block = False
+            i = closed
+            continue
+        var c = b[i]
+        var top = frames[len(frames) - 1] if len(frames) > 0 else -2
+        if top == -1:
+            # Template literal text.
+            if c == 36 and i + 1 < n and b[i + 1] == 123:
+                if mark:
+                    cls[i] = TOK_SYMBOL
+                    cls[i + 1] = TOK_SYMBOL
+                frames.append(0)
+                i += 2
+                continue
+            var w = 2 if (c == 92 and i + 1 < n) else 1
+            if mark:
+                for k in range(i, i + w):
+                    cls[k] = TOK_STRING
+            if c == 96:
+                _ = frames.pop()
+            i += w
+            continue
+        # Code: top level (`top == -2`) or inside a `${}` interpolation.
+        if c == 47 and i + 1 < n and (b[i + 1] == 47 or b[i + 1] == 42):
+            if b[i + 1] == 47:
+                if mark:
+                    for k in range(i, n):
+                        cls[k] = TOK_COMMENT
+                break
+            if len(frames) == 0:
+                if mark:
+                    cls[i] = TOK_COMMENT
+                    cls[i + 1] = TOK_COMMENT
+                in_block = True
+                i += 2
+                continue
+            # `/* */` inside an interpolation: closed on this line or runs to its end.
+            var j = i + 2
+            while j + 1 < n and not (b[j] == 42 and b[j + 1] == 47):
+                j += 1
+            var stop = min(j + 2, n)
+            if mark:
+                for k in range(i, stop):
+                    cls[k] = TOK_COMMENT
+            i = stop
+            continue
+        if c == 96 and len(frames) < _JS_MAX_FRAMES:
+            if mark:
+                cls[i] = TOK_STRING
+            frames.append(-1)
+            i += 1
+            continue
+        if c == 34 or c == 39 or c == 96:
+            var j = i + 1
+            while j < n:
+                if b[j] == 92:
+                    j += 2
+                    continue
+                if b[j] == c:
+                    j += 1
+                    break
+                j += 1
+            if mark:
+                for k in range(i, min(j, n)):
+                    cls[k] = TOK_STRING
+            i = j
+            continue
+        if top >= 0 and c == 125:
+            if top == 0:
+                if mark:
+                    cls[i] = TOK_SYMBOL
+                _ = frames.pop()
+                i += 1
+                continue
+            frames[len(frames) - 1] = top - 1
+        elif top >= 0 and c == 123 and top < _JS_MAX_BRACES:
+            frames[len(frames) - 1] = top + 1
+        if mark:
+            cls[i] = _JS_CODE
+        i += 1
+    return _js_pack(frames, in_block)
 
 
 @fieldwise_init
@@ -118,10 +286,15 @@ def lang_for_path(path: String, title: String = "") -> Int:
         return LANG_PYTHON
     for ext in [
         ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hxx",
-        ".cu", ".cuh", ".rs", ".go", ".js", ".ts", ".jsx", ".tsx", ".java",
+        ".cu", ".cuh", ".go", ".java",
     ]:
         if low.endswith(String(ext)):
             return LANG_C_CUDA
+    if low.endswith(".rs"):
+        return LANG_RUST
+    for ext in [".js", ".mjs", ".cjs", ".ts", ".mts", ".jsx", ".tsx"]:
+        if low.endswith(String(ext)):
+            return LANG_JS
     if low.endswith(".toml") or low.endswith(".ini") or low.endswith(".cfg") or low == ".editorconfig":
         return LANG_TOML
     if low.endswith(".json") or low.endswith(".jsonl") or low.endswith(".jsonc"):
@@ -142,6 +315,65 @@ def _is_md_fence(b: Span[UInt8, _]) -> Bool:
     while i < n and (b[i] == 32 or b[i] == 9):
         i += 1
     return i + 2 < n and b[i] == 96 and b[i + 1] == 96 and b[i + 2] == 96
+
+
+def _fence_info_lang(b: Span[UInt8, _]) -> Int:
+    """Language of a fence's info string (```python, ```rust, ...); Mojo when absent/unknown."""
+    var n = len(b)
+    var i = 0
+    while i < n and (b[i] == 32 or b[i] == 9):
+        i += 1
+    while i < n and b[i] == 96:
+        i += 1
+    while i < n and (b[i] == 32 or b[i] == 9):
+        i += 1
+    var tag = List[UInt8]()
+    while i < n and b[i] != 32 and b[i] != 9 and b[i] != 123 and b[i] != 44:
+        var c = b[i]
+        tag.append(c + 32 if (c >= 65 and c <= 90) else c)
+        i += 1
+    var t = String(unsafe_from_utf8=tag)
+    if t == "python" or t == "py" or t == "python3":
+        return LANG_PYTHON
+    if t == "rust" or t == "rs":
+        return LANG_RUST
+    if t == "js" or t == "javascript" or t == "ts" or t == "typescript" or t == "jsx" or t == "tsx":
+        return LANG_JS
+    if t == "c" or t == "cpp" or t == "c++" or t == "cuda" or t == "cu" or t == "h" or t == "go" or t == "java":
+        return LANG_C_CUDA
+    if t == "toml" or t == "ini":
+        return LANG_TOML
+    if t == "json" or t == "jsonc":
+        return LANG_JSON
+    if t == "sh" or t == "bash" or t == "zsh" or t == "shell" or t == "console" or t == "yaml" or t == "yml":
+        return LANG_SHELL_YAML
+    return LANG_MOJO
+
+
+@always_inline
+def _is_c_family(lang: Int) -> Bool:
+    return lang == LANG_C_CUDA or lang == LANG_RUST or lang == LANG_JS
+
+
+def _rust_char_end(b: Span[UInt8, _], i: Int) -> Int:
+    """End of a Rust char literal starting at `'` (`'a'`, `'\\n'`, `'\\u{1F600}'`), or -1 when
+    it is a lifetime / label (`'a`, `'static`)."""
+    var n = len(b)
+    if i + 1 >= n:
+        return -1
+    if b[i + 1] == 92:
+        var j = i + 2
+        while j < n and j < i + 14:
+            if b[j] == 39:
+                return j + 1
+            j += 1
+        return -1
+    var j = i + 2
+    while j < n and (b[j] & 0xC0) == 0x80:
+        j += 1
+    if j < n and b[j] == 39:
+        return j + 1
+    return -1
 
 
 def _split_words(s: String) -> List[String]:
@@ -176,11 +408,16 @@ def next_line_state(line: String, state: Int = STATE_NORMAL, lang: Int = LANG_MO
     if lang == LANG_JSON or lang == LANG_SHELL_YAML:
         return STATE_NORMAL
     if lang == LANG_MARKDOWN:
-        var st_md = STATE_MD_FENCE if state == STATE_MD_FENCE else STATE_NORMAL
         if _is_md_fence(b):
-            return STATE_NORMAL if st_md == STATE_MD_FENCE else STATE_MD_FENCE
-        return st_md
-    if lang == LANG_C_CUDA:
+            return STATE_NORMAL if md_in_fence(state) else md_fence_state(_fence_info_lang(b))
+        if md_in_fence(state):
+            var inner_lang = md_fence_lang(state)
+            return md_fence_state(inner_lang, next_line_state(line, md_fence_inner(state), inner_lang))
+        return STATE_NORMAL
+    if lang == LANG_JS:
+        var no_cls = List[Int]()
+        return _js_scan(b, state, no_cls, False)
+    if _is_c_family(lang):
         var i = 0
         var st_c = STATE_BLOCK_COMMENT if state == STATE_BLOCK_COMMENT else STATE_NORMAL
         while i < n:
@@ -199,6 +436,10 @@ def next_line_state(line: String, state: Int = STATE_NORMAL, lang: Int = LANG_MO
                     st_c = STATE_BLOCK_COMMENT
                     i += 2
                     continue
+            if c == 39 and lang == LANG_RUST:
+                var ce = _rust_char_end(b, i)
+                i = ce if ce > 0 else i + 1
+                continue
             if c == 34 or c == 39:
                 var j = i + 1
                 while j < n:
@@ -273,6 +514,8 @@ struct MojoHighlighter(Movable):
     var py_map: Dict[String, Int]
     var c_map: Dict[String, Int]
     var sh_map: Dict[String, Int]
+    var rust_map: Dict[String, Int]
+    var js_map: Dict[String, Int]
 
     def __init__(out self):
         self.mojo_map = Dict[String, Int]()
@@ -346,6 +589,41 @@ struct MojoHighlighter(Movable):
         for w in _split_words("this self Self"):
             self.c_map[w] = TOK_SELF
 
+        self.rust_map = Dict[String, Int]()
+        for w in _split_words(
+            "i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize f32 f64 bool char str String Vec"
+            " Option Result Box Rc Arc RefCell Cell HashMap HashSet BTreeMap Some None Ok Err Self"
+        ):
+            self.rust_map[w] = TOK_TYPE
+        for w in _split_words(
+            "as async await break const continue crate dyn else enum extern false fn for if impl in"
+            " let loop match mod move mut pub ref return static struct super trait true type unsafe"
+            " use where while union macro_rules"
+        ):
+            self.rust_map[w] = TOK_KEYWORD
+        self.rust_map["self"] = TOK_SELF
+        self.rust_map["Self"] = TOK_SELF
+
+        self.js_map = Dict[String, Int]()
+        for w in _split_words(
+            "console Math JSON Object Array Promise Map Set Symbol Number String Boolean Date RegExp"
+            " Error window document globalThis require module exports"
+        ):
+            self.js_map[w] = TOK_BUILTIN
+        for w in _split_words(
+            "string number boolean any unknown never void object bigint undefined"
+        ):
+            self.js_map[w] = TOK_TYPE
+        for w in _split_words(
+            "break case catch class const continue debugger default delete do else export extends"
+            " finally for function if import in instanceof let new return super switch throw try"
+            " typeof var while with yield async await of static get set true false null from as"
+            " interface type enum implements private public protected readonly declare namespace"
+            " abstract keyof satisfies"
+        ):
+            self.js_map[w] = TOK_KEYWORD
+        self.js_map["this"] = TOK_SELF
+
         self.sh_map = Dict[String, Int]()
         for w in _split_words("echo printf cd pwd ls rm cp mv mkdir cat grep sed awk find xargs test"):
             self.sh_map[w] = TOK_BUILTIN
@@ -360,16 +638,43 @@ struct MojoHighlighter(Movable):
             return self.py_map.get(word, TOK_TEXT)
         if lang == LANG_C_CUDA:
             return self.c_map.get(word, TOK_TEXT)
+        if lang == LANG_RUST:
+            return self.rust_map.get(word, TOK_TEXT)
+        if lang == LANG_JS:
+            return self.js_map.get(word, TOK_TEXT)
         if lang == LANG_SHELL_YAML:
             return self.sh_map.get(word, TOK_TEXT)
         return self.mojo_map.get(word, TOK_TEXT)
 
-    def _lex_c_cuda(self, line: String, state: Int, mut cls: List[Int]) -> Int:
+    def _lex_c_cuda(self, line: String, state: Int, mut cls: List[Int], lang: Int = LANG_C_CUDA) -> Int:
+        """C/C++/CUDA lexer; `lang` selects the Rust (`#[attr]`, lifetimes, `name!` macros)
+        dialect. JavaScript/TypeScript is delegated to `_lex_js`."""
+        if lang == LANG_JS:
+            return self._lex_js(line, state, cls)
         var b = line.as_bytes()
         var n = len(b)
         var i = 0
         var st = STATE_BLOCK_COMMENT if state == STATE_BLOCK_COMMENT else STATE_NORMAL
-        if st == STATE_NORMAL:
+        if st == STATE_NORMAL and lang == LANG_RUST:
+            var p = 0
+            while p < n and (b[p] == 32 or b[p] == 9):
+                p += 1
+            if p + 1 < n and b[p] == 35 and (b[p + 1] == 91 or b[p + 1] == 33):
+                var depth = 0
+                var q = p
+                while q < n:
+                    if b[q] == 91:
+                        depth += 1
+                    elif b[q] == 93:
+                        depth -= 1
+                        if depth == 0:
+                            q += 1
+                            break
+                    q += 1
+                for k in range(p, min(q, n)):
+                    cls[k] = TOK_DECORATOR
+                i = min(q, n)
+        elif st == STATE_NORMAL and lang == LANG_C_CUDA:
             var p = 0
             while p < n and (b[p] == 32 or b[p] == 9):
                 p += 1
@@ -413,6 +718,15 @@ struct MojoHighlighter(Movable):
                     st = STATE_BLOCK_COMMENT
                     i += 2
                     continue
+            if c == 39 and lang == LANG_RUST and _rust_char_end(b, i) < 0:
+                # Lifetime or loop label: `'a`, `'static`.
+                var j = i + 1
+                while j < n and _is_ident(b[j]):
+                    j += 1
+                for k in range(i, j):
+                    cls[k] = TOK_TYPE
+                i = j
+                continue
             if c == 34 or c == 39:
                 var j = i + 1
                 while j < n:
@@ -436,17 +750,24 @@ struct MojoHighlighter(Movable):
                 i = j
                 continue
             if _is_alpha(c):
-                var j = i
+                var j = i + 1
                 while j < n and _is_ident(b[j]):
                     j += 1
                 var w = String(line[byte=i:j])
-                var kind = self.classify_word(w, LANG_C_CUDA)
+                var kind = self.classify_word(w, lang)
+                if lang == LANG_RUST and kind == TOK_TEXT and j < n and b[j] == 33:
+                    kind = TOK_BUILTIN  # macro invocation `println!`
+                    j += 1
                 if kind == TOK_TEXT and (
                     prev_word == "struct"
                     or prev_word == "class"
                     or prev_word == "namespace"
                     or prev_word == "fn"
                     or prev_word == "func"
+                    or prev_word == "function"
+                    or prev_word == "enum"
+                    or prev_word == "trait"
+                    or prev_word == "interface"
                 ):
                     kind = TOK_DEF
                 elif kind == TOK_TEXT and j < n and b[j] == 40:
@@ -461,6 +782,56 @@ struct MojoHighlighter(Movable):
                 prev_word = ""
             i += 1
         return st
+
+    def _lex_js(self, line: String, state: Int, mut cls: List[Int]) -> Int:
+        """JavaScript/TypeScript: `_js_scan` structure (multi-line template literals and their
+        `${}` interpolations), then keyword / number / call classing of the code bytes."""
+        var b = line.as_bytes()
+        var n = len(b)
+        var next = _js_scan(b, state, cls, True)
+        var prev_word = String("")
+        var i = 0
+        while i < n:
+            if cls[i] != _JS_CODE:
+                i += 1
+                continue
+            var c = b[i]
+            if _is_digit(c) and (i == 0 or not _is_ident(b[i - 1])):
+                var j = i
+                while j < n and cls[j] == _JS_CODE and (_is_ident(b[j]) or b[j] == 46):
+                    j += 1
+                for k in range(i, j):
+                    cls[k] = TOK_NUMBER
+                i = j
+                continue
+            if _is_alpha(c) or c == 36:
+                var j = i + 1
+                while j < n and cls[j] == _JS_CODE and (_is_ident(b[j]) or b[j] == 36):
+                    j += 1
+                var w = String(line[byte=i:j])
+                var kind = self.classify_word(w, LANG_JS)
+                if kind == TOK_TEXT and (
+                    prev_word == "class"
+                    or prev_word == "function"
+                    or prev_word == "enum"
+                    or prev_word == "interface"
+                    or prev_word == "namespace"
+                ):
+                    kind = TOK_DEF
+                elif kind == TOK_TEXT and j < n and b[j] == 40:
+                    kind = TOK_DEF
+                for k in range(i, j):
+                    cls[k] = kind
+                prev_word = w
+                i = j
+                continue
+            if c == 32 or c == 9:
+                cls[i] = TOK_TEXT
+            else:
+                cls[i] = TOK_SYMBOL
+                prev_word = ""
+            i += 1
+        return next
 
     def _lex_toml(self, line: String, state: Int, mut cls: List[Int]) -> Int:
         var b = line.as_bytes()
@@ -708,14 +1079,15 @@ struct MojoHighlighter(Movable):
     def _lex_markdown(self, line: String, state: Int, mut cls: List[Int]) -> Int:
         var b = line.as_bytes()
         var n = len(b)
-        var st = STATE_MD_FENCE if state == STATE_MD_FENCE else STATE_NORMAL
         if _is_md_fence(b):
             for k in range(n):
                 cls[k] = TOK_DECORATOR
-            return STATE_NORMAL if st == STATE_MD_FENCE else STATE_MD_FENCE
-        if st == STATE_MD_FENCE:
-            _ = self.lex_bytes(line, STATE_NORMAL, cls, LANG_MOJO)
-            return STATE_MD_FENCE
+            return STATE_NORMAL if md_in_fence(state) else md_fence_state(_fence_info_lang(b))
+        if md_in_fence(state):
+            # Fenced code: the fence's language, carrying its own multi-line state.
+            var inner_lang = md_fence_lang(state)
+            var inner_next = self.lex_bytes(line, md_fence_inner(state), cls, inner_lang)
+            return md_fence_state(inner_lang, inner_next)
         var p = 0
         while p < n and (b[p] == 32 or b[p] == 9):
             p += 1
@@ -762,8 +1134,8 @@ struct MojoHighlighter(Movable):
         var n = len(b)
         cls.clear()
         cls.resize(n, TOK_TEXT)
-        if lang == LANG_C_CUDA:
-            return self._lex_c_cuda(line, state, cls)
+        if _is_c_family(lang):
+            return self._lex_c_cuda(line, state, cls, lang)
         if lang == LANG_TOML:
             return self._lex_toml(line, state, cls)
         if lang == LANG_JSON:

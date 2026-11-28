@@ -89,7 +89,10 @@ struct EmbeddedIde(Movable):
 
     def forward(mut self, inp: InputState, mx: Int, my: Int):
         var ctrl = inp.key_down(341) or inp.key_down(345)
-        var alt = inp.key_down(342) or inp.key_down(346)
+        # Right Alt is AltGr on international layouts (`{ [ @ \\ |` on German, etc.): when it produced text,
+        # forward that text instead of treating it as Meta (which sent ESC+letter and dropped the char).
+        var altgr_text = inp.key_down(346) and inp.text_input_utf8.byte_length() > 0
+        var alt = inp.key_down(342) or (inp.key_down(346) and not altgr_text)
         var shift = inp.key_down(340) or inp.key_down(344)
         var modifier = 1 + Int(shift) + 2 * Int(alt) + 4 * Int(ctrl)
         if ctrl or alt:
@@ -109,7 +112,7 @@ struct EmbeddedIde(Movable):
                 if b >= 32 and b != 127:
                     self.pty.pending.append(b)
         for key in range(256, 302):
-            if inp.key_pressed(key):
+            if inp.key_pressed_or_repeat(key):
                 self.pty.send(special_key(key, modifier))
         if self.grid.mouse and my >= HEADER:
             var pos = (
@@ -186,11 +189,9 @@ struct EmbeddedIde(Movable):
         var fb = win.framebuffer_size()
         var w = max(1, fb[0])
         var h = max(1, fb[1])
-        var scale = win.content_scale()
-        if not (scale > Float32(0.0)):
-            scale = Float32(1.0)
-        var mx = Int(inp.last_mouse_x * scale)
-        var my = Int(inp.last_mouse_y * scale)
+        # Pointer positions already arrive in framebuffer pixels (WaylandWindow.map_pointer).
+        var mx = Int(inp.last_mouse_x)
+        var my = Int(inp.last_mouse_y)
         if not self.tick(inp, w, h, mx, my, scene_hotkey):
             return False
         if self.visible:

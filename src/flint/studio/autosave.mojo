@@ -1,6 +1,6 @@
 """Project-local scene recovery. The scene snapshot and its original path survive a restart."""
-from flint.assets.flpk_v3 import AssetUuid
-from flint.core.serial import BlobReader, BlobWriter, fourcc
+
+from flint.core.serial import BlobReader, BlobWriter, fnv64, fourcc
 from flint.platform.os import file_size, file_stamp, list_directory, make_dirs, read_bytes, remove_file, write_file_durable
 
 
@@ -9,7 +9,36 @@ def recovery_directory(project: String) -> String:
 
 
 def snapshot_path(project: String, original: String) -> String:
-    return recovery_directory(project) + "/" + AssetUuid.from_path(original).format() + ".autosave.flscnb"
+    """`<project>/.flint/autosave/<scene stem>-<fnv64 hex of the full path>.autosave.flscnb`.
+    The stem keeps the file recognisable; the hash keeps `a/level.flscn` and `b/level.flscn` apart."""
+    var b = original.as_bytes()
+    var start = 0
+    var stop = len(b)
+    for i in range(len(b)):
+        if b[i] == 47:  # '/'
+            start = i + 1
+    for i in range(len(b) - 1, start - 1, -1):
+        if b[i] == 46:  # '.'
+            stop = i
+            break
+    var name = String("untitled")
+    if stop > start:
+        name = String(unsafe_from_utf8=b[start:stop])
+    # Never stack suffixes (`level.autosave.autosave`) if a path ever points at an autosave.
+    while name.endswith(".autosave"):
+        var trimmed = String(name[byte=0 : name.byte_length() - 9])
+        name = trimmed^
+    if name.byte_length() == 0:
+        name = String("untitled")
+    var key = List[UInt8](capacity=original.byte_length())
+    for c in b:
+        key.append(c)
+    var h = fnv64(key)
+    var digits = String("0123456789abcdef").as_bytes()
+    var hex = List[UInt8](capacity=16)
+    for k in range(16):
+        hex.append(digits[Int((h >> UInt64(60 - 4 * k)) & UInt64(15))])
+    return recovery_directory(project) + "/" + name + "-" + String(unsafe_from_utf8=hex) + ".autosave.flscnb"
 
 
 def write_snapshot(project: String, original: String, mut packed_scene: List[UInt8]) -> Bool:

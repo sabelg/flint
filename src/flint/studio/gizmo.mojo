@@ -15,10 +15,13 @@ from flint.core.math import Quat, Vec3
 from flint.ui.draw_list import UiDrawList
 from flint.ui.theme import lerp_rgba8, rgba8_scale_alpha, rgba8_with_alpha
 
-comptime GIZMO_MODE_SELECT: Int = -1
+comptime GIZMO_TARGET_PX: Float32 = 96.0
+"""Gizmo handle length in UI points (multiply by the UI scale for physical pixels)."""
 comptime GIZMO_MODE_TRANSLATE: Int = 0
 comptime GIZMO_MODE_ROTATE: Int = 1
 comptime GIZMO_MODE_SCALE: Int = 2
+comptime GIZMO_MODE_SELECT: Int = 3
+"""Select tool (Q): no gizmo is drawn or picked; clicks only select."""
 
 comptime GIZMO_SPACE_WORLD: Int = 0
 comptime GIZMO_SPACE_LOCAL: Int = 1
@@ -31,6 +34,9 @@ comptime GIZMO_PLANE_XY: Int = 4
 comptime GIZMO_PLANE_XZ: Int = 5
 comptime GIZMO_PLANE_YZ: Int = 6
 comptime GIZMO_SCALE_UNIFORM: Int = 7
+comptime GIZMO_AXIS_VIEW: Int = 8
+"""Rotate mode's outer screen ring: turns the selection about the camera's view axis."""
+comptime GIZMO_VIEW_RING_SCALE: Float32 = 1.06
 
 # Flint Obsidian harmonized default axis palette (overridable from StudioTheme)
 comptime GIZMO_COLOR_X: UInt32 = 0xFFE85A66
@@ -197,6 +203,23 @@ def ray_axis_closest_param(
     return (True, t, dist)
 
 
+@always_inline
+def clamp_gizmo_param(t: Float32, max_param: Float32) -> Float32:
+    """Clamps a drag parameter to `+-max_param` (no clamp when `max_param <= 0`)."""
+    if not (isfinite(max_param) and max_param > Float32(0.0)):
+        return t
+    return max(-max_param, min(max_param, t))
+
+
+def gizmo_drag_param_limit(gizmo_world_radius: Float32, far_z: Float32 = 1000.0) -> Float32:
+    """How far (world units) a gizmo drag may carry the selection along an axis or across a plane:
+    a fixed multiple of the on-screen gizmo size, never past the far plane. Near the horizon the
+    closest-point solve diverges; this keeps the object from flying off to infinity."""
+    var r = gizmo_world_radius if (isfinite(gizmo_world_radius) and gizmo_world_radius > Float32(0.0)) else Float32(1.0)
+    var f = far_z if (isfinite(far_z) and far_z > Float32(1.0)) else Float32(1000.0)
+    return max(Float32(1.0), min(f, r * Float32(256.0)))
+
+
 def ray_plane_hit(
     ray: ViewportRay,
     plane_origin: Vec3,
@@ -292,9 +315,21 @@ def gizmo_rotation_delta_rad(
     var vp1 = ray_plane_hit(cur_ray, pivot, view_n)
     if not vp0[0] or not vp1[0]:
         return Float32(0.0)
-    var raw_tan = axis.cross(view_n)
-    var tangent = raw_tan.normalized() if raw_tan.length_squared() > Float32(1.0e-8) else Vec3(1.0, 0.0, 0.0)
+    # Edge-on ring: it projects to a line, so the grab point on screen is the x coordinate along
+    # e1 = axis x view_n; take the ring point on the half nearer the camera (the one users grab).
+    # The drag tangent there is axis x r (using axis x view_n alone turned the ring against the cursor).
     var eff_r = max(Float32(0.05), ring_world_radius)
+    var e1_raw = axis.cross(view_n)
+    var tangent = Vec3(1.0, 0.0, 0.0)
+    if e1_raw.length_squared() > Float32(1.0e-8):
+        var e1 = e1_raw.normalized()
+        var e2_raw = view_n - axis * view_n.dot(axis)
+        var e2 = e2_raw.normalized() if e2_raw.length_squared() > Float32(1.0e-8) else view_n
+        var gx = max(-eff_r, min(eff_r, (vp0[1] - pivot).dot(e1)))
+        var gz = sqrt(max(Float32(0.0), eff_r * eff_r - gx * gx))
+        var r = e1 * gx - e2 * gz
+        var t_raw = axis.cross(r)
+        tangent = t_raw.normalized() if t_raw.length_squared() > Float32(1.0e-10) else e1
     var disp = (vp1[1] - vp0[1]).dot(tangent)
     if not isfinite(disp):
         return Float32(0.0)
@@ -324,8 +359,11 @@ def gizmo_scale_drag(
     start_scale: Vec3,
     snap_step: Float32 = 0.0,
     gizmo_rot: Quat = Quat.identity(),
+    max_param: Float32 = 0.0,
 ) -> Vec3:
-    """Solves 1D per-axis or uniform 3D scale drag relative to `start_scale`."""
+    """Solves 1D per-axis or uniform 3D scale drag relative to `start_scale`. A positive `max_param`
+    clamps the axis parameters to `+-max_param` (a ray grazing the axis would otherwise send `t`, and
+    the scale, toward infinity)."""
     var safe_start = Vec3(
         start_scale.x if isfinite(start_scale.x) else Float32(1.0),
         start_scale.y if isfinite(start_scale.y) else Float32(1.0),
@@ -370,7 +408,9 @@ def gizmo_scale_drag(
     var p1 = ray_axis_closest_param(cur_ray, pivot, ax)
     if not p0[0] or not p1[0]:
         return safe_start
-    var ratio_raw = Float32(1.0) + (p1[1] - p0[1]) / eff_r
+    var t0 = clamp_gizmo_param(p0[1], max_param)
+    var t1 = clamp_gizmo_param(p1[1], max_param)
+    var ratio_raw = Float32(1.0) + (t1 - t0) / eff_r
     if not isfinite(ratio_raw):
         return safe_start
     var ratio = max(Float32(0.05), ratio_raw)
@@ -407,6 +447,57 @@ def snap_scalar(val: Float32, step: Float32) -> Float32:
 
 
 @always_inline
+def snap_constrained_delta(
+    pivot: Vec3,
+    delta: Vec3,
+    handle: Int,
+    grid_step: Float32,
+    gizmo_rot: Quat = Quat.identity(),
+) -> Vec3:
+    """Grid-snaps a translate-gizmo drag along only the handle's constrained gizmo axes.
+
+    An axis handle snaps one component and a plane handle two; the free components stay exactly where
+    they were (snapping the whole pivot used to pull Y/Z onto the grid during an X drag). A gizmo axis
+    that is world-aligned snaps the absolute world coordinate; a rotated (local) axis snaps the offset."""
+    if not isfinite(grid_step) or grid_step <= Float32(1.0e-6):
+        return delta
+    var rot = _sanitize_gizmo_rot(gizmo_rot)
+    var bx = rot.rotate(Vec3(1.0, 0.0, 0.0))
+    var by = rot.rotate(Vec3(0.0, 1.0, 0.0))
+    var bz = rot.rotate(Vec3(0.0, 0.0, 1.0))
+    var axes = List[Vec3]()
+    if handle == GIZMO_AXIS_X:
+        axes.append(bx)
+    elif handle == GIZMO_AXIS_Y:
+        axes.append(by)
+    elif handle == GIZMO_AXIS_Z:
+        axes.append(bz)
+    elif handle == GIZMO_PLANE_XY:
+        axes.append(bx)
+        axes.append(by)
+    elif handle == GIZMO_PLANE_XZ:
+        axes.append(bx)
+        axes.append(bz)
+    elif handle == GIZMO_PLANE_YZ:
+        axes.append(by)
+        axes.append(bz)
+    else:
+        return snap_translation(pivot + delta, grid_step) - pivot
+    var out = delta
+    for i in range(len(axes)):
+        var a = axes[i]
+        var t = delta.dot(a)
+        var world_aligned = max(abs(a.x), max(abs(a.y), abs(a.z))) > Float32(0.9999)
+        var snapped: Float32
+        if world_aligned:
+            var p = pivot.dot(a)
+            snapped = snap_scalar(p + t, grid_step) - p
+        else:
+            snapped = snap_scalar(t, grid_step)
+        out = out + a * (snapped - t)
+    return out
+
+
 def snap_translation(pos: Vec3, grid_step: Float32) -> Vec3:
     if not isfinite(grid_step) or grid_step <= Float32(1.0e-6):
         return pos
@@ -528,6 +619,55 @@ def _emit_gizmo_arrow_cone(
     _ = ui.add_polygon(xy, counts, color)
 
 
+def _emit_thick_line_ui(
+    mut ui: UiDrawList,
+    x0: Float32,
+    y0: Float32,
+    x1: Float32,
+    y1: Float32,
+    thickness: Float32,
+    color: UInt32,
+):
+    if not (isfinite(x0) and isfinite(y0) and isfinite(x1) and isfinite(y1) and isfinite(thickness)):
+        return
+    var dx = x1 - x0
+    var dy = y1 - y0
+    var dist64 = sqrt(Float64(dx) * Float64(dx) + Float64(dy) * Float64(dy))
+    if not isfinite(dist64):
+        return
+    var rad = max(Float32(1.2), min(Float32(256.0), thickness * Float32(0.5)))
+    var denom64 = Float64(max(Float32(2.2), rad * Float32(0.95)))
+    var steps = max(1, min(64, Int(min(64.0, dist64 / denom64)) + 1))
+    for i in range(steps + 1):
+        var t = Float32(i) / Float32(steps)
+        var px = x0 + dx * t
+        var py = y0 + dy * t
+        if isfinite(px) and isfinite(py):
+            ui.add_circle(px, py, rad, color)
+
+
+comptime GIZMO_AXIS_MIN_VIEW_DEG: Float32 = 6.0
+"""Axis/plane handles closer than this to edge-on (axis along the view ray, plane seen side-on) are hidden
+and unpickable: dragging them divides by ~sin^2(angle), so a pixel of mouse motion moved objects metres."""
+
+
+def gizmo_axis_usable(axis: Vec3, view_dir: Vec3) -> Bool:
+    """True when a translate/scale axis handle is far enough from the view ray to drag stably."""
+    var c = abs(axis.dot(view_dir))
+    return isfinite(c) and c < cos(GIZMO_AXIS_MIN_VIEW_DEG * Float32(0.017453292))
+
+
+def gizmo_plane_usable(normal: Vec3, view_dir: Vec3) -> Bool:
+    """True when a dual-axis plane handle is not seen (nearly) edge-on."""
+    var c = abs(normal.dot(view_dir))
+    return isfinite(c) and c > sin(GIZMO_AXIS_MIN_VIEW_DEG * Float32(0.017453292))
+
+
+def _gizmo_ring_seg_is_back(mid: Vec3, pivot: Vec3, view_dir: Vec3, wscale: Float32) -> Bool:
+    """True for a rotate-ring segment on the far (camera-averted) half: drawn ghosted, never pickable."""
+    return (mid - pivot).dot(view_dir) > wscale * Float32(0.05)
+
+
 def pick_gizmo_handle(
     mouse_x: Float32,
     mouse_y: Float32,
@@ -544,10 +684,17 @@ def pick_gizmo_handle(
     fov_y_deg: Float32,
     target_px: Float32 = 96.0,
     gizmo_rot: Quat = Quat.identity(),
+    px_scale: Float32 = 1.0,
 ) -> Int:
-    """Screen-space handle picker returning `GIZMO_AXIS_*`, `GIZMO_PLANE_*`, or `GIZMO_SCALE_UNIFORM`."""
+    """Screen-space handle picker returning `GIZMO_AXIS_*`, `GIZMO_PLANE_*`, `GIZMO_SCALE_UNIFORM` or
+    `GIZMO_AXIS_VIEW`. `px_scale` (physical pixels per UI point) scales every hit tolerance, so handles
+    are as easy to grab at 200% UI scale as at 100%. Rotate rings only accept hits on the half facing
+    the camera: the far half is behind the selection and grabbing it turns the object the wrong way.
+    `GIZMO_MODE_SELECT` never picks a handle."""
     if mode == GIZMO_MODE_SELECT:
         return GIZMO_AXIS_NONE
+    var k = px_scale if (isfinite(px_scale) and px_scale > Float32(0.0)) else Float32(1.0)
+    var tol = Float32(11.0) * k
     if not (
         isfinite(mouse_x) and isfinite(mouse_y)
         and isfinite(vp_x) and isfinite(vp_y) and isfinite(vp_w) and isfinite(vp_h)
@@ -567,11 +714,12 @@ def pick_gizmo_handle(
 
     if mode == GIZMO_MODE_SCALE:
         var dc = _point_seg_dist_px(mouse_x, mouse_y, c_proj[0], c_proj[1], c_proj[0], c_proj[1])
-        if dc <= Float32(11.0):
+        if dc <= tol:
             return GIZMO_SCALE_UNIFORM
 
     if mode == GIZMO_MODE_TRANSLATE or mode == GIZMO_MODE_SCALE:
         if mode == GIZMO_MODE_TRANSLATE:
+            # True perspective plane quads (front-most wins); hidden when seen (nearly) edge-on.
             var pl_u = [bx, bx, by]
             var pl_v = [by, bz, bz]
             var pl_n = [bz, by, bx]
@@ -582,7 +730,7 @@ def pick_gizmo_handle(
             var best_plane_z = Float32(1.0e30)
             for pi in range(3):
                 var grazing = abs(pl_n[pi].dot(view_dir))
-                if grazing < GIZMO_PLANE_GRAZING_MIN:
+                if grazing < GIZMO_PLANE_GRAZING_MIN or not gizmo_plane_usable(pl_n[pi], view_dir):
                     continue
                 var q0 = project_world_to_viewport(pivot + pl_u[pi] * s0 + pl_v[pi] * s0, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
                 var q1 = project_world_to_viewport(pivot + pl_u[pi] * s1 + pl_v[pi] * s0, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
@@ -592,7 +740,7 @@ def pick_gizmo_handle(
                     var hit_q = _point_in_quad_px(mouse_x, mouse_y, q0[0], q0[1], q1[0], q1[1], q2[0], q2[1], q3[0], q3[1])
                     var mid_x = (q0[0] + q1[0] + q2[0] + q3[0]) * Float32(0.25)
                     var mid_y = (q0[1] + q1[1] + q2[1] + q3[1]) * Float32(0.25)
-                    var near_mid = _point_seg_dist_px(mouse_x, mouse_y, mid_x, mid_y, mid_x, mid_y) <= Float32(9.0)
+                    var near_mid = _point_seg_dist_px(mouse_x, mouse_y, mid_x, mid_y, mid_x, mid_y) <= Float32(9.0) * k
                     if hit_q or near_mid:
                         var avg_z = (q0[2] + q1[2] + q2[2] + q3[2]) * Float32(0.25)
                         if avg_z < best_plane_z:
@@ -604,9 +752,9 @@ def pick_gizmo_handle(
         var axes = [bx, by, bz]
         var ids = [GIZMO_AXIS_X, GIZMO_AXIS_Y, GIZMO_AXIS_Z]
         var best_id = GIZMO_AXIS_NONE
-        var best_d = Float32(12.0)
+        var best_d = tol + Float32(1.0) * k
         for a in range(3):
-            if abs(axes[a].dot(view_dir)) > Float32(0.985):
+            if not gizmo_axis_usable(axes[a], view_dir):
                 continue
             var tip = project_world_to_viewport(pivot + axes[a] * wscale, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
             if tip[3]:
@@ -616,12 +764,12 @@ def pick_gizmo_handle(
                     best_id = ids[a]
         return best_id
 
-    # Rotate mode: prioritize front-hemisphere projected 3D rings
+    # Rotate mode: test distance to the front (camera-facing) half of the projected 3D rings
     var ring_u = [by, bx, bx]
     var ring_v = [bz, bz, by]
     var r_ids = [GIZMO_AXIS_X, GIZMO_AXIS_Y, GIZMO_AXIS_Z]
     var best_r = GIZMO_AXIS_NONE
-    var best_rd = Float32(11.0)
+    var best_rd = tol
     comptime SEG: Int = 32
     for ri in range(3):
         for s in range(SEG):
@@ -629,18 +777,38 @@ def pick_gizmo_handle(
             var a1 = Float32(s + 1) * Float32(6.2831853 / Float32(SEG))
             var p0 = pivot + (ring_u[ri] * cos(a0) + ring_v[ri] * sin(a0)) * wscale
             var p1 = pivot + (ring_u[ri] * cos(a1) + ring_v[ri] * sin(a1)) * wscale
-            var mid = (p0 + p1) * Float32(0.5)
-            # Bias slightly toward front hemisphere while still allowing grazing grabs
-            var is_back = (mid - pivot).dot(view_dir) > wscale * Float32(0.12)
+            if _gizmo_ring_seg_is_back((p0 + p1) * Float32(0.5), pivot, view_dir, wscale):
+                continue  # far half of the ring
             var s0 = project_world_to_viewport(p0, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
             var s1 = project_world_to_viewport(p1, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
             if s0[3] and s1[3]:
                 var d = _point_seg_dist_px(mouse_x, mouse_y, s0[0], s0[1], s1[0], s1[1])
-                var eff_d = d + (Float32(3.5) if is_back else Float32(0.0))
-                if eff_d < best_rd:
-                    best_rd = eff_d
+                if d < best_rd:
+                    best_rd = d
                     best_r = r_ids[ri]
+    if best_r == GIZMO_AXIS_NONE:
+        var view_r = target_px * GIZMO_VIEW_RING_SCALE
+        var dxv = mouse_x - c_proj[0]
+        var dyv = mouse_y - c_proj[1]
+        if abs(sqrt(dxv * dxv + dyv * dyv) - view_r) <= tol:
+            return GIZMO_AXIS_VIEW
     return best_r
+
+
+def gizmo_uniform_scale_screen(
+    start_x: Float32, start_y: Float32, cur_x: Float32, cur_y: Float32, center_x: Float32, center_y: Float32
+) -> Float32:
+    """Uniform scale factor from a drag on the centre handle: how much farther the mouse is from the
+    pivot on screen than where the drag started. Moving in any direction away from the pivot grows the
+    selection and moving toward it shrinks it (the old solver only read the camera-right component)."""
+    var d0 = sqrt((start_x - center_x) * (start_x - center_x) + (start_y - center_y) * (start_y - center_y))
+    var d1 = sqrt((cur_x - center_x) * (cur_x - center_x) + (cur_y - center_y) * (cur_y - center_y))
+    if not (isfinite(d0) and isfinite(d1)):
+        return Float32(1.0)
+    # A press right on the pivot has no lever arm: measure from a small minimum radius instead.
+    var base = max(Float32(12.0), d0)
+    var f = Float32(1.0) + (d1 - d0) / base
+    return max(Float32(0.05), min(Float32(100.0), f)) if isfinite(f) else Float32(1.0)
 
 
 def emit_gizmo_draw_list(
@@ -665,14 +833,20 @@ def emit_gizmo_draw_list(
     axis_z_color: UInt32 = GIZMO_COLOR_Z,
     active_color: UInt32 = GIZMO_COLOR_ACTIVE,
     drag_angle_rad: Float32 = 0.0,
+    px_scale: Float32 = 1.0,
 ):
     """Emits razor-sharp analytical GPU SDF 3D gizmos (depth-sorted `PRIM_LINE` shafts + contrast halos,
     tapered `PRIM_POLYGON` cone arrowheads, true 3D perspective plane quads with grazing-angle fade,
-    hemisphere-cued rotation rings, scale cubes, and ringed center reticle)."""
+    hemisphere-cued rotation rings + view-axis ring, scale cubes, and ringed center reticle) into
+    `UiDrawList` clipped to the 3D viewport. `px_scale` (physical pixels per UI point) scales every
+    handle size and stroke, matching the pick tolerance in `pick_gizmo_handle`, so handles look as big
+    at 200% UI scale as they are to grab. Handles `pick_gizmo_handle` rejects (edge-on axes/planes, the
+    far ring half) are hidden or ghosted. `GIZMO_MODE_SELECT` draws nothing."""
     if mode == GIZMO_MODE_SELECT:
         return
     if not (isfinite(vp_x) and isfinite(vp_y) and isfinite(vp_w) and isfinite(vp_h) and isfinite(target_px)):
         return
+    var k = px_scale if (isfinite(px_scale) and px_scale > Float32(0.0)) else Float32(1.0)
     var c = project_world_to_viewport(pivot, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
     if not c[3]:
         return
@@ -708,7 +882,7 @@ def emit_gizmo_draw_list(
             quad_counts.append(4)
             for pi in range(3):
                 var grazing = abs(pl_n[pi].dot(view_dir))
-                if grazing < GIZMO_PLANE_GRAZING_MIN:
+                if grazing < GIZMO_PLANE_GRAZING_MIN or not gizmo_plane_usable(pl_n[pi], view_dir):
                     continue
                 var vis_t = min(Float32(1.0), (grazing - GIZMO_PLANE_GRAZING_MIN) / Float32(0.18))
                 var q0 = project_world_to_viewport(pivot + pl_u[pi] * s0 + pl_v[pi] * s0, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
@@ -721,7 +895,7 @@ def emit_gizmo_draw_list(
                     var base_c = active_color if is_act else (lerp_rgba8(pl_cols[pi], UInt32(0xFFFFFFFF), Float32(0.28)) if is_hov else pl_cols[pi])
                     var fill_a = Float32(0.54) if is_act else (Float32(0.42) if is_hov else Float32(0.26))
                     var edge_a = Float32(0.96) if (is_act or is_hov) else Float32(0.84)
-                    var edge_t = Float32(1.9) if (is_act or is_hov) else Float32(1.4)
+                    var edge_t = (Float32(1.9) if (is_act or is_hov) else Float32(1.4)) * k
                     var q_xy = List[Float32](capacity=8)
                     q_xy.append(q0[0]); q_xy.append(q0[1])
                     q_xy.append(q1[0]); q_xy.append(q1[1])
@@ -754,14 +928,15 @@ def emit_gizmo_draw_list(
                     order[j] = tmp
 
         # 3. Emit depth-sorted analytical shafts + sharp cone arrowheads / machined scale cubes
+        var align_max = cos(GIZMO_AXIS_MIN_VIEW_DEG * Float32(0.017453292))
         for oi in range(3):
             var a = order[oi]
             if not tip_ok[a]:
                 continue
+            if not gizmo_axis_usable(axes[a], view_dir):
+                continue  # matches `pick_gizmo_handle`: no handle is shown that cannot be dragged
             var align = abs(axes[a].dot(view_dir))
-            if align > Float32(0.985):
-                continue
-            var fade = Float32(1.0) if align < Float32(0.90) else max(Float32(0.25), (Float32(0.985) - align) / Float32(0.085))
+            var fade = Float32(1.0) if align < Float32(0.90) else max(Float32(0.25), (align_max - align) / (align_max - Float32(0.90)))
             var is_act = active_handle == h_ids[a]
             var is_hov = hovered_handle == h_ids[a]
             var col_raw = active_color if is_act else (lerp_rgba8(cols[a], UInt32(0xFFFFFFFF), Float32(0.32)) if is_hov else cols[a])
@@ -771,7 +946,7 @@ def emit_gizmo_draw_list(
             var dx = tx - c[0]
             var dy = ty - c[1]
             var slen = sqrt(dx * dx + dy * dy)
-            if slen <= Float32(3.0):
+            if slen <= Float32(3.0) * k:
                 continue
             var ux = dx / slen
             var uy = dy / slen
@@ -779,49 +954,55 @@ def emit_gizmo_draw_list(
             # Subtle infinite axis guide rail during active drag
             if is_act:
                 var rail_col = rgba8_with_alpha(active_color, 72)
-                ui.add_line(c[0] - ux * Float32(420.0), c[1] - uy * Float32(420.0), c[0] + ux * Float32(420.0), c[1] + uy * Float32(420.0), Float32(1.2), rail_col)
+                var rail_l = Float32(420.0) * k
+                ui.add_line(c[0] - ux * rail_l, c[1] - uy * rail_l, c[0] + ux * rail_l, c[1] + uy * rail_l, Float32(1.2) * k, rail_col)
 
-            var head_len = Float32(16.5) if (is_act or is_hov) else Float32(14.5)
-            var half_w = Float32(5.6) if (is_act or is_hov) else Float32(4.8)
-            var start_off = min(slen * Float32(0.35), Float32(6.8))
-            var end_trim = min(slen - start_off, (head_len * Float32(0.82)) if mode == GIZMO_MODE_TRANSLATE else Float32(5.0))
+            var head_len = (Float32(16.5) if (is_act or is_hov) else Float32(14.5)) * k
+            var half_w = (Float32(5.6) if (is_act or is_hov) else Float32(4.8)) * k
+            var start_off = min(slen * Float32(0.35), Float32(6.8) * k)
+            var end_trim = min(slen - start_off, (head_len * Float32(0.82)) if mode == GIZMO_MODE_TRANSLATE else Float32(5.0) * k)
             var sx0 = c[0] + ux * start_off
             var sy0 = c[1] + uy * start_off
             var sx1 = tx - ux * end_trim
             var sy1 = ty - uy * end_trim
-            var shaft_t = Float32(3.4) if (is_act or is_hov) else Float32(2.7)
+            var shaft_t = (Float32(3.4) if (is_act or is_hov) else Float32(2.7)) * k
 
             # Analytical SDF shaft with dark contrast backing halo
-            ui.add_line(sx0, sy0, sx1, sy1, shaft_t + Float32(2.2), rgba8_scale_alpha(GIZMO_COLOR_HALO, fade))
+            ui.add_line(sx0, sy0, sx1, sy1, shaft_t + Float32(2.2) * k, rgba8_scale_alpha(GIZMO_COLOR_HALO, fade))
             ui.add_line(sx0, sy0, sx1, sy1, shaft_t, col)
 
             if mode == GIZMO_MODE_TRANSLATE:
                 _emit_gizmo_arrow_cone(ui, tx, ty, ux, uy, head_len, half_w, col, fade)
             else:
-                var csz = Float32(11.0) if (is_act or is_hov) else Float32(9.6)
+                var csz = (Float32(11.0) if (is_act or is_hov) else Float32(9.6)) * k
                 var ch = csz * Float32(0.5)
-                ui.add_rect(tx - ch - Float32(1.0), ty - ch - Float32(1.0), csz + Float32(2.0), csz + Float32(2.0), rgba8_scale_alpha(GIZMO_COLOR_HALO, fade), Float32(2.8))
-                ui.add_rect(tx - ch, ty - ch, csz, csz, col, Float32(2.0), Float32(0.8), rgba8_scale_alpha(UInt32(0x40FFFFFF), fade))
+                ui.add_rect(tx - ch - k, ty - ch - k, csz + Float32(2.0) * k, csz + Float32(2.0) * k, rgba8_scale_alpha(GIZMO_COLOR_HALO, fade), Float32(2.8) * k)
+                ui.add_rect(tx - ch, ty - ch, csz, csz, col, Float32(2.0) * k, Float32(0.8) * k, rgba8_scale_alpha(UInt32(0x40FFFFFF), fade))
 
         # 4. Precision Center Pivot Reticle
         var ctr_act = active_handle == GIZMO_SCALE_UNIFORM
         var ctr_hov = hovered_handle == GIZMO_SCALE_UNIFORM
         var center_col = active_color if ctr_act else (UInt32(0xFFFFFFFF) if ctr_hov else GIZMO_COLOR_CENTER)
         if mode == GIZMO_MODE_SCALE:
-            var usz = Float32(13.0) if (ctr_act or ctr_hov) else Float32(11.6)
+            var usz = (Float32(13.0) if (ctr_act or ctr_hov) else Float32(11.6)) * k
             var uh = usz * Float32(0.5)
-            ui.add_rect(c[0] - uh - Float32(1.0), c[1] - uh - Float32(1.0), usz + Float32(2.0), usz + Float32(2.0), GIZMO_COLOR_HALO, Float32(3.2))
-            ui.add_rect(c[0] - uh, c[1] - uh, usz, usz, GIZMO_COLOR_CORE, Float32(2.4), Float32(1.8), center_col)
+            ui.add_rect(c[0] - uh - k, c[1] - uh - k, usz + Float32(2.0) * k, usz + Float32(2.0) * k, GIZMO_COLOR_HALO, Float32(3.2) * k)
+            ui.add_rect(c[0] - uh, c[1] - uh, usz, usz, GIZMO_COLOR_CORE, Float32(2.4) * k, Float32(1.8) * k, center_col)
         else:
             # Subtle outer screen-space free-move ring + dark-cored pivot ring
-            ui.add_arc(c[0], c[1], Float32(11.5), Float32(1.2), Float32(0.0), Float32(6.2831853), UInt32(0x4CEEF2F7))
-            ui.add_circle(c[0], c[1], Float32(5.6), GIZMO_COLOR_HALO)
-            ui.add_circle(c[0], c[1], Float32(4.8), GIZMO_COLOR_CORE, Float32(1.8), center_col)
+            ui.add_arc(c[0], c[1], Float32(11.5) * k, Float32(1.2) * k, Float32(0.0), Float32(6.2831853), UInt32(0x4CEEF2F7))
+            ui.add_circle(c[0], c[1], Float32(5.6) * k, GIZMO_COLOR_HALO)
+            ui.add_circle(c[0], c[1], Float32(4.8) * k, GIZMO_COLOR_CORE, Float32(1.8) * k, center_col)
     else:
         # 3D Rotation Rings with Back/Front Hemisphere Depth Cueing
-        # Subtle screen-space outer horizon silhouette ring
-        ui.add_arc(c[0], c[1], target_px * Float32(1.07), Float32(2.4), Float32(0.0), Float32(6.2831853), UInt32(0x36080B10))
-        ui.add_arc(c[0], c[1], target_px * Float32(1.07), Float32(1.2), Float32(0.0), Float32(6.2831853), UInt32(0x52DCE4F0))
+        # Outer screen-space view-axis ring (`GIZMO_AXIS_VIEW`): dark silhouette + light stroke
+        var view_act = active_handle == GIZMO_AXIS_VIEW
+        var view_hov = hovered_handle == GIZMO_AXIS_VIEW
+        var view_r = target_px * GIZMO_VIEW_RING_SCALE
+        var view_col = active_color if view_act else (UInt32(0xA6DCE4F0) if view_hov else UInt32(0x66DCE4F0))
+        var view_t = (Float32(2.0) if (view_act or view_hov) else Float32(1.2)) * k
+        ui.add_arc(c[0], c[1], view_r, view_t + Float32(1.2) * k, Float32(0.0), Float32(6.2831853), UInt32(0x36080B10))
+        ui.add_arc(c[0], c[1], view_r, view_t, Float32(0.0), Float32(6.2831853), view_col)
 
         var ring_u = [by, bx, bx]
         var ring_v = [bz, bz, by]
@@ -851,7 +1032,7 @@ def emit_gizmo_draw_list(
                     wc.append(len(w_xy) // 2)
                     _ = ui.add_polygon(w_xy, wc, rgba8_with_alpha(active_color, 58))
 
-        # Pass 1: Back hemisphere (receding arcs, softly ghosted)
+        # Pass 1: Back hemisphere (receding arcs, softly ghosted; not pickable, see `pick_gizmo_handle`)
         for ri in range(3):
             var is_act = active_handle == h_ids[ri]
             var is_hov = hovered_handle == h_ids[ri]
@@ -862,36 +1043,34 @@ def emit_gizmo_draw_list(
                 var a1 = Float32(s + 1) * step_a
                 var p0 = pivot + (ring_u[ri] * cos(a0) + ring_v[ri] * sin(a0)) * wscale
                 var p1 = pivot + (ring_u[ri] * cos(a1) + ring_v[ri] * sin(a1)) * wscale
-                var mid = (p0 + p1) * Float32(0.5)
-                if (mid - pivot).dot(view_dir) <= wscale * Float32(0.04):
+                if not _gizmo_ring_seg_is_back((p0 + p1) * Float32(0.5), pivot, view_dir, wscale):
                     continue
                 var s0 = project_world_to_viewport(p0, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
                 var s1 = project_world_to_viewport(p1, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
                 if s0[3] and s1[3]:
-                    ui.add_line(s0[0], s0[1], s1[0], s1[1], Float32(1.3), back_c)
+                    ui.add_line(s0[0], s0[1], s1[0], s1[1], Float32(1.3) * k, back_c)
 
         # Pass 2: Front hemisphere (facing arcs, crisp analytical SDF stroke + dark contrast halo)
         for ri in range(3):
             var is_act = active_handle == h_ids[ri]
             var is_hov = hovered_handle == h_ids[ri]
             var rcol = active_color if is_act else (lerp_rgba8(cols[ri], UInt32(0xFFFFFFFF), Float32(0.32)) if is_hov else cols[ri])
-            var rt = Float32(3.3) if (is_act or is_hov) else Float32(2.5)
+            var rt = (Float32(3.3) if (is_act or is_hov) else Float32(2.5)) * k
             for s in range(RSEG):
                 var a0 = Float32(s) * step_a
                 var a1 = Float32(s + 1) * step_a
                 var p0 = pivot + (ring_u[ri] * cos(a0) + ring_v[ri] * sin(a0)) * wscale
                 var p1 = pivot + (ring_u[ri] * cos(a1) + ring_v[ri] * sin(a1)) * wscale
-                var mid = (p0 + p1) * Float32(0.5)
-                if (mid - pivot).dot(view_dir) > wscale * Float32(0.04):
+                if _gizmo_ring_seg_is_back((p0 + p1) * Float32(0.5), pivot, view_dir, wscale):
                     continue
                 var s0 = project_world_to_viewport(p0, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
                 var s1 = project_world_to_viewport(p1, vp_x, vp_y, vp_w, vp_h, cam_pos, cam_fwd, cam_right, cam_up, fov_y_deg)
                 if s0[3] and s1[3]:
-                    ui.add_line(s0[0], s0[1], s1[0], s1[1], rt + Float32(2.0), GIZMO_COLOR_HALO)
+                    ui.add_line(s0[0], s0[1], s1[0], s1[1], rt + Float32(2.0) * k, GIZMO_COLOR_HALO)
                     ui.add_line(s0[0], s0[1], s1[0], s1[1], rt, rcol)
 
         # Center pivot reticle
-        ui.add_circle(c[0], c[1], Float32(4.6), GIZMO_COLOR_HALO)
-        ui.add_circle(c[0], c[1], Float32(3.8), GIZMO_COLOR_CORE, Float32(1.6), GIZMO_COLOR_CENTER)
+        ui.add_circle(c[0], c[1], Float32(4.6) * k, GIZMO_COLOR_HALO)
+        ui.add_circle(c[0], c[1], Float32(3.8) * k, GIZMO_COLOR_CORE, Float32(1.6) * k, GIZMO_COLOR_CENTER)
 
     ui.pop_clip()

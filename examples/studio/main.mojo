@@ -16,14 +16,15 @@ powered by the unified Engine v5 spine (`EngineApp`, `WindowPlugin`, `TransformP
   - **`--gallery <dir>`**:
     Renders all 6 deterministic `1280x720` visual showcase shots (`01_edit_default.png` .. `06_play_hud.png`).
   - **`--mcp-stdio`**:
-    Runs `McpServerV2` in spec-compliant Model Context Protocol (`2024-11-05`) JSON-RPC 2.0 `stdio` mode.
+    Runs `McpServerV2` in spec-compliant MCP (`2024-11-05` / `2025-06-18`) JSON-RPC 2.0 `stdio` mode
+    (clients must `initialize` first; `structuredContent` only for `2025-06-18`).
   - **`--mcp-connect <sock_path>`**:
     Pure-Mojo bidirectional `stdio <-> AF_UNIX` MCP proxy for live Studio Unix socket sessions.
 """
 from flint.studio.autosave import recovery_original
 from std.collections import List
 from std.ffi import external_call
-from std.math import abs, cos, max, min, sin
+from std.math import abs, max, min
 from std.sys import argv
 from flint.app.engine_app import STAGE_FIRST
 from flint.app.window_plugin import WindowStateResource
@@ -32,8 +33,9 @@ from flint.assets.image import write_png
 from flint.assets.server import AssetServer
 from flint.core.build_info import check_flint_version_pin, parse_flint_version_from_toml_bytes
 from flint.core.jobs import JobPool, default_worker_count
-from flint.core.math import Quat, Vec3
+from flint.core.math import Vec3
 from flint.devtools.mcp_v2 import (
+    MCP_COOK_WORKER_FLAG,
     MCP_GATE_ALL,
     MCP_GATE_AUTO,
     MCP_GATE_MUTATING,
@@ -41,20 +43,26 @@ from flint.devtools.mcp_v2 import (
     McpServerV2,
     McpToolEvent,
     default_mcp_socket_path,
+    pid_is_descendant_of,
     run_mcp_connect_stdio,
+    run_mcp_cook_worker,
 )
+from flint.render.aaa_renderer import FlintAaaVulkanRenderer
 from flint.input.plugin import InputStateResource
 from flint.platform.input import InputState
 from flint.platform.os import (
     env_value,
     file_size,
     get_time,
+    install_quit_signal_handlers,
     is_directory,
     make_dirs,
     parent_directory,
+    quit_signal_received,
     read_bytes,
     real_path,
 )
+from flint.render.swapchain_surface import PRESENT_FIFO
 from flint.render.render_world import (
     RENDER_TIER_0_HEADLESS_SIMD,
     RENDER_TIER_2_AAA_VISBUFFER_RT,
@@ -64,16 +72,6 @@ from flint.studio import (
     APPROVAL_AUTO,
     APPROVAL_EDITS,
     APPROVAL_STEP,
-    GIZMO_AXIS_NONE,
-    GIZMO_AXIS_X,
-    GIZMO_AXIS_Y,
-    GIZMO_AXIS_Z,
-    GIZMO_MODE_ROTATE,
-    GIZMO_MODE_SCALE,
-    GIZMO_MODE_TRANSLATE,
-    GIZMO_PLANE_XY,
-    GIZMO_PLANE_XZ,
-    GIZMO_PLANE_YZ,
     PIE_PLAYING,
     PIE_STOPPED,
     WORKSPACE_AGENT_STUDIO,
@@ -83,19 +81,10 @@ from flint.studio import (
     WORKSPACE_PLAY,
     BridgedMcpEvent,
     FlintStudioState,
-    SelectedTransformSnap,
-    ViewportRay,
     VisBufferGpuPicker,
     fill_instance_entity_maps,
-    gizmo_rotation_delta_rad,
-    gizmo_scale_drag,
-    gizmo_world_scale,
-    pick_gizmo_handle,
-    ray_axis_closest_param,
-    ray_plane_hit,
-    snap_angle_deg,
-    snap_translation,
 )
+from flint.studio.viewport_transform import ViewportTransform
 from flint.studio.studio_app import (
     populate_default_studio_scene,
     upload_default_studio_gpu_assets,
@@ -156,19 +145,104 @@ def _parse_anim_mode_arg(raw: String) -> Int:
     return -1
 
 
-def _sync_mcp_gate_from_bus(mut mcp: McpServerV2, studio: FlintStudioState):
-    """Aligns `McpServerV2` approval gate mode with the selected `AgentTelemetryBus` session policy."""
-    var si = studio.agent_bus.find_session_index(studio.agent_bus.selected_agent_id)
-    if si < 0 or si >= len(studio.agent_bus.sessions):
-        mcp.set_gate_mode(MCP_GATE_AUTO)
-        return
+def _parse_size_arg(raw: String) -> Tuple[Int, Int]:
+    """`WxH` (64..8192 each) -> (W, H), or (0, 0) when malformed."""
+    var b = raw.as_bytes()
+    var w = 0
+    var h = 0
+    var seen_x = False
+    var digits = 0
+    for i in range(len(b)):
+        var c = Int(b[i])
+        if c == 120 or c == 88:  # x / X
+            if seen_x or digits == 0:
+                return (0, 0)
+            seen_x = True
+            digits = 0
+        elif c >= 48 and c <= 57:
+            digits += 1
+            if digits > 5:
+                return (0, 0)
+            if seen_x:
+                h = h * 10 + (c - 48)
+            else:
+                w = w * 10 + (c - 48)
+        else:
+            return (0, 0)
+    if not seen_x or digits == 0 or w < 64 or h < 64 or w > 8192 or h > 8192:
+        return (0, 0)
+    return (w, h)
+
+
+def _gate_mode_for_session(studio: FlintStudioState, si: Int) -> Int:
+    if studio.agent_bus.sessions[si].paused:
+        return MCP_GATE_ALL
     var pol = studio.agent_bus.sessions[si].approval_policy
     if pol == APPROVAL_STEP:
-        mcp.set_gate_mode(MCP_GATE_ALL)
-    elif pol == APPROVAL_EDITS:
-        mcp.set_gate_mode(MCP_GATE_MUTATING)
-    else:
-        mcp.set_gate_mode(MCP_GATE_AUTO)
+        return MCP_GATE_ALL
+    if pol == APPROVAL_EDITS:
+        return MCP_GATE_MUTATING
+    return MCP_GATE_AUTO
+
+
+def _is_acp_agent_client(mcp: McpServerV2, studio: FlintStudioState, key: Int) -> Bool:
+    """True when connection `key` comes from the process tree of the ACP agent Studio launched (its
+    `flint --mcp-connect` bridge), proven by the socket's `SO_PEERCRED` pid, not by who connects first."""
+    var acp_pid = Int(studio.agent_runtime.acp.proc.pid)
+    return acp_pid > 0 and pid_is_descendant_of(mcp.peer_pid_of(key), acp_pid)
+
+
+def _run_mcp_replays(
+    mut mcp: McpServerV2,
+    mut studio: FlintStudioState,
+    mut assets: AssetServer,
+    mut pool: JobPool,
+    mut ren: FlintAaaVulkanRenderer,
+):
+    """Re-runs the gated calls the user approved in the Agents panel, exactly as the agent sent them."""
+    var keys = List[Int]()
+    var tools = List[String]()
+    var args = List[String]()
+    var steps = List[UInt64]()
+    var eids = List[UInt64]()
+    swap(keys, studio.mcp_replay_client)
+    swap(tools, studio.mcp_replay_tool)
+    swap(args, studio.mcp_replay_args)
+    swap(steps, studio.mcp_replay_step)
+    swap(eids, studio.mcp_replay_editor_id)
+    for i in range(len(tools)):
+        _ = mcp.replay_approved_call_with_renderer(keys[i], tools[i], args[i], steps[i], eids[i], studio, assets, pool, ren)
+
+
+def _sync_mcp_gate_from_bus(mut mcp: McpServerV2, mut studio: FlintStudioState):
+    """Aligns each MCP client's approval gate with its agent session's policy, releases the sessions
+    of closed connections, and lets builds make progress."""
+    var dropped = mcp.take_dropped_clients()
+    for di in range(len(dropped)):
+        studio.release_mcp_client(dropped[di])
+    mcp.tick_builds()
+    # Socket clients: each follows the policy of its own agent session, not the one selected in the UI.
+    var keys = mcp.client_keys()
+    for ki in range(len(keys)):
+        var ck = keys[ki]
+        if ck <= 0 or not mcp.client_initialized(ck):
+            continue
+        var caid = studio.agent_for_mcp_client(ck, mcp.client_name_of(ck), _is_acp_agent_client(mcp, studio, ck))
+        var csi = studio.agent_bus.find_session_index(caid)
+        if csi >= 0:
+            mcp.set_client_gate_mode(ck, _gate_mode_for_session(studio, csi))
+            # "Approve for turn" lasts while the agent's turn does (AgentBus clears it in end_turn).
+            mcp.set_client_turn_allowance(ck, studio.agent_bus.turn_allowance_active(caid))
+        else:
+            # A socket client with no agent session never runs mutating tools unasked.
+            mcp.set_client_gate_mode(ck, MCP_GATE_MUTATING)
+            mcp.set_client_turn_allowance(ck, False)
+    # The in-process / stdio client (key 0) follows the selected agent. Socket clients that connect
+    # before they are mapped start gated: never `MCP_GATE_AUTO` by default.
+    var si = studio.agent_bus.find_session_index(studio.agent_bus.selected_agent_id)
+    var m = MCP_GATE_AUTO if (si < 0 or si >= len(studio.agent_bus.sessions)) else _gate_mode_for_session(studio, si)
+    mcp.default_gate_mode = MCP_GATE_MUTATING if m == MCP_GATE_AUTO else m
+    mcp.set_client_gate_mode(0, m)
 
 
 def _drain_mcp_events_to_studio(mut mcp: McpServerV2, mut studio: FlintStudioState):
@@ -191,6 +265,12 @@ def _drain_mcp_events_to_studio(mut mcp: McpServerV2, mut studio: FlintStudioSta
             agent_id=studio.agent_bus.selected_agent_id,
         )
         b.affected_entities = r.affected_entities.copy()
+        b.mcp_client_key = r.client_key
+        b.mcp_client_name = r.client_name
+        if r.client_key != 0:
+            # Socket clients each have their own agent session; key 0 keeps the selected agent.
+            b.agent_id = studio.agent_for_mcp_client(r.client_key, r.client_name, _is_acp_agent_client(mcp, studio, r.client_key))
+        b.replay_step_id = r.replay_step_id
         if len(b.affected_entities) > 0:
             var target_eid = b.affected_entities[0]
             if target_eid >= 0 and target_eid < len(studio.entities) and studio.is_alive_id(target_eid):
@@ -270,9 +350,17 @@ def _run_studio() raises -> Int:
     var theme_opt = -1
     var anim_mode_opt = -1
     var ui_scale_opt = Float32(-1.0)
+    var smoke_w = 0
+    var smoke_h = 0
 
     var args = argv()
     var exe_path = String(args[0]) if len(args) > 0 else String("flint-studio")
+    # Hidden child-process mode: an MCP `assets.list_and_cook` run off the editor's UI thread.
+    if len(args) >= 2 and String(args[1]) == MCP_COOK_WORKER_FLAG:
+        if len(args) != 6:
+            print("[Flint Studio] ERROR: " + String(MCP_COOK_WORKER_FLAG) + " <source_dir> <output.flpk> <cache_dir> <0|1>")
+            return 2
+        return run_mcp_cook_worker(String(args[2]), String(args[3]), String(args[4]), String(args[5]) == "1")
     var ai = 1
     while ai < len(args):
         var a = String(args[ai])
@@ -386,6 +474,17 @@ def _run_studio() raises -> Int:
                 ui_scale_opt = Float32(Float64(String(a[byte=11:])))
             except:
                 ui_scale_opt = Float32(2.0)
+        elif (a == "--size" and ai + 1 < len(args)) or a.startswith("--size="):
+            # `--headless-smoke --size WxH`: render after resizing the renderer away from 1280x720.
+            var sraw = String(args[ai + 1]) if a == "--size" else String(a[byte=7:])
+            if a == "--size":
+                ai += 1
+            var parsed = _parse_size_arg(sraw)
+            if parsed[0] <= 0:
+                print("[Flint Studio] ERROR: --size expects WxH (for example 1600x900), got: " + sraw)
+                return 1
+            smoke_w = parsed[0]
+            smoke_h = parsed[1]
         ai += 1
 
     # Pure-Mojo stdio <-> AF_UNIX proxy exits immediately with zero GPU/Window initialization
@@ -443,24 +542,52 @@ def _run_studio() raises -> Int:
         worker_threads=max(1, default_worker_count()),
         project_root=proj_arg,
     )
-    if ui_scale_opt > Float32(0.0):
-        studio.set_ui_scale(ui_scale_opt)
-    elif not is_headless:
+    # The UI scale follows the window's content scale (Wayland preferred / fractional scale, X11 Xft.dpi / 96,
+    # 1.0 on KMS) for the whole session, unless the user chose one (--ui-scale, FLINT_UI_SCALE, or
+    # a zoom hotkey, seen as the scale drifting from the one applied here).
+    var ui_scale_user = False
+    var applied_content_scale = Float32(-1.0)
+    var applied_ui_scale = Float32(-1.0)
+    if not is_headless:
         var env_sc = env_value("FLINT_UI_SCALE")
-        if env_sc.byte_length() > 0:
+        if ui_scale_opt > Float32(0.0):
+            studio.set_ui_scale(ui_scale_opt)
+            ui_scale_user = True
+        elif env_sc.byte_length() > 0:
             try:
                 studio.set_ui_scale(Float32(Float64(env_sc)))
             except:
                 studio.set_ui_scale(Float32(2.0))
+            ui_scale_user = True
         else:
-            studio.set_ui_scale(Float32(2.0))
+            var cs = Float32(1.0)
+            var wres = studio.app.resources.get_ptr[WindowStateResource]()
+            if wres:
+                cs = wres.value()[unsafe_offset=0].content_scale
+            applied_content_scale = cs if cs > Float32(0.0) else Float32(1.0)
+            studio.set_ui_scale(applied_content_scale)
+            applied_ui_scale = studio.ui_scale
+    elif ui_scale_opt > Float32(0.0) and not mcp_stdio:
+        # Headless smoke / shots at a HiDPI scale (`--headless-smoke --ui-scale 2`).
+        studio.set_ui_scale(ui_scale_opt)
     if has_project_flag or has_project_env:
         studio.asset_browser_dir = project_root
     populate_default_studio_scene(studio)
     if not is_headless:
-        var recoverable = recovery_original(studio.project_root, studio.scene_file_path)
-        if recoverable:
-            studio.push_toast("Unsaved edits for " + recoverable + ". Choose File > Recover autosave.", 1, 12)
+        studio.maybe_show_welcome()
+    if not is_headless:
+        if studio.autosave_available():
+            # A crash or kill left unsaved work behind: offer it instead of silently keeping it on disk.
+            studio.push_toast(
+                "Unsaved work from an earlier session was found: File -> Recover autosave restores it.",
+                1,
+                15.0,
+            )
+        else:
+            # Crash work of another scene in this project (File > Recover autosave reopens that scene).
+            var recoverable = recovery_original(studio.project_root, studio.autosave_source_path())
+            if recoverable:
+                studio.push_toast("Unsaved edits for " + recoverable + ". Choose File > Recover autosave.", 1, 12)
 
     if theme_opt >= 0:
         studio.set_studio_theme(theme_opt)
@@ -481,6 +608,10 @@ def _run_studio() raises -> Int:
         return 1
     ref assets = assets_ptr.value()[unsafe_offset=0]
     var mcp = McpServerV2(workspace_root=project_root)
+    # Socket-client cooks re-run this executable in `MCP_COOK_WORKER_FLAG` mode, off the UI thread.
+    var self_exe = real_path("/proc/self/exe")
+    if self_exe[0]:
+        mcp.cook_helper_exe = self_exe[1]
 
     if mcp_stdio:
         var mcp_pool = JobPool()
@@ -494,7 +625,7 @@ def _run_studio() raises -> Int:
     if not ren_check or not ren_check.value()[unsafe_offset=0].uses_vulkan():
         print("[Flint Studio] ERROR: Vulkan 1.3 driver unavailable.")
         studio.shutdown()
-        return 0
+        return 1
 
     upload_default_studio_gpu_assets(studio)
     var picker = VisBufferGpuPicker()
@@ -571,6 +702,16 @@ def _run_studio() raises -> Int:
                 return 1
         studio.set_anim_mode(UI_ANIM_INSTANT)
         studio.ui_time_sec = Float32(0.0)
+        if smoke_w > 0:
+            # A forced resize before the frame, as a window resize would do it.
+            var rz = studio.app.resources.get_ptr_mut[ScalableRenderer]()
+            if rz:
+                if not rz.value()[unsafe_offset=0].resize(smoke_w, smoke_h):
+                    print("[Flint Studio] ERROR: renderer resize to " + String(smoke_w) + "x" + String(smoke_h) + " failed.")
+                    studio.shutdown()
+                    return 1
+                out_w = rz.value()[unsafe_offset=0].width
+                out_h = rz.value()[unsafe_offset=0].height
         var res = _render_deterministic_png(studio, assets, out_w, out_h, target_png, Float32(0.0))
 
         var rend_fin = studio.app.resources.get_ptr_mut[ScalableRenderer]()
@@ -582,7 +723,7 @@ def _run_studio() raises -> Int:
             return 1
 
         print(
-            "[Flint Studio] Saved 1280x720 Studio frame -> "
+            "[Flint Studio] Saved " + String(out_w) + "x" + String(out_h) + " Studio frame -> "
             + target_png
             + " (UIPrims=" + String(res[1])
             + ", Entities=" + String(studio.live_entity_count())
@@ -599,11 +740,18 @@ def _run_studio() raises -> Int:
     if win_opt and win_opt.value()[unsafe_offset=0].initialized and len(win_opt.value()[unsafe_offset=0].windows) > 0:
         var rend_i = studio.app.resources.get_ptr_mut[ScalableRenderer]()
         if rend_i:
-            _ = rend_i.value()[unsafe_offset=0].attach_window_surface(win_opt.value()[unsafe_offset=0].windows[0])
+            # FIFO: presents pace the loop to the display instead of rendering frames nobody sees.
+            _ = rend_i.value()[unsafe_offset=0].attach_window_surface(win_opt.value()[unsafe_offset=0].windows[0], present_mode=PRESENT_FIFO)
             if rend_i.value()[unsafe_offset=0].uses_vulkan():
                 ref gpu = rend_i.value()[unsafe_offset=0].gpu_slot[0]
                 if gpu.vk.swapchain == 0:
                     gpu.deferred_readback = True
+            # The window may not be the size Studio asked for (HiDPI, a tiling compositor): start at its
+            # real framebuffer size, since no resize event will report the difference.
+            out_w = max(64, win_opt.value()[unsafe_offset=0].width)
+            out_h = max(64, win_opt.value()[unsafe_offset=0].height)
+            if rend_i.value()[unsafe_offset=0].width != out_w or rend_i.value()[unsafe_offset=0].height != out_h:
+                _ = rend_i.value()[unsafe_offset=0].resize(out_w, out_h)
             win_ok = True
 
     if not win_ok:
@@ -612,20 +760,30 @@ def _run_studio() raises -> Int:
         if rend_s and rend_s.value()[unsafe_offset=0].uses_vulkan():
             picker.shutdown(rend_s.value()[unsafe_offset=0].gpu_slot[0])
         studio.shutdown()
-        return 0
+        return 1
+
+    # Shortcuts follow the keyboard layout's labels (Ctrl+Z is the key marked Z on AZERTY/QWERTZ).
+    var inp_cfg = studio.app.resources.get_ptr_mut[InputStateResource]()
+    if inp_cfg:
+        inp_cfg.value()[unsafe_offset=0].input.layout_shortcuts = True
+    # Ctrl+C / SIGTERM / a closed terminal: autosave and shut down normally (MCP socket removed).
+    _ = install_quit_signal_handlers()
 
     var mcp_sock = FlintMcpUnixListener(default_mcp_socket_path())
     if mcp_sock.active and mcp_sock.socket_path.byte_length() > 0:
         studio.agent_runtime.acp.configure_studio_mcp_socket(exe_path, mcp_sock.socket_path)
     var mcp_pool = JobPool()
     _ = mcp_pool.start(2)
-    var dragging_gizmo = False
-    var drag_start_ray = ViewportRay()
-    var drag_start_pivot = Vec3()
-    var drag_snaps = List[SelectedTransformSnap]()
-    var drag_seq = UInt64(100)
-    var pending_pick_ctrls = List[Tuple[UInt64, Bool]]()
+    var pending_pick_ctrls = List[Tuple[UInt64, Int]]()  # (pick request id, bit0 Shift-add | bit1 Ctrl-toggle)
+    # Left press on empty viewport space: a click picks on release, a drag becomes a marquee.
+    var press_pending = False
+    var press_x = Float32(0.0)
+    var press_y = Float32(0.0)
+    var press_additive = False
+    var press_toggle = False
     var resume_swapchain = False
+    var ide_quit_warned = False
+    var next_gpu_recovery_at = Float64(0.0)
     var t_last = get_time()
 
     while True:
@@ -638,14 +796,39 @@ def _run_studio() raises -> Int:
         if not w_opt or not w_opt.value()[unsafe_offset=0].initialized:
             break
         ref win_res = w_opt.value()[unsafe_offset=0]
+        var quit_sig = quit_signal_received()
+        if quit_sig != 0:
+            # Not interactive: keep the work as an autosave (offered on the next start) and shut down.
+            if studio.dirty:
+                _ = studio.write_autosave()
+            var sig_note = String(" (unsaved work autosaved).") if studio.dirty else String(".")
+            print("[Flint Studio] Signal " + String(quit_sig) + " received: shutting down" + sig_note)
+            break
         if win_res.close_requested:
+            # The text workspace hides the scene UI, so the unsaved-changes modal could never show.
+            var ide_live = studio.source_editor.pty.fd >= 0
+            if studio.source_editor.visible:
+                studio.source_editor.visible = False
+                if resume_swapchain and len(win_res.windows) > 0:
+                    var r_back = studio.app.resources.get_ptr_mut[ScalableRenderer]()
+                    if r_back:
+                        _ = r_back.value()[unsafe_offset=0].attach_window_surface(win_res.windows[0], present_mode=PRESENT_FIFO)
+                    resume_swapchain = False
+            var hold = False
             if studio.dirty and not studio.quit_requested:
+                hold = True
+                _ = studio.request_quit()
+            if ide_live and not ide_quit_warned and not studio.quit_requested:
+                # The TurboMojo session ends with Studio: say so once before it does.
+                hold = True
+                ide_quit_warned = True
+                studio.push_toast("TurboMojo is still running and closes with Studio: save its buffers, then close again to quit.", 1, 8.0)
+            if hold:
                 win_res.close_requested = False
                 if len(win_res.windows) > 0:
                     win_res.windows[0].close_requested = False
                     win_res.windows[0].x11.close_requested = False
                     win_res.windows[0].kms.close_requested = False
-                _ = studio.request_quit()
             else:
                 break
         if studio.quit_requested:
@@ -656,15 +839,25 @@ def _run_studio() raises -> Int:
             var r_opt = studio.app.resources.get_ptr_mut[ScalableRenderer]()
             if r_opt:
                 _ = r_opt.value()[unsafe_offset=0].resize(out_w, out_h)
+        if not ui_scale_user:
+            if applied_ui_scale > Float32(0.0) and abs(studio.ui_scale - applied_ui_scale) > Float32(1.0e-3):
+                ui_scale_user = True  # a zoom hotkey: the user's scale from now on
+            elif win_res.content_scale > Float32(0.0) and abs(win_res.content_scale - applied_content_scale) > Float32(1.0e-3):
+                applied_content_scale = win_res.content_scale
+                studio.set_ui_scale(applied_content_scale)
+                applied_ui_scale = studio.ui_scale
 
         var now = get_time()
-        _ = studio.tick_autosave(Float32(now - t_last))
         var dt = Float32(min(0.05, max(0.001, now - t_last)))
         t_last = now
+        _ = studio.tick_autosave(dt)
 
         var inp_opt = studio.app.resources.get_ptr[InputStateResource]()
         var frame_input = inp_opt.value()[unsafe_offset=0].input.copy() if inp_opt else InputState()
 
+        if studio.source_editor.visible:
+            # The TurboMojo terminal takes text (IME commits go to its PTY); the scene UI is not drawn.
+            win_res.set_text_input(True, Float32(8.0), Float32(8.0), Float32(2.0), Float32(18.0))
         ref window = win_res.windows[0]
         if studio.source_editor.present(window, frame_input, scene_hotkey=False):
             # Track held keys across the focus boundary so returning with Ctrl+F8
@@ -688,10 +881,13 @@ def _run_studio() raises -> Int:
                     studio.sync_flmat_studio_styles()
                     studio.asset_browser_scanned = False
                 _sync_mcp_gate_from_bus(mcp, studio)
+                _run_mcp_replays(mcp, studio, assets, mcp_pool, renderer.gpu_slot[0])
                 _ = mcp_sock.poll_once_with_renderer(mcp, studio, assets, mcp_pool, renderer.gpu_slot[0])
                 _drain_mcp_events_to_studio(mcp, studio)
-            dragging_gizmo = False
-            studio.active_gizmo_handle = GIZMO_AXIS_NONE
+                studio.code_drawer.mirror_problem_store(mcp.diagnostics_store)
+            studio.gizmo_drag_cancel()
+            press_pending = False
+            studio.marquee_active = False
             continue
 
         # Harvest completed non-stalling async GPU viewport picks from previous frames
@@ -704,23 +900,23 @@ def _run_studio() raises -> Int:
                 var entry = harvested.value()
                 var h_req_id = entry[0]
                 var pres = entry[1]
-                var pick_ctrl = False
-                var kept = List[Tuple[UInt64, Bool]](capacity=len(pending_pick_ctrls))
+                var pick_mods = 0  # bit 0: Shift adds, bit 1: Ctrl toggles
+                var kept = List[Tuple[UInt64, Int]](capacity=len(pending_pick_ctrls))
                 for pi in range(len(pending_pick_ctrls)):
                     if pending_pick_ctrls[pi][0] == h_req_id:
-                        pick_ctrl = pending_pick_ctrls[pi][1]
+                        pick_mods = pending_pick_ctrls[pi][1]
                     else:
                         kept.append(pending_pick_ctrls[pi])
                 pending_pick_ctrls = kept^
-                if (
+                var pick_hit = (
                     pres.hit
                     and pres.entity_id >= 0
                     and studio.is_alive_id(pres.entity_id)
                     and (pres.entity_bits == 0 or studio.resolve_entity(pres.entity_id).to_bits() == pres.entity_bits)
-                ):
-                    studio.select_entity(pres.entity_id, multi_select=pick_ctrl)
-                elif not pick_ctrl:
-                    studio.clear_selection()
+                )
+                # A hit on a locked entity is ignored rather than clearing the selection.
+                if not (pick_hit and studio.is_entity_locked(pres.entity_id)):
+                    studio.click_select(pres.entity_id, pick_hit, (pick_mods & 1) != 0, (pick_mods & 2) != 0)
 
         if studio.handle_command_menu(frame_input, out_w, out_h):
             # Record held keys without sending menu gestures to the scene.
@@ -732,16 +928,14 @@ def _run_studio() raises -> Int:
             break
 
         var vp_rect = studio.viewport_rect(out_w, out_h)
-        var vp_x = vp_rect.x
-        var vp_y = vp_rect.y
-        var vp_w = vp_rect.w
-        var vp_h = vp_rect.h
 
         var mx = frame_input.last_mouse_x
         var my = frame_input.last_mouse_y
         var in_vp = vp_rect.contains(mx, my)
 
         var _ui_s = studio.effective_ui_scale()
+        # The renderer projects over the whole window; the panel rect is only the clip/input region.
+        var vxf = ViewportTransform.from_physical(vp_rect, out_w, out_h, _ui_s)
         var ui_blocks_vp = (
             studio.dock.dragging_node >= 0
             or studio.dock.hovered_splitter_node >= 0
@@ -750,119 +944,115 @@ def _run_studio() raises -> Int:
             or studio.menu.bar.group >= 0
             or studio.pie.mode != PIE_STOPPED
         )
-        var gizmo_rot = studio.selection_gizmo_rotation()
-        if frame_input.mouse_pressed(0) and in_vp and not ui_blocks_vp:
-            var g_piv = studio.selection_gizmo_pivot()
-            var g_hit = GIZMO_AXIS_NONE
-            if g_piv[0]:
-                g_hit = pick_gizmo_handle(
-                    mx, my, g_piv[1],
-                    studio.gizmo_mode, vp_x, vp_y, vp_w, vp_h,
-                    studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg,
-                    gizmo_rot=gizmo_rot,
-                )
-            if g_hit != GIZMO_AXIS_NONE:
-                dragging_gizmo = True
-                studio.active_gizmo_handle = g_hit
-                drag_seq += 1
-                drag_start_ray = ViewportRay.from_screen(
-                    mx, my, vp_x, vp_y, vp_w, vp_h,
-                    studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg,
-                )
-                drag_start_pivot = g_piv[1]
-                drag_snaps = studio.capture_selected_transforms()
-            else:
-                var ctrl_down = frame_input.key_down(341) or frame_input.key_down(345)
-                if picker.has_pending_pick:
-                    var stale_id = picker.queued_request_id
-                    var kept = List[Tuple[UInt64, Bool]](capacity=len(pending_pick_ctrls))
-                    for pi in range(len(pending_pick_ctrls)):
-                        if pending_pick_ctrls[pi][0] != stale_id:
-                            kept.append(pending_pick_ctrls[pi])
-                    pending_pick_ctrls = kept^
-                var req_id = picker.request_pick(Int(mx), Int(my))
-                pending_pick_ctrls.append((req_id, ctrl_down))
-
-        if (
+        studio.viewport_xf = vxf
+        studio.viewport_hovered = in_vp and not ui_blocks_vp
+        var alt_down = frame_input.key_down(342) or frame_input.key_down(346)
+        var ctrl_down = frame_input.key_down(341) or frame_input.key_down(345)
+        var shift_down = frame_input.key_down(340) or frame_input.key_down(344)
+        var cancel_pressed = (
             studio.pie.mode != PIE_STOPPED
             or studio.ui_ctx.modal_depth > 0
             or studio.ui_ctx.had_modal_prev_frame
+            or frame_input.mouse_pressed(1)
             or (frame_input.key_pressed(256) and not studio.wants_keyboard())
-        ):
-            dragging_gizmo = False
-            studio.active_gizmo_handle = GIZMO_AXIS_NONE
+        )
+        if cancel_pressed:
+            # Esc / right-click / a modal / Play abandon the drag: the selection goes back to its start pose.
+            studio.gizmo_drag_cancel()
+            press_pending = False
+            studio.marquee_active = False
 
-        if dragging_gizmo and frame_input.mouse_down(0) and len(drag_snaps) > 0:
-            var cur_ray = ViewportRay.from_screen(
-                mx, my, vp_x, vp_y, vp_w, vp_h,
-                studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg,
-            )
-            var h_id = studio.active_gizmo_handle
-            var wscale = gizmo_world_scale(drag_start_pivot, studio.cam_pos, studio.cam_fwd, studio.fov_y_deg, Int(vp_h))
-            if studio.gizmo_mode == GIZMO_MODE_TRANSLATE:
-                var delta_p = Vec3()
-                if h_id == GIZMO_AXIS_X or h_id == GIZMO_AXIS_Y or h_id == GIZMO_AXIS_Z:
-                    var ax = gizmo_rot.rotate(Vec3(1, 0, 0) if h_id == GIZMO_AXIS_X else (Vec3(0, 1, 0) if h_id == GIZMO_AXIS_Y else Vec3(0, 0, 1)))
-                    var t0 = ray_axis_closest_param(drag_start_ray, drag_start_pivot, ax)
-                    var t1 = ray_axis_closest_param(cur_ray, drag_start_pivot, ax)
-                    if t0[0] and t1[0]:
-                        delta_p = ax * (t1[1] - t0[1])
-                elif h_id == GIZMO_PLANE_XY or h_id == GIZMO_PLANE_XZ or h_id == GIZMO_PLANE_YZ:
-                    var pn = gizmo_rot.rotate(Vec3(0, 0, 1) if h_id == GIZMO_PLANE_XY else (Vec3(0, 1, 0) if h_id == GIZMO_PLANE_XZ else Vec3(1, 0, 0)))
-                    var p0 = ray_plane_hit(drag_start_ray, drag_start_pivot, pn)
-                    var p1 = ray_plane_hit(cur_ray, drag_start_pivot, pn)
-                    if p0[0] and p1[0]:
-                        delta_p = p1[1] - p0[1]
-                if studio.snap_enabled:
-                    var snapped_piv = snap_translation(drag_start_pivot + delta_p, studio.grid_snap_m)
-                    delta_p = snapped_piv - drag_start_pivot
-                _ = studio.apply_gizmo_drag_selected(
-                    drag_snaps,
-                    drag_start_pivot,
-                    delta_p,
-                    Quat(0.0, 0.0, 0.0, 1.0),
-                    Vec3(1.0, 1.0, 1.0),
-                    GIZMO_MODE_TRANSLATE,
-                    coalesce_key=drag_seq,
-                )
-            elif studio.gizmo_mode == GIZMO_MODE_ROTATE:
-                var rax = gizmo_rot.rotate(Vec3(1, 0, 0) if h_id == GIZMO_AXIS_X else (Vec3(0, 1, 0) if h_id == GIZMO_AXIS_Y else Vec3(0, 0, 1)))
-                var drad = gizmo_rotation_delta_rad(drag_start_ray, cur_ray, drag_start_pivot, rax, studio.cam_fwd, wscale)
-                if studio.snap_enabled:
-                    drad = snap_angle_deg(drad, studio.angle_snap_deg)
-                var dq = Quat(rax.x * sin(drad * Float32(0.5)), rax.y * sin(drad * Float32(0.5)), rax.z * sin(drad * Float32(0.5)), cos(drad * Float32(0.5)))
-                _ = studio.apply_gizmo_drag_selected(
-                    drag_snaps,
-                    drag_start_pivot,
-                    Vec3(),
-                    dq,
-                    Vec3(1.0, 1.0, 1.0),
-                    GIZMO_MODE_ROTATE,
-                    coalesce_key=drag_seq,
-                )
-            elif studio.gizmo_mode == GIZMO_MODE_SCALE:
-                var sf = gizmo_scale_drag(drag_start_ray, cur_ray, drag_start_pivot, h_id, wscale, studio.cam_fwd, studio.cam_right, Vec3(1.0, 1.0, 1.0), gizmo_rot=gizmo_rot)
-                _ = studio.apply_gizmo_drag_selected(
-                    drag_snaps,
-                    drag_start_pivot,
-                    Vec3(),
-                    Quat(0.0, 0.0, 0.0, 1.0),
-                    sf,
-                    GIZMO_MODE_SCALE,
-                    coalesce_key=drag_seq,
-                )
+        if frame_input.mouse_pressed(0) and in_vp and not ui_blocks_vp and not alt_down:
+            if not studio.gizmo_try_begin(mx, my):
+                press_pending = True
+                press_x = mx
+                press_y = my
+                press_additive = shift_down and not ctrl_down
+                press_toggle = ctrl_down
+
+        if studio.gz_dragging and frame_input.mouse_down(0):
+            _ = studio.gizmo_drag_update(mx, my)
+
+        if press_pending and frame_input.mouse_down(0):
+            if not studio.marquee_active and abs(mx - press_x) + abs(my - press_y) > Float32(5.0) * _ui_s:
+                studio.marquee_active = True
+            if studio.marquee_active:
+                studio.marquee_x0 = press_x
+                studio.marquee_y0 = press_y
+                studio.marquee_x1 = mx
+                studio.marquee_y1 = my
 
         if not frame_input.mouse_down(0):
-            dragging_gizmo = False
-            studio.active_gizmo_handle = GIZMO_AXIS_NONE
+            if studio.gz_dragging:
+                studio.gizmo_drag_end()
+            if press_pending:
+                if studio.marquee_active:
+                    _ = studio.marquee_select(press_x, press_y, mx, my, press_additive, toggle=press_toggle)
+                else:
+                    # Click (no drag): pick what is under the release point.
+                    var r_rel = studio.app.resources.get_ptr[ScalableRenderer]()
+                    if r_rel and r_rel.value()[unsafe_offset=0].uses_vulkan():
+                        if picker.has_pending_pick:
+                            var stale_id = picker.queued_request_id
+                            var kept = List[Tuple[UInt64, Int]](capacity=len(pending_pick_ctrls))
+                            for pi in range(len(pending_pick_ctrls)):
+                                if pending_pick_ctrls[pi][0] != stale_id:
+                                    kept.append(pending_pick_ctrls[pi])
+                            pending_pick_ctrls = kept^
+                        var req_id = picker.request_pick(Int(press_x), Int(press_y))
+                        pending_pick_ctrls.append((req_id, (1 if press_additive else 0) | (2 if press_toggle else 0)))
+                    else:
+                        # Software renderer: pick with the CPU scene raycast instead of the GPU id buffer.
+                        var ray = vxf.ray_phys(press_x, press_y, studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg)
+                        var hit = studio.raycast_scene(ray.origin, ray.dir)
+                        var hit_ok = hit.hit and studio.is_alive_id(hit.entity_id)
+                        if not (hit_ok and studio.is_entity_locked(hit.entity_id)):
+                            studio.click_select(hit.entity_id, hit_ok, press_additive, press_toggle)
+                press_pending = False
+                studio.marquee_active = False
+
+        # Arrow-key nudges (one grid step) when the viewport has focus and no text field does.
+        if studio.arrows_drive_nudge():  # the same test that stops the arrows orbiting the camera
+            var nx = (1 if frame_input.key_pressed(262) else 0) - (1 if frame_input.key_pressed(263) else 0)
+            var nz = (1 if frame_input.key_pressed(265) else 0) - (1 if frame_input.key_pressed(264) else 0)
+            var ny = (1 if frame_input.key_pressed(266) else 0) - (1 if frame_input.key_pressed(267) else 0)
+            if nx != 0 or ny != 0 or nz != 0:
+                _ = studio.nudge_selection(nx, ny, nz)
 
         _ = assets.tick(now)
+        # A lost device (driver reset, GPU hang, eGPU unplug) is rebuilt instead of leaving a frozen
+        # window; a failed attempt is retried every 2 s, sleeping meanwhile instead of spinning.
+        var r_dev = studio.app.resources.get_ptr_mut[ScalableRenderer]()
+        if r_dev and r_dev.value()[unsafe_offset=0].uses_vulkan() and r_dev.value()[unsafe_offset=0].gpu_slot[0].is_device_lost():
+            if now >= next_gpu_recovery_at:
+                if r_dev.value()[unsafe_offset=0].gpu_slot[0].recover_from_device_loss():
+                    picker = VisBufferGpuPicker()  # its buffers died with the old device
+                    pending_pick_ctrls.clear()
+                    press_pending = False
+                    next_gpu_recovery_at = 0.0
+                    studio.push_toast("The GPU device was lost and has been recreated.", 1, 6.0)
+                else:
+                    if next_gpu_recovery_at <= 0.0:
+                        studio.push_toast("The GPU device was lost; retrying every 2 s. Save your work (Ctrl+S).", 2, 10.0)
+                    next_gpu_recovery_at = now + 2.0
+            if r_dev.value()[unsafe_offset=0].gpu_slot[0].is_device_lost():
+                _ = external_call["usleep", Int32](UInt32(50000))
+        # Clipboard: the OS selection feeds a paste; a copy or cut in a text field goes out to it.
+        if studio.ui_ctx.wants_clipboard_paste(frame_input):
+            var w_clip = studio.app.resources.get_ptr_mut[WindowStateResource]()
+            if w_clip and len(w_clip.value()[unsafe_offset=0].windows) > 0:
+                var os_text = w_clip.value()[unsafe_offset=0].windows[0].clipboard_get()
+                if os_text.byte_length() > 0:
+                    studio.ui_ctx.set_clipboard(os_text)
         var r_mcp = studio.app.resources.get_ptr_mut[ScalableRenderer]()
         var gms = 0.0
         if r_mcp and r_mcp.value()[unsafe_offset=0].uses_vulkan():
             _sync_mcp_gate_from_bus(mcp, studio)
+            _run_mcp_replays(mcp, studio, assets, mcp_pool, r_mcp.value()[unsafe_offset=0].gpu_slot[0])
             _ = mcp_sock.poll_once_with_renderer(mcp, studio, assets, mcp_pool, r_mcp.value()[unsafe_offset=0].gpu_slot[0])
             _drain_mcp_events_to_studio(mcp, studio)
+            # Read-only: MCP `code.build_hot_reload` diagnostics show up in the drawer's Problems.
+            studio.code_drawer.mirror_problem_store(mcp.diagnostics_store)
             gms = r_mcp.value()[unsafe_offset=0].gpu_slot[0].render_graph.total_gpu_ms
 
         if studio.pie.mode == PIE_PLAYING:
@@ -878,17 +1068,36 @@ def _run_studio() raises -> Int:
             dt=dt,
         )
         _fill_instance_entity_maps(studio, inst_to_ent, inst_to_bits)
+        if studio.ui_ctx.has_clipboard_out():
+            var clip_out = studio.ui_ctx.take_clipboard_out()
+            var w_cout = studio.app.resources.get_ptr_mut[WindowStateResource]()
+            if w_cout and len(w_cout.value()[unsafe_offset=0].windows) > 0:
+                w_cout.value()[unsafe_offset=0].windows[0].clipboard_set(clip_out)
 
         var r_post = studio.app.resources.get_ptr_mut[ScalableRenderer]()
+        var zero_copy = False
         if r_post:
             ref renderer = r_post.value()[unsafe_offset=0]
+            zero_copy = renderer.surface.is_zero_copy_gpu()
             if renderer.uses_vulkan():
                 _ = picker.dispatch_pending_pick(renderer.gpu_slot[0], inst_to_ent, inst_to_bits)
-            if not renderer.surface.is_zero_copy_gpu():
+            if not zero_copy:
                 var frame_px = renderer.readback_pixels()
                 var w_p = studio.app.resources.get_ptr_mut[WindowStateResource]()
                 if w_p and len(w_p.value()[unsafe_offset=0].windows) > 0:
                     w_p.value()[unsafe_offset=0].windows[0].present(frame_px, renderer.width, renderer.height)
+
+        # Frame pacing. A FIFO swapchain paces itself. The CPU present path waits for the compositor's
+        # frame callback (Wayland; X11 caps its own presents). An unfocused or minimized window blocks in
+        # poll instead of rendering flat out: 10 Hz idle, 30 Hz while agents or Play still need it.
+        var w_pace = studio.app.resources.get_ptr_mut[WindowStateResource]()
+        if w_pace and len(w_pace.value()[unsafe_offset=0].windows) > 0:
+            ref pace_win = w_pace.value()[unsafe_offset=0].windows[0]
+            if not w_pace.value()[unsafe_offset=0].focused:
+                var busy = mcp_sock.client_count() > 0 or studio.pie.mode == PIE_PLAYING
+                _ = pace_win.wait_events(33 if busy else 100)
+            elif not zero_copy:
+                pace_win.wait_for_frame(17)
 
     mcp_sock.close()
     mcp_pool.stop()

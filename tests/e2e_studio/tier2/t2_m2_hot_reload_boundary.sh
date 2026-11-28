@@ -241,7 +241,7 @@ def main() raises:
         raise Error("mismatched FlintPluginApiV2.struct_size was not rejected")
 MOJO
 
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >"$probe_log" 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >"$probe_log" 2>&1; then
         fail_test "t2_m2_f22_abi_version_and_magic_size_mismatch_rejected" "M5 FlintPluginApiV2 contract pending"
         return
     fi
@@ -322,7 +322,7 @@ def main() raises:
         raise Error("missing last_error or loaded=True after on_load error")
 MOJO
 
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
         fail_test "t2_m2_f22_nonexistent_corrupt_so_and_on_load_error" "failed to compile corrupt_so_probe.mojo"
         return
     fi
@@ -393,7 +393,7 @@ def main() raises:
         raise Error("invalid field type/size PodFieldDesc was not rejected")
 MOJO
 
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
         fail_test "t2_m2_f22_pod_schema_layout_mismatch_rejected" "M5 PodComponentSchema/PodFieldDesc contract pending"
         return
     fi
@@ -436,7 +436,7 @@ def main() raises:
         raise Error("remove_component_by_name succeeded on absent SpotLightComponent or mutated state_hash")
 MOJO
 
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
         fail_test "t2_m2_f23_reflection_inspector_invalid_add_remove" "M5 Reflection Inspector Add/Remove Component API pending"
         return
     fi
@@ -565,7 +565,7 @@ case7_ok, case7_err = False, ""
 try:
     with McpStdioClient([studio_bin, "--project", proj_dir, "--mcp-stdio"], cwd=proj_dir, framing="cl", timeout=20.0) as client:
         init_res = client.initialize()
-        if init_res.get("protocolVersion") != "2024-11-05":
+        if init_res.get("protocolVersion") != "2025-06-18":
             raise AssertionError(f"Unexpected protocolVersion: {init_res!r}")
         client.notify_initialized()
 
@@ -712,7 +712,7 @@ def main() raises:
         raise Error("Tween corrupted state under negative/NaN dt")
 MOJO
 
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
         fail_test "t2_m2_f25_bt_json_and_game_flow_boundary" "M5 BehaviorTree.load_json / GameFlow boundary contract pending"
         return
     fi

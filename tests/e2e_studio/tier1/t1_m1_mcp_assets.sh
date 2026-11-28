@@ -148,7 +148,7 @@ PY
 
 # Run MCP v2 Tier 1 checks and capture structured results per case
 RESULTS_JSON="${TMPD}/t1_m1_mcp_results.json"
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${SCRIPT_DIR}/../common" python3 -B - \
+FLINT_MCP_IMPORT_DIRS="${IMPORT_SRC}" PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${SCRIPT_DIR}/../common" python3 -B - \
     "$STUDIO_BIN" "$PROJ_DIR" "$IMPORT_SRC" "$TMPD" "$RESULTS_JSON" <<'PY'
 import json
 import os
@@ -191,7 +191,7 @@ tools_by_name = {}
 try:
     with McpStdioClient([studio_bin, "--project", proj_dir, "--mcp-stdio"], cwd=proj_dir, framing="ndjson") as c_nd:
         init_nd = c_nd.initialize()
-        if init_nd.get("protocolVersion") != "2024-11-05":
+        if init_nd.get("protocolVersion") != "2025-06-18":
             raise AssertionError(f"bad protocolVersion in ndjson: {init_nd!r}")
         c_nd.notify_initialized()
         nd_tools = c_nd.list_tools()
@@ -200,7 +200,7 @@ try:
 
     with McpStdioClient([studio_bin, "--project", proj_dir, "--mcp-stdio"], cwd=proj_dir, framing="cl") as c_cl:
         init_cl = c_cl.initialize()
-        if init_cl.get("protocolVersion") != "2024-11-05":
+        if init_cl.get("protocolVersion") != "2025-06-18":
             raise AssertionError(f"bad protocolVersion in cl: {init_cl!r}")
         c_cl.notify_initialized()
         cl_tools = c_cl.list_tools()

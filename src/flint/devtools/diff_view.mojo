@@ -27,6 +27,7 @@ comptime HUNK_ACCEPTED: Int = 1
 comptime HUNK_REJECTED: Int = 2
 
 comptime DEFAULT_DIFF_CONTEXT: Int = 3
+comptime NO_EOL_NOTE = "\\ No newline at end of file"
 
 
 @fieldwise_init
@@ -58,32 +59,51 @@ struct DiffRow(Copyable, Movable):
     var right_text: String  # split view right column text
 
 
-@fieldwise_init
 struct DiffSide(Copyable, Movable):
-    """Normalized line representation of one side of a file diff."""
+    """Normalized line representation of one side of a file diff.
+
+    `crlf` remembers the file's line-ending style (taken from its first line break) so
+    `to_text` writes CRLF files back with CRLF. Only CRLF files have their `\\r` stripped
+    from `lines`; a stray `\\r` in an LF file is kept byte-for-byte.
+    """
     var lines: List[String]
     var trailing_eol: Bool
+    var crlf: Bool
+
+    def __init__(out self, var lines: List[String], trailing_eol: Bool, crlf: Bool = False):
+        self.lines = lines^
+        self.trailing_eol = trailing_eol
+        self.crlf = crlf
 
     @staticmethod
     def from_text(text: String) -> DiffSide:
         var lines = List[String]()
         if text.byte_length() == 0:
             return DiffSide(lines^, True)
+        var first_lf = text.find("\n")
+        var crlf = first_lf > 0 and text.as_bytes()[first_lf - 1] == 13
         for raw in text.split("\n"):
-            lines.append(String(String(raw).rstrip("\r")))
+            if crlf:
+                lines.append(String(String(raw).removesuffix("\r")))
+            else:
+                lines.append(String(raw))
         var eol = text.endswith("\n")
         if eol and len(lines) > 0 and lines[len(lines) - 1].byte_length() == 0:
             _ = lines.pop()
-        return DiffSide(lines^, eol or len(lines) == 0)
+        return DiffSide(lines^, eol or len(lines) == 0, crlf)
+
+    def has_line_break(self) -> Bool:
+        return len(self.lines) > 1 or (len(self.lines) == 1 and self.trailing_eol)
 
     def to_text(self) -> String:
+        var sep = String("\r\n") if self.crlf else String("\n")
         var s = String("")
         for k in range(len(self.lines)):
             if k > 0:
-                s += "\n"
+                s += sep
             s += self.lines[k]
         if self.trailing_eol and len(self.lines) > 0:
-            s += "\n"
+            s += sep
         return s^
 
     def hashes(self) -> List[UInt64]:
@@ -210,16 +230,26 @@ def diff_line_hashes(old: List[UInt64], new: List[UInt64], max_d: Int = 1000) ->
     return out^
 
 
+def eol_style_crlf(old: DiffSide, new: DiffSide) -> Bool:
+    """Line-ending style of the result: the original file's, unless it had no line break."""
+    if old.has_line_break():
+        return old.crlf
+    return new.crlf
+
+
 def diff_sides(old: DiffSide, new: DiffSide) -> List[DiffHunk]:
-    """Computes `DiffHunk`s transforming `old` into `new`."""
+    """Computes `DiffHunk`s transforming `old` into `new`.
+
+    A change of the final newline is always a hunk: when no hunk already reaches the end
+    of the file, the last line gets its own hunk so accepting it applies the new EOF state.
+    """
     var h = diff_line_hashes(old.hashes(), new.hashes())
-    if (
-        len(h) == 0
-        and old.trailing_eol != new.trailing_eol
-        and len(old.lines) > 0
-        and len(new.lines) > 0
-    ):
-        h.append(DiffHunk(len(old.lines) - 1, 1, len(new.lines) - 1, 1))
+    if old.trailing_eol != new.trailing_eol and len(old.lines) > 0 and len(new.lines) > 0:
+        var reaches_end = (
+            len(h) > 0 and h[len(h) - 1].a + h[len(h) - 1].la >= len(old.lines)
+        )
+        if not reaches_end:
+            h.append(DiffHunk(len(old.lines) - 1, 1, len(new.lines) - 1, 1))
     return h^
 
 
@@ -278,9 +308,13 @@ def build_unified_diff(
         for k in range(h.la):
             var txt = old.lines[h.a + k]
             rows.append(DiffRow(DIFF_ROW_OLD, "-" + txt, hi, h.a + k, h.b, txt, ""))
+        if h.la > 0 and h.a + h.la == len(old.lines) and not old.trailing_eol:
+            rows.append(DiffRow(DIFF_ROW_NOTE, NO_EOL_NOTE, hi, -1, -1, NO_EOL_NOTE, ""))
         for k in range(h.lb):
             var txt = new.lines[h.b + k]
             rows.append(DiffRow(DIFF_ROW_NEW, "+" + txt, hi, h.a, h.b + k, "", txt))
+        if h.lb > 0 and h.b + h.lb == len(new.lines) and not new.trailing_eol:
+            rows.append(DiffRow(DIFF_ROW_NOTE, NO_EOL_NOTE, hi, -1, -1, "", NO_EOL_NOTE))
         for k in range(after):
             var txt = old.lines[h.a + h.la + k]
             rows.append(
@@ -409,7 +443,7 @@ def apply_hunk(old: DiffSide, new: DiffSide, h: DiffHunk) -> DiffSide:
     for k in range(min(h.a + h.la, len(old.lines)), len(old.lines)):
         lines.append(old.lines[k])
     var eol = new.trailing_eol if h.a + h.la >= len(old.lines) else old.trailing_eol
-    return DiffSide(lines^, eol)
+    return DiffSide(lines^, eol, eol_style_crlf(old, new))
 
 
 def revert_hunk(old: DiffSide, new: DiffSide, h: DiffHunk) -> DiffSide:
@@ -422,7 +456,7 @@ def revert_hunk(old: DiffSide, new: DiffSide, h: DiffHunk) -> DiffSide:
     for k in range(min(h.b + h.lb, len(new.lines)), len(new.lines)):
         lines.append(new.lines[k])
     var eol = old.trailing_eol if h.b + h.lb >= len(new.lines) else new.trailing_eol
-    return DiffSide(lines^, eol)
+    return DiffSide(lines^, eol, eol_style_crlf(old, new))
 
 
 def hunk_at_new_line(hunks: List[DiffHunk], line: Int) -> Int:
@@ -516,4 +550,4 @@ struct DiffDocument(Copyable, Movable):
             out_lines.append(self.old_side.lines[old_pos])
             old_pos += 1
         var eol = self.new_side.trailing_eol if last_applied_end else self.old_side.trailing_eol
-        return DiffSide(out_lines^, eol).to_text()
+        return DiffSide(out_lines^, eol, eol_style_crlf(self.old_side, self.new_side)).to_text()

@@ -51,7 +51,7 @@ from flint.devtools.problems import (
     scope_breadcrumbs,
 )
 from flint.platform.input import InputState
-from flint.platform.os import read_bytes
+from flint.platform.os import file_stamp, get_time, is_symlink, read_bytes, real_path, write_file_durable
 from flint.render.font import SdfFont
 from flint.ui.draw_list import UI_FLAG_BORDER, UI_FLAG_TOP_BEVEL, UiDrawList
 from flint.ui.icons import draw_studio_chevron, draw_studio_icon
@@ -94,6 +94,14 @@ comptime CODE_ACT_JUMP_DIAGNOSTIC: Int = 8
 comptime CODE_ACT_ASK_AGENT_FIX: Int = 9
 comptime CODE_ACT_OPEN_EXTERNAL_IDE: Int = 10
 comptime CODE_ACT_TOGGLE_PROBLEMS: Int = 11
+comptime CODE_ACT_SAVE_TAB: Int = 12
+"""A save was attempted (Ctrl+S or the unsaved-close banner); `message` is "" on success."""
+comptime CODE_ACT_RELOAD_FROM_DISK: Int = 13
+comptime CODE_ACT_KEEP_BUFFER: Int = 14
+
+comptime CODE_TAB_WIDTH: Int = 4
+"""Columns per tab stop when drawing `\\t` and placing diagnostic squiggles."""
+comptime CODE_DISK_POLL_SEC: Float64 = 0.5
 
 
 def _basename(path: String) -> String:
@@ -117,6 +125,29 @@ def _split_lines(text: String) -> List[String]:
     if text.endswith("\n") and len(out) > 1 and out[len(out) - 1].byte_length() == 0:
         _ = out.pop()
     return out^
+
+
+def text_hash64(text: String) -> UInt64:
+    """FNV-1a 64 over the UTF-8 bytes (detects on-disk content changes)."""
+    var h: UInt64 = 0xCBF29CE484222325
+    var b = text.as_bytes()
+    for i in range(len(b)):
+        h = (h ^ UInt64(b[i])) * 0x100000001B3
+    return h
+
+
+def _bytes_to_text(raw: List[UInt8]) -> String:
+    return String(unsafe_from_utf8=raw) if len(raw) > 0 else String("")
+
+
+def byte_offset_for_col(line: String, col_1based: Int) -> Int:
+    """Byte offset of 1-based compiler column `col_1based` (a byte column), clamped to the
+    line and moved back onto a UTF-8 boundary."""
+    var b = line.as_bytes()
+    var off = max(0, min(len(b), col_1based - 1))
+    while off > 0 and off < len(b) and (b[off] & 0xC0) == 0x80:
+        off -= 1
+    return off
 
 
 @always_inline
@@ -158,6 +189,58 @@ def _draw_cd_mid(
         dl.add_text(font_slot, font, text, x, base_y, px, color)
 
 
+def _tab_stop_px(font: SdfFont, font_px: Float32) -> Float32:
+    return max(Float32(1.0), font.measure(" ", font_px) * Float32(CODE_TAB_WIDTH))
+
+
+def advance_text(font: SdfFont, font_px: Float32, x0: Float32, pen: Float32, seg: String) -> Float32:
+    """Pen position after laying out `seg` starting at `pen`, where tabs snap to the next
+    `CODE_TAB_WIDTH` stop measured from the line origin `x0` (matches drawing)."""
+    var b = seg.as_bytes()
+    var p = pen
+    var start = 0
+    for i in range(len(b)):
+        if b[i] == 9:
+            if i > start:
+                p += font.measure(String(seg[byte=start:i]), font_px)
+            var stop = _tab_stop_px(font, font_px)
+            p = x0 + (Float32(Int((p - x0) / stop + Float32(1.0e-3))) + Float32(1.0)) * stop
+            start = i + 1
+    if start < len(b):
+        p += font.measure(String(seg[byte=start : len(b)]), font_px)
+    return p
+
+
+def diag_squiggle_span(
+    font: SdfFont, font_px: Float32, line: String, col_1based: Int, end_col_1based: Int = 0
+) -> Tuple[Float32, Float32]:
+    """(x offset from the code origin, width) of a diagnostic squiggle: the column is mapped to
+    a byte offset and the tab-expanded prefix is measured; the squiggle covers `end_col` when
+    given, else the identifier/word at the column (at least one glyph)."""
+    var b = line.as_bytes()
+    var start = byte_offset_for_col(line, col_1based)
+    var end = start
+    if end_col_1based > col_1based:
+        end = max(start, byte_offset_for_col(line, end_col_1based))
+    else:
+        while end < len(b) and (
+            (b[end] >= 48 and b[end] <= 57)
+            or (b[end] >= 65 and b[end] <= 90)
+            or (b[end] >= 97 and b[end] <= 122)
+            or b[end] == 95
+            or b[end] >= 128
+        ):
+            end += 1
+        if end == start and end < len(b):
+            end += 1
+            while end < len(b) and (b[end] & 0xC0) == 0x80:
+                end += 1
+    var x0 = advance_text(font, font_px, Float32(0.0), Float32(0.0), String(line[byte=0:start]))
+    var x1 = advance_text(font, font_px, Float32(0.0), x0, String(line[byte=start:end]))
+    var glyph = max(Float32(6.0), font.measure("m", font_px))
+    return (x0, max(glyph, x1 - x0))
+
+
 @fieldwise_init
 struct CodeDrawerAction(Copyable, Movable):
     """Typed user interaction event emitted by `CodeDrawer.draw_and_handle`."""
@@ -180,7 +263,12 @@ struct CodeDrawerAction(Copyable, Movable):
 
 
 struct CodeTab(Copyable, Movable):
-    """Open file buffer inside `CodeDrawer` with cached highlight spans, outline & diff."""
+    """Open file buffer inside `CodeDrawer` with cached highlight spans, outline & diff.
+
+    Disk-backed tabs (`disk_path` set) remember the size, mtime and content hash of the
+    version last read or saved; `CodeDrawer.poll_disk_changes` reloads clean tabs when the
+    file changes and flags `disk_conflict` (keeping the buffer) when the tab is dirty.
+    """
     var path: String
     var title: String
     var lang: Int
@@ -195,6 +283,18 @@ struct CodeTab(Copyable, Movable):
     var proposal_request_id: String
     var cursor_line: Int      # 0-based
     var scroll_line: Int      # 0-based top visible line
+    var disk_path: String
+    var disk_size: Int
+    var disk_mtime: Int
+    var disk_hash: UInt64
+    var disk_conflict: Bool
+    """The file changed on disk while this tab had unsaved edits (or a pending proposal)."""
+    var disk_missing: Bool
+    var disk_pending_text: String
+    """The newer on-disk (or newly supplied) text a conflict is about."""
+    var diff_old_spans: List[List[HighlightSpan]]
+    var diff_new_spans: List[List[HighlightSpan]]
+    var diff_spans_valid: Bool
 
     def __init__(out self, path: String = "", text: String = "", base_text: String = ""):
         self.path = path
@@ -211,6 +311,16 @@ struct CodeTab(Copyable, Movable):
         self.proposal_request_id = ""
         self.cursor_line = 0
         self.scroll_line = 0
+        self.disk_path = ""
+        self.disk_size = -1
+        self.disk_mtime = 0
+        self.disk_hash = 0
+        self.disk_conflict = False
+        self.disk_missing = False
+        self.disk_pending_text = ""
+        self.diff_old_spans = List[List[HighlightSpan]]()
+        self.diff_new_spans = List[List[HighlightSpan]]()
+        self.diff_spans_valid = False
 
     def rebuild_caches(mut self, hl: MojoHighlighter):
         self.lines = _split_lines(self.text)
@@ -221,10 +331,25 @@ struct CodeTab(Copyable, Movable):
             self.symbols.clear()
         if not self.has_proposal:
             self.diff_doc = DiffDocument(self.path, self.base_text, self.text)
+        self.diff_spans_valid = False
+
+    def ensure_diff_spans(mut self, hl: MojoHighlighter):
+        """Highlights both diff sides as whole files so multi-line strings, comments and
+        Markdown fences keep their state across diff rows."""
+        if self.diff_spans_valid:
+            return
+        self.diff_old_spans = hl.highlight_lines(self.diff_doc.old_side.lines, self.lang)
+        self.diff_new_spans = hl.highlight_lines(self.diff_doc.new_side.lines, self.lang)
+        self.diff_spans_valid = True
 
 
 struct CodeDrawer(Movable):
-    """Native GPU SDF Code, Diff & Problems drawer for Flint Studio."""
+    """Native GPU SDF Code, Diff & Problems drawer for Flint Studio.
+
+    Public buffer API (also used by the MCP agent): `open_file`, `open_source`,
+    `materialized_text`, `tab_text`, `save_tab` / `save_path`, `close_tab`,
+    `poll_disk_changes`, `reload_tab_from_disk`, `keep_tab_buffer`, `mirror_problem_store`.
+    """
     var tabs: List[CodeTab]
     var active_tab: Int
     var view_mode: Int
@@ -241,6 +366,14 @@ struct CodeDrawer(Movable):
     var symbols: SymbolIndex
     var has_keyboard_focus: Bool
     var last_hit_count: Int
+    var visible_rows: Int
+    """Code rows visible in the last drawn body (used by `jump_to_line`)."""
+    var pending_close_tab: Int
+    """Tab whose close is waiting on the unsaved-changes banner (-1: none)."""
+    var last_error: String
+    var last_disk_poll: Float64
+    var mirrored_source_hash: List[UInt64]
+    """Per-`DIAG_SRC_*` fingerprint of the last mirrored external `ProblemStore`."""
 
     def __init__(out self):
         self.tabs = List[CodeTab]()
@@ -259,12 +392,28 @@ struct CodeDrawer(Movable):
         self.symbols = SymbolIndex()
         self.has_keyboard_focus = False
         self.last_hit_count = 0
+        self.visible_rows = 12
+        self.pending_close_tab = -1
+        self.last_error = ""
+        self.last_disk_poll = -1.0e9
+        self.mirrored_source_hash = List[UInt64](length=4, fill=UInt64(0))
 
     def find_tab(self, path: String) -> Int:
+        if path.byte_length() == 0:
+            return -1
         for i in range(len(self.tabs)):
             if self.tabs[i].path == path:
                 return i
+        for i in range(len(self.tabs)):
+            if self.tabs[i].disk_path == path:
+                return i
         return -1
+
+    def _valid(self, idx: Int) -> Bool:
+        return idx >= 0 and idx < len(self.tabs)
+
+    def _resolve_idx(self, idx: Int) -> Int:
+        return self.active_tab if idx < 0 else idx
 
     def open_source(
         mut self,
@@ -273,8 +422,13 @@ struct CodeDrawer(Movable):
         base_text: String = "",
         dirty: Bool = False,
         focus_line_1based: Int = 1,
+        force: Bool = False,
     ) -> Int:
-        """Opens or updates a tab from in-memory source text and focuses `focus_line_1based`."""
+        """Opens or updates a tab from in-memory source text and focuses `focus_line_1based`.
+
+        Re-opening a tab with unsaved edits never overwrites them: unless `force`, a different
+        `text` is parked in `disk_pending_text` and the tab is flagged `disk_conflict`.
+        """
         var idx = self.find_tab(path)
         if idx < 0:
             var tab = CodeTab(path, text, base_text)
@@ -282,32 +436,274 @@ struct CodeDrawer(Movable):
             tab.rebuild_caches(self.highlighter)
             self.tabs.append(tab^)
             idx = len(self.tabs) - 1
+        elif self.tabs[idx].text == text and not force:
+            pass  # Same buffer: keep its base text, dirty flag and caches.
+        elif self.tabs[idx].dirty and not force:
+            self.tabs[idx].disk_conflict = True
+            self.tabs[idx].disk_pending_text = text
         else:
             self.tabs[idx].text = text
             if base_text.byte_length() > 0:
                 self.tabs[idx].base_text = base_text
             self.tabs[idx].dirty = dirty
+            self.tabs[idx].disk_conflict = False
             self.tabs[idx].rebuild_caches(self.highlighter)
         if self.tabs[idx].lang == LANG_MOJO:
-            self.symbols.index_source(path, text)
+            self.symbols.index_source(path, self.tabs[idx].text)
         self.active_tab = idx
         self.jump_to_line(focus_line_1based)
         return idx
 
-    def open_file(mut self, path: String, focus_line_1based: Int = 1) -> Int:
-        """Loads a UTF-8 file from disk into a tab and focuses `focus_line_1based`."""
-        var raw = read_bytes(path)
-        var text = String(unsafe_from_utf8=raw) if len(raw) > 0 else String("")
-        return self.open_source(path, text, text, False, focus_line_1based)
+    def _record_disk(mut self, idx: Int, disk_path: String, text: String, size: Int, mtime: Int):
+        self.tabs[idx].disk_path = disk_path
+        self.tabs[idx].disk_size = size
+        self.tabs[idx].disk_mtime = mtime
+        self.tabs[idx].disk_hash = text_hash64(text)
+        self.tabs[idx].disk_missing = False
 
-    def close_tab(mut self, idx: Int):
+    def open_file(mut self, path: String, focus_line_1based: Int = 1) -> Int:
+        """Loads a UTF-8 file from disk into a tab and focuses `focus_line_1based`.
+
+        An already-open tab is focused as-is (never re-read over unsaved edits). Returns -1
+        and sets `last_error` when the file cannot be read.
+        """
+        var idx = self.find_tab(path)
+        if idx >= 0 and self.tabs[idx].disk_path.byte_length() > 0:
+            self.active_tab = idx
+            self.jump_to_line(focus_line_1based)
+            return idx
+        var st = file_stamp(path)
+        if st[0] < 0:
+            self.last_error = "cannot read " + path
+            return -1
+        var text = _bytes_to_text(read_bytes(path))
+        if st[0] > 0 and text.byte_length() == 0:
+            self.last_error = "cannot read " + path
+            return -1
+        if idx >= 0:
+            # A tab opened from memory under this path becomes disk-backed.
+            var same = self.tabs[idx].text == text
+            self._record_disk(idx, path, text, st[0], st[1])
+            if not same and self.tabs[idx].dirty:
+                self.tabs[idx].disk_conflict = True
+                self.tabs[idx].disk_pending_text = text
+            elif not same:
+                self.tabs[idx].text = text
+                self.tabs[idx].base_text = text
+                self.tabs[idx].rebuild_caches(self.highlighter)
+            self.active_tab = idx
+            self.jump_to_line(focus_line_1based)
+            return idx
+        idx = self.open_source(path, text, text, False, focus_line_1based)
+        self._record_disk(idx, path, text, st[0], st[1])
+        return idx
+
+    def set_tab_disk_path(mut self, idx: Int, disk_path: String):
+        """Binds a tab opened from memory (e.g. a workspace-relative agent proposal) to the
+        file it should be saved to and watched at."""
+        if not self._valid(idx):
+            return
+        self.tabs[idx].disk_path = disk_path
+        var st = file_stamp(disk_path)
+        self.tabs[idx].disk_size = st[0]
+        self.tabs[idx].disk_mtime = st[1]
+        self.tabs[idx].disk_missing = st[0] < 0
+        if st[0] >= 0:
+            self.tabs[idx].disk_hash = text_hash64(_bytes_to_text(read_bytes(disk_path)))
+
+    def materialized_text(self, idx: Int = -1, accept_pending: Bool = False) -> String:
+        """Text the tab would hold after its diff review: pending proposal hunks resolved
+        with the current decisions (`accept_pending` takes undecided hunks), else the buffer."""
+        var i = self._resolve_idx(idx)
+        if not self._valid(i):
+            return String("")
+        if self.tabs[i].has_proposal:
+            return self.tabs[i].diff_doc.materialized_text(accept_pending)
+        return self.tabs[i].text
+
+    def tab_text(self, path: String) -> String:
+        var i = self.find_tab(path)
+        return self.tabs[i].text if i >= 0 else String("")
+
+    def _save_target(self, idx: Int) -> String:
+        if self.tabs[idx].disk_path.byte_length() > 0:
+            return self.tabs[idx].disk_path
+        if self.tabs[idx].path.startswith("/"):
+            return self.tabs[idx].path
+        return String("")
+
+    def save_tab(mut self, idx: Int = -1, force: Bool = False) -> Bool:
+        """Durably writes the tab buffer to its file (`write_file_durable`: temp + fsync +
+        rename). Refuses (unless `force`) while the file changed on disk under unsaved edits."""
+        var i = self._resolve_idx(idx)
+        if not self._valid(i):
+            self.last_error = "no tab to save"
+            return False
+        var target = self._save_target(i)
+        if target.byte_length() == 0:
+            self.last_error = "no file path for " + self.tabs[i].title
+            return False
+        if self.tabs[i].disk_conflict and not force:
+            self.last_error = self.tabs[i].title + " changed on disk: reload or keep your version first"
+            return False
+        var write_to = target
+        if is_symlink(target):
+            var rp = real_path(target)
+            if rp[0]:
+                write_to = rp[1]
+        var data = List[UInt8](self.tabs[i].text.as_bytes())
+        if not write_file_durable(write_to, data):
+            self.last_error = "could not write " + target
+            return False
+        var st = file_stamp(target)
+        var saved_text = self.tabs[i].text
+        self._record_disk(i, target, saved_text, st[0], st[1])
+        self.tabs[i].base_text = self.tabs[i].text
+        self.tabs[i].dirty = False
+        self.tabs[i].disk_conflict = False
+        self.tabs[i].disk_pending_text = ""
+        self.tabs[i].rebuild_caches(self.highlighter)
+        self.last_error = ""
+        return True
+
+    def save_path(mut self, path: String, force: Bool = False) -> Bool:
+        var i = self.find_tab(path)
+        if i < 0:
+            self.last_error = "no open tab for " + path
+            return False
+        return self.save_tab(i, force)
+
+    def reload_tab_from_disk(mut self, idx: Int = -1) -> Bool:
+        """Discards the buffer and loads the current file (or the parked conflicting text)."""
+        var i = self._resolve_idx(idx)
+        if not self._valid(i):
+            return False
+        var text: String
+        if self.tabs[i].disk_path.byte_length() > 0:
+            var st = file_stamp(self.tabs[i].disk_path)
+            if st[0] < 0:
+                self.last_error = "cannot read " + self.tabs[i].disk_path
+                return False
+            text = _bytes_to_text(read_bytes(self.tabs[i].disk_path))
+            var dp = self.tabs[i].disk_path
+            self._record_disk(i, dp, text, st[0], st[1])
+        elif self.tabs[i].disk_conflict:
+            text = self.tabs[i].disk_pending_text
+        else:
+            return False
+        self.tabs[i].text = text
+        self.tabs[i].base_text = text
+        self.tabs[i].dirty = False
+        self.tabs[i].has_proposal = False
+        self.tabs[i].disk_conflict = False
+        self.tabs[i].disk_pending_text = ""
+        self.tabs[i].rebuild_caches(self.highlighter)
+        self.tabs[i].cursor_line = min(self.tabs[i].cursor_line, max(0, len(self.tabs[i].lines) - 1))
+        return True
+
+    def keep_tab_buffer(mut self, idx: Int = -1):
+        """Resolves a disk conflict in favour of the buffer: the next save overwrites the file."""
+        var i = self._resolve_idx(idx)
+        if not self._valid(i):
+            return
+        self.tabs[i].disk_conflict = False
+        self.tabs[i].disk_pending_text = ""
+
+    def poll_disk_changes(mut self, now_sec: Float64 = -1.0, force: Bool = False) -> Int:
+        """Stats every disk-backed tab (at most every `CODE_DISK_POLL_SEC`); clean tabs reload a
+        changed file, dirty / proposal tabs get `disk_conflict`. Returns tabs reloaded or flagged."""
+        var now = now_sec if now_sec >= 0.0 else get_time()
+        if not force and now - self.last_disk_poll < CODE_DISK_POLL_SEC:
+            return 0
+        self.last_disk_poll = now
+        var changed = 0
+        for i in range(len(self.tabs)):
+            if self.tabs[i].disk_path.byte_length() == 0:
+                continue
+            var st = file_stamp(self.tabs[i].disk_path)
+            if st[0] < 0:
+                self.tabs[i].disk_missing = True
+                continue
+            self.tabs[i].disk_missing = False
+            if st[0] == self.tabs[i].disk_size and st[1] == self.tabs[i].disk_mtime:
+                continue
+            var text = _bytes_to_text(read_bytes(self.tabs[i].disk_path))
+            var h = text_hash64(text)
+            self.tabs[i].disk_size = st[0]
+            self.tabs[i].disk_mtime = st[1]
+            if h == self.tabs[i].disk_hash:
+                continue  # touched, same content
+            self.tabs[i].disk_hash = h
+            if text == self.tabs[i].text:
+                self.tabs[i].base_text = text
+                self.tabs[i].dirty = False
+                self.tabs[i].disk_conflict = False
+                self.tabs[i].rebuild_caches(self.highlighter)
+            elif self.tabs[i].dirty or self.tabs[i].has_proposal:
+                self.tabs[i].disk_conflict = True
+                self.tabs[i].disk_pending_text = text
+            else:
+                self.tabs[i].text = text
+                self.tabs[i].base_text = text
+                self.tabs[i].rebuild_caches(self.highlighter)
+                self.tabs[i].cursor_line = min(self.tabs[i].cursor_line, max(0, len(self.tabs[i].lines) - 1))
+            changed += 1
+        return changed
+
+    def close_tab(mut self, idx: Int, force: Bool = False):
+        """Closes a tab. A dirty tab is only closed with `force`; otherwise it becomes
+        `pending_close_tab` and the drawer asks Save / Discard / Cancel."""
         if idx < 0 or idx >= len(self.tabs):
             return
+        if self.tabs[idx].dirty and not force:
+            self.pending_close_tab = idx
+            self.active_tab = idx
+            return
         _ = self.tabs.pop(idx)
+        if self.pending_close_tab == idx:
+            self.pending_close_tab = -1
+        elif self.pending_close_tab > idx:
+            self.pending_close_tab -= 1
         if len(self.tabs) == 0:
             self.active_tab = -1
+        elif idx < self.active_tab:
+            # A tab left of the active one closed: keep showing the same file.
+            self.active_tab -= 1
         elif self.active_tab >= len(self.tabs):
             self.active_tab = len(self.tabs) - 1
+
+    def mirror_problem_store(mut self, store: ProblemStore):
+        """Mirrors another `ProblemStore` (e.g. the MCP server's `diagnostics_store`) into
+        `problems`, replacing a source only when that source changed there."""
+        for src in range(4):
+            var h: UInt64 = 0xCBF29CE484222325
+            var n = 0
+            for k in range(len(store.items)):
+                ref d = store.items[k]
+                if d.source != src:
+                    continue
+                n += 1
+                var key = d.path + ":" + String(d.line) + ":" + String(d.col) + ":" + String(d.severity) + ":" + d.message
+                h = (h ^ text_hash64(key)) * 0x100000001B3
+            h = (h ^ UInt64(n)) * 0x100000001B3
+            if h == self.mirrored_source_hash[src]:
+                continue
+            self.mirrored_source_hash[src] = h
+            var diags = List[Diagnostic]()
+            for k in range(len(store.items)):
+                if store.items[k].source == src:
+                    diags.append(store.items[k].copy())
+            self.problems.replace_source(src, diags)
+
+    def _ensure_cursor_visible(mut self):
+        if not self._valid(self.active_tab):
+            return
+        var rows = max(1, self.visible_rows)
+        var ln = self.tabs[self.active_tab].cursor_line
+        if ln < self.tabs[self.active_tab].scroll_line:
+            self.tabs[self.active_tab].scroll_line = ln
+        elif ln >= self.tabs[self.active_tab].scroll_line + rows:
+            self.tabs[self.active_tab].scroll_line = ln - rows + 1
 
     def jump_to_line(mut self, line_1based: Int):
         if self.active_tab < 0 or self.active_tab >= len(self.tabs):
@@ -316,10 +712,11 @@ struct CodeDrawer(Movable):
         var max_ln = max(0, len(tab.lines) - 1)
         var ln = max(0, min(max_ln, line_1based - 1))
         self.tabs[self.active_tab].cursor_line = ln
-        if ln < self.tabs[self.active_tab].scroll_line:
-            self.tabs[self.active_tab].scroll_line = ln
-        elif ln > self.tabs[self.active_tab].scroll_line + 12:
-            self.tabs[self.active_tab].scroll_line = max(0, ln - 4)
+        var rows = max(1, self.visible_rows)
+        var top = self.tabs[self.active_tab].scroll_line
+        if ln < top or ln >= top + rows:
+            # Off screen: centre-ish (a third from the top), like most editors.
+            self.tabs[self.active_tab].scroll_line = max(0, ln - rows // 3)
 
     def show_agent_proposal(
         mut self,
@@ -332,6 +729,7 @@ struct CodeDrawer(Movable):
         """Opens `path` in Diff mode showing a pending agent `FileWriteProposal` with Accept/Reject hunks."""
         var idx = self.open_source(path, old_text, old_text, False, 1)
         self.tabs[idx].diff_doc = DiffDocument(path, old_text, new_text)
+        self.tabs[idx].diff_spans_valid = False
         self.tabs[idx].has_proposal = True
         self.tabs[idx].proposal_request_id = request_id
         self.tabs[idx].scroll_line = 0
@@ -405,19 +803,52 @@ struct CodeDrawer(Movable):
         baseline_y: Float32,
         font_px: Float32,
     ):
+        """Draws `line` coloured by `spans` (byte ranges; spans past a truncated line are
+        clipped and any uncovered tail is drawn plain). `\t` advances to the next tab stop."""
         var pen_x = x
-        if len(spans) == 0:
-            if line.byte_length() > 0:
-                dl.add_text(font_slot, font, line, pen_x, baseline_y, font_px, theme.text_primary)
-            return
+        var n = line.byte_length()
+        var drawn_to = 0
         for si in range(len(spans)):
             ref sp = spans[si]
-            if sp.end_byte <= sp.start_byte or sp.end_byte > line.byte_length():
+            var s0 = max(sp.start_byte, drawn_to)
+            var s1 = min(sp.end_byte, n)
+            if s1 <= s0:
                 continue
-            var seg = String(line[byte=sp.start_byte : sp.end_byte])
-            var col = self._syntax_color(theme, sp.token_kind)
-            dl.add_text(font_slot, font, seg, pen_x, baseline_y, font_px, col)
-            pen_x += font.measure(seg, font_px)
+            if s0 > drawn_to:
+                pen_x = self._draw_segment(dl, font_slot, font, String(line[byte=drawn_to:s0]), x, pen_x, baseline_y, font_px, theme.text_primary)
+            var seg = String(line[byte=s0:s1])
+            pen_x = self._draw_segment(dl, font_slot, font, seg, x, pen_x, baseline_y, font_px, self._syntax_color(theme, sp.token_kind))
+            drawn_to = s1
+        if drawn_to < n:
+            _ = self._draw_segment(dl, font_slot, font, String(line[byte=drawn_to:n]), x, pen_x, baseline_y, font_px, theme.text_primary)
+
+    def _draw_segment(
+        self,
+        mut dl: UiDrawList,
+        font_slot: Int,
+        font: SdfFont,
+        seg: String,
+        x0: Float32,
+        pen: Float32,
+        baseline_y: Float32,
+        font_px: Float32,
+        color: UInt32,
+    ) -> Float32:
+        """Draws one same-colour run, splitting at tabs; returns the new pen x."""
+        var b = seg.as_bytes()
+        var p = pen
+        var start = 0
+        for i in range(len(b) + 1):
+            if i < len(b) and b[i] != 9:
+                continue
+            if i > start:
+                var piece = String(seg[byte=start:i])
+                dl.add_text(font_slot, font, piece, p, baseline_y, font_px, color)
+                p += font.measure(piece, font_px)
+            if i < len(b):
+                p = advance_text(font, font_px, x0, p, "\t")
+            start = i + 1
+        return p
 
     def _draw_squiggle(
         self,
@@ -487,6 +918,13 @@ struct CodeDrawer(Movable):
         )
         if has_active_prop:
             prop_bar_h = Float32(28.0)
+        if not self._valid(self.pending_close_tab):
+            self.pending_close_tab = -1
+        var notice_h = Float32(0.0)
+        if self.pending_close_tab >= 0 or (
+            self._valid(self.active_tab) and self.tabs[self.active_tab].disk_conflict
+        ):
+            notice_h = Float32(28.0)
 
         var prob_hdr_h = Float32(24.0)
         var prob_total_h = (
@@ -494,7 +932,7 @@ struct CodeDrawer(Movable):
             if self.problems_open
             else prob_hdr_h
         )
-        if prob_total_h > h - tab_bar_h - crumb_h - prop_bar_h - Float32(48.0):
+        if prob_total_h > h - tab_bar_h - crumb_h - prop_bar_h - notice_h - Float32(48.0):
             prob_total_h = prob_hdr_h
 
         # --------------------------------------------------------------------
@@ -817,6 +1255,17 @@ struct CodeDrawer(Movable):
             body_y += prop_bar_h
 
         # --------------------------------------------------------------------
+        # 3b. Unsaved-close / disk-conflict notice (Save | Discard | Cancel, Reload | Keep Mine)
+        # --------------------------------------------------------------------
+        if notice_h > Float32(0.0):
+            var notice_act = self._draw_notice_bar(
+                dl, font_slot, font, theme, x, body_y, w, notice_h, mx, my, click
+            )
+            if notice_act.kind != CODE_ACT_NONE and action.kind == CODE_ACT_NONE:
+                action = notice_act^
+            body_y += notice_h
+
+        # --------------------------------------------------------------------
         # 4. Main Code or Diff Canvas
         # --------------------------------------------------------------------
         var prob_y = y + h - prob_total_h
@@ -824,6 +1273,21 @@ struct CodeDrawer(Movable):
         var line_h = Float32(18.0)
         var mono_px = theme.font_mono
         var visible_rows = max(1, Int(body_h / line_h))
+        self.visible_rows = visible_rows
+
+        # Ctrl+S saves the active tab whenever the drawer owns the keyboard.
+        if (
+            self.has_keyboard_focus
+            and self._valid(self.active_tab)
+            and (inp.key_down(341) or inp.key_down(345))
+            and inp.key_pressed(83)
+            and action.kind == CODE_ACT_NONE
+        ):
+            var saved = self.save_tab(self.active_tab)
+            action = CodeDrawerAction(CODE_ACT_SAVE_TAB)
+            action.tab_index = self.active_tab
+            action.path = self._save_target(self.active_tab)
+            action.message = String("") if saved else self.last_error
 
         dl.push_clip(Int(x), Int(body_y), Int(x + w), Int(body_y + body_h))
         dl.add_rect(x, body_y, w, body_h, theme.l0_canvas)
@@ -835,14 +1299,23 @@ struct CodeDrawer(Movable):
                 self.tabs[self.active_tab].scroll_line = max(
                     0, self.tabs[self.active_tab].scroll_line + delta
                 )
-            if self.has_keyboard_focus:
+            if self.has_keyboard_focus and self.view_mode == CODE_MODE_SOURCE:
+                var last_ln = max(0, len(self.tabs[self.active_tab].lines) - 1)
+                var cur = self.tabs[self.active_tab].cursor_line
+                var moved = True
                 if inp.key_pressed(265):  # Up
-                    self.tabs[self.active_tab].cursor_line = max(0, self.tabs[self.active_tab].cursor_line - 1)
+                    cur -= 1
                 elif inp.key_pressed(264):  # Down
-                    self.tabs[self.active_tab].cursor_line = min(
-                        max(0, len(self.tabs[self.active_tab].lines) - 1),
-                        self.tabs[self.active_tab].cursor_line + 1,
-                    )
+                    cur += 1
+                elif inp.key_pressed(266):  # Page Up
+                    cur -= max(1, visible_rows - 1)
+                elif inp.key_pressed(267):  # Page Down
+                    cur += max(1, visible_rows - 1)
+                else:
+                    moved = False
+                if moved:
+                    self.tabs[self.active_tab].cursor_line = max(0, min(last_ln, cur))
+                    self._ensure_cursor_visible()
 
             if self.view_mode == CODE_MODE_SOURCE:
                 self._draw_source_canvas(
@@ -1000,6 +1473,101 @@ struct CodeDrawer(Movable):
         dl.pop_clip()
         return action^
 
+    def _notice_button(
+        self,
+        mut dl: UiDrawList,
+        font_slot: Int,
+        font: SdfFont,
+        theme: StudioTheme,
+        label: String,
+        bx: Float32,
+        by: Float32,
+        bw: Float32,
+        accent: UInt32,
+        mx: Float32,
+        my: Float32,
+    ) -> Bool:
+        var hov = _hit_rect(mx, my, bx, by, bw, Float32(20.0))
+        dl.add_rect(bx, by, bw, Float32(20.0), rgba8_with_alpha(accent, 70 if hov else 40), theme.radius_xs, Float32(1.0), accent)
+        dl.add_text(font_slot, font, label, bx + Float32(8.0), by + Float32(14.0), Float32(11.0), theme.text_primary)
+        return hov
+
+    def _draw_notice_bar(
+        mut self,
+        mut dl: UiDrawList,
+        font_slot: Int,
+        font: SdfFont,
+        theme: StudioTheme,
+        x: Float32,
+        y: Float32,
+        w: Float32,
+        h: Float32,
+        mx: Float32,
+        my: Float32,
+        click: Bool,
+    ) -> CodeDrawerAction:
+        """Unsaved-close prompt (Save / Discard / Cancel) or disk-conflict prompt
+        (Reload / Keep Mine) for the active tab."""
+        var act = CodeDrawerAction(CODE_ACT_NONE)
+        dl.add_rect(x, y, w, h, rgba8_with_alpha(theme.status_warn, 30))
+        dl.add_rect(x, y + h - Float32(1.0), w, Float32(1.0), rgba8_with_alpha(theme.status_warn, 90))
+        draw_studio_icon(dl, ICON_WARN, x + Float32(10.0), y + Float32(7.0), Float32(14.0), theme.status_warn)
+        var by = y + Float32(4.0)
+        self.last_hit_count += 3
+        if self.pending_close_tab >= 0:
+            var ti = self.pending_close_tab
+            var cx = x + w - Float32(70.0)
+            var dx = cx - Float32(78.0)
+            var sx = dx - Float32(62.0)
+            dl.add_text(
+                font_slot, font,
+                _truncate_text("Unsaved changes in " + self.tabs[ti].title, max(8, Int((sx - x - Float32(40.0)) / Float32(7.0)))),
+                x + Float32(30.0), y + Float32(18.0), Float32(11.5), theme.text_primary,
+            )
+            var save_h = self._notice_button(dl, font_slot, font, theme, "Save", sx, by, Float32(56.0), theme.status_ok, mx, my)
+            var disc_h = self._notice_button(dl, font_slot, font, theme, "Discard", dx, by, Float32(72.0), theme.status_danger, mx, my)
+            var canc_h = self._notice_button(dl, font_slot, font, theme, "Cancel", cx, by, Float32(62.0), theme.border_control, mx, my)
+            if click and save_h:
+                var saved = self.save_tab(ti)
+                act = CodeDrawerAction(CODE_ACT_SAVE_TAB)
+                act.tab_index = ti
+                act.path = self._save_target(ti)
+                act.message = String("") if saved else self.last_error
+                if saved:
+                    self.close_tab(ti, force=True)
+                else:
+                    self.pending_close_tab = -1
+            elif click and disc_h:
+                act = CodeDrawerAction(CODE_ACT_CLOSE_TAB)
+                act.tab_index = ti
+                act.path = self.tabs[ti].path
+                self.close_tab(ti, force=True)
+            elif click and canc_h:
+                self.pending_close_tab = -1
+            return act^
+        var ai = self.active_tab
+        var kx = x + w - Float32(92.0)
+        var rx = kx - Float32(72.0)
+        dl.add_text(
+            font_slot, font,
+            _truncate_text(self.tabs[ai].title + " changed on disk (you have unsaved edits)", max(8, Int((rx - x - Float32(40.0)) / Float32(7.0)))),
+            x + Float32(30.0), y + Float32(18.0), Float32(11.5), theme.text_primary,
+        )
+        var rel_h = self._notice_button(dl, font_slot, font, theme, "Reload", rx, by, Float32(66.0), theme.accent_primary, mx, my)
+        var keep_h = self._notice_button(dl, font_slot, font, theme, "Keep Mine", kx, by, Float32(84.0), theme.status_ok, mx, my)
+        if click and rel_h:
+            act = CodeDrawerAction(CODE_ACT_RELOAD_FROM_DISK)
+            act.tab_index = ai
+            act.path = self.tabs[ai].path
+            if not self.reload_tab_from_disk(ai):
+                act.message = self.last_error
+        elif click and keep_h:
+            act = CodeDrawerAction(CODE_ACT_KEEP_BUFFER)
+            act.tab_index = ai
+            act.path = self.tabs[ai].path
+            self.keep_tab_buffer(ai)
+        return act^
+
     def _draw_source_canvas(
         mut self,
         mut dl: UiDrawList,
@@ -1074,12 +1642,11 @@ struct CodeDrawer(Movable):
                 ref d = file_diags[di]
                 if d.line == ln + 1:
                     var dcol = theme.status_danger if d.severity == DIAG_ERROR else theme.status_warn
-                    var char_w = max(Float32(6.5), _measure_cd(font, "m", mono_px))
-                    var sq_x = code_x + Float32(max(0, d.col - 1)) * char_w
-                    var sq_w = max(Float32(24.0), char_w * Float32(6.0))
-                    self._draw_squiggle(dl, sq_x, ry + line_h - Float32(2.0), sq_w, dcol)
+                    var span = diag_squiggle_span(font, mono_px, tab.lines[ln], d.col, d.end_col if d.end_line == d.line or d.end_line == 0 else 0)
+                    self._draw_squiggle(dl, code_x + span[0], ry + line_h - Float32(2.0), span[1], dcol)
                     var badge = _truncate_text(d.message, 32)
-                    var bx = max(code_x + _measure_cd(font, tab.lines[ln], mono_px) + Float32(16.0), x + w - Float32(220.0))
+                    var line_end_x = advance_text(font, mono_px, code_x, code_x, tab.lines[ln])
+                    var bx = max(line_end_x + Float32(16.0), x + w - Float32(220.0))
                     if bx + Float32(60.0) < x + w:
                         dl.add_rect(bx, ry + Float32(2.0), x + w - bx - Float32(10.0), line_h - Float32(4.0), rgba8_with_alpha(dcol, 34), theme.radius_xs)
                         _draw_cd_mid(dl, font_slot, font, badge, bx + Float32(6.0), ry, line_h, Float32(10.0), dcol)
@@ -1130,6 +1697,8 @@ struct CodeDrawer(Movable):
 
         var top = max(0, min(max(0, len(rows) - 1), self.tabs[self.active_tab].scroll_line))
         self.tabs[self.active_tab].scroll_line = top
+        self.tabs[self.active_tab].ensure_diff_spans(self.highlighter)
+        var empty_spans = List[HighlightSpan]()
 
         var old_bg = theme.diff_del_bg
         var new_bg = theme.diff_add_bg
@@ -1217,6 +1786,22 @@ struct CodeDrawer(Movable):
                 continue
 
             var base_y = cur_y + (line_h + mono_px * Float32(0.66)) * Float32(0.5)
+            if row.kind == DIFF_ROW_NOTE:
+                # "\ No newline at end of file" style notes: muted, no gutter number or syntax colour.
+                var note_x = (
+                    x + gutter_w + Float32(18.0)
+                    if not is_split
+                    else (
+                        x + split_gutter_w + Float32(6.0)
+                        if row.left_text.byte_length() > 0
+                        else x + half_w + split_gutter_w + Float32(7.0)
+                    )
+                )
+                dl.push_clip(Int(x), Int(cur_y), Int(x + w - Float32(8.0)), Int(cur_y + line_h))
+                _draw_cd_mid(dl, code_slot, code_font, row.text, note_x, cur_y, line_h, Float32(10.5), theme.text_muted)
+                dl.pop_clip()
+                cur_y += line_h
+                continue
 
             if not is_split:
                 var bg = UInt32(0)
@@ -1252,8 +1837,15 @@ struct CodeDrawer(Movable):
                 )
                 dl.push_clip(Int(x + gutter_w + Float32(1.0)), Int(cur_y), Int(x + w - Float32(8.0)), Int(cur_y + line_h))
                 dl.add_text(code_slot, code_font, prefix, x + gutter_w + Float32(6.0), base_y, mono_px, pcol)
-                var hl_u = self.highlighter.highlight_line(body, 0, self.tabs[self.active_tab].lang)
-                self._draw_syntax_text(dl, code_slot, code_font, theme, body, hl_u[0], x + gutter_w + Float32(18.0), base_y, mono_px)
+                # Spans come from highlighting each side as a whole file (multi-line state).
+                ref tab_u = self.tabs[self.active_tab]
+                var body_x = x + gutter_w + Float32(18.0)
+                if row.kind == DIFF_ROW_OLD and row.old_line >= 0 and row.old_line < len(tab_u.diff_old_spans):
+                    self._draw_syntax_text(dl, code_slot, code_font, theme, body, tab_u.diff_old_spans[row.old_line], body_x, base_y, mono_px)
+                elif row.kind != DIFF_ROW_OLD and row.new_line >= 0 and row.new_line < len(tab_u.diff_new_spans):
+                    self._draw_syntax_text(dl, code_slot, code_font, theme, body, tab_u.diff_new_spans[row.new_line], body_x, base_y, mono_px)
+                else:
+                    self._draw_syntax_text(dl, code_slot, code_font, theme, body, empty_spans, body_x, base_y, mono_px)
                 dl.pop_clip()
             else:
                 # Split side-by-side rendering with strict per-pane clipping & right-aligned line numbers
@@ -1272,9 +1864,13 @@ struct CodeDrawer(Movable):
                     var ol_s = String(row.old_line + 1)
                     var ol_w = _measure_cd(code_font, ol_s, Float32(10.0))
                     _draw_cd_mid(dl, code_slot, code_font, ol_s, x + max(Float32(4.0), split_gutter_w - Float32(5.0) - ol_w), cur_y, line_h, Float32(10.0), theme.text_muted)
+                ref tab_s = self.tabs[self.active_tab]
                 if row.left_text.byte_length() > 0:
-                    var hl_l = self.highlighter.highlight_line(row.left_text, 0, self.tabs[self.active_tab].lang)
-                    self._draw_syntax_text(dl, code_slot, code_font, theme, row.left_text, hl_l[0], x + split_gutter_w + Float32(6.0), base_y, mono_px)
+                    var lx = x + split_gutter_w + Float32(6.0)
+                    if row.old_line >= 0 and row.old_line < len(tab_s.diff_old_spans):
+                        self._draw_syntax_text(dl, code_slot, code_font, theme, row.left_text, tab_s.diff_old_spans[row.old_line], lx, base_y, mono_px)
+                    else:
+                        self._draw_syntax_text(dl, code_slot, code_font, theme, row.left_text, empty_spans, lx, base_y, mono_px)
                 dl.pop_clip()
 
                 # Right pane (clipped cleanly to right half)
@@ -1284,8 +1880,11 @@ struct CodeDrawer(Movable):
                     var nl_w = _measure_cd(code_font, nl_s, Float32(10.0))
                     _draw_cd_mid(dl, code_slot, code_font, nl_s, x + half_w + Float32(1.0) + max(Float32(4.0), split_gutter_w - Float32(5.0) - nl_w), cur_y, line_h, Float32(10.0), theme.text_muted)
                 if row.right_text.byte_length() > 0:
-                    var hl_r = self.highlighter.highlight_line(row.right_text, 0, self.tabs[self.active_tab].lang)
-                    self._draw_syntax_text(dl, code_slot, code_font, theme, row.right_text, hl_r[0], x + half_w + split_gutter_w + Float32(7.0), base_y, mono_px)
+                    var rx = x + half_w + split_gutter_w + Float32(7.0)
+                    if row.new_line >= 0 and row.new_line < len(tab_s.diff_new_spans):
+                        self._draw_syntax_text(dl, code_slot, code_font, theme, row.right_text, tab_s.diff_new_spans[row.new_line], rx, base_y, mono_px)
+                    else:
+                        self._draw_syntax_text(dl, code_slot, code_font, theme, row.right_text, empty_spans, rx, base_y, mono_px)
                 dl.pop_clip()
 
             cur_y += line_h

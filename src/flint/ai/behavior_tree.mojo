@@ -40,6 +40,14 @@ comptime BT_NODE_COOLDOWN: UInt8 = 4
 comptime BT_NODE_BLACKBOARD_CMP: UInt8 = 5
 comptime BT_NODE_UTILITY_SELECT: UInt8 = 6
 comptime BT_NODE_ACTION: UInt8 = 7
+comptime BT_NODE_REPEAT: UInt8 = 8  # decorator: re-runs child `param_f32` times (0 = forever), one iteration per tick
+comptime BT_NODE_TIMEOUT: UInt8 = 9  # decorator: fails a child that stays RUNNING longer than `param_f32` s
+comptime BT_NODE_SUCCEEDER: UInt8 = 10  # decorator: SUCCESS unless child is RUNNING
+comptime BT_NODE_FORCE_FAILURE: UInt8 = 11  # decorator: FAILURE unless child is RUNNING
+comptime BT_NODE_WAIT: UInt8 = 12  # leaf: RUNNING for `param_f32` seconds, then SUCCESS
+comptime BT_NODE_SUBTREE: UInt8 = 13  # pass-through root of an inlined subtree (`action_id` = subtree slot)
+comptime BT_NODE_SERVICE: UInt8 = 14  # decorator: schedules service `action_id` every `param_f32` s while active
+comptime BT_NODE_LAST: UInt8 = 14
 
 comptime BT_ABORT_NONE: UInt8 = 0
 comptime BT_ABORT_SELF: UInt8 = 1
@@ -52,6 +60,11 @@ comptime BT_CMP_GT: UInt8 = 2
 comptime BT_CMP_GE: UInt8 = 3
 comptime BT_CMP_EQ: UInt8 = 4
 comptime BT_CMP_NE: UInt8 = 5
+comptime BT_CMP_IS_TRUE: UInt8 = 6  # Bool key
+comptime BT_CMP_IS_FALSE: UInt8 = 7  # Bool key
+comptime BT_CMP_ENTITY_SET: UInt8 = 8  # entity key != 0
+comptime BT_CMP_ENTITY_UNSET: UInt8 = 9  # entity key == 0
+comptime BT_CMP_LAST: UInt8 = 9
 
 comptime CURVE_LINEAR: UInt8 = 0
 comptime CURVE_POLYNOMIAL: UInt8 = 1
@@ -70,12 +83,16 @@ struct Blackboard(Copyable, Movable):
     var floats: List[Float32]
     var ints: List[Int]
     var vecs: List[Vec3]
+    var entities: List[UInt64]  # entity bits (`Entity.to_bits()`), 0 = none
+    var bools: List[Bool]
 
     def __init__(out self):
         self.names = List[String]()
         self.floats = List[Float32]()
         self.ints = List[Int]()
         self.vecs = List[Vec3]()
+        self.entities = List[UInt64]()
+        self.bools = List[Bool]()
 
     def def_key(mut self, name: String, initial_f32: Float32 = 0.0, initial_int: Int = 0, initial_vec: Vec3 = Vec3()) -> Int:
         for i in range(len(self.names)):
@@ -86,7 +103,50 @@ struct Blackboard(Copyable, Movable):
         self.floats.append(initial_f32)
         self.ints.append(initial_int)
         self.vecs.append(initial_vec)
+        self._sync_ext()
         return idx
+
+    def def_bool_key(mut self, name: String, initial: Bool = False) -> Int:
+        var existed = self.find_key(name) >= 0
+        var k = self.def_key(name)
+        if not existed:
+            self.set_bool(k, initial)
+        return k
+
+    def def_entity_key(mut self, name: String, initial: UInt64 = 0) -> Int:
+        var existed = self.find_key(name) >= 0
+        var k = self.def_key(name)
+        if not existed:
+            self.set_entity(k, initial)
+        return k
+
+    def _sync_ext(mut self):
+        """Keeps `entities` / `bools` as long as `names` (codecs restore only the original columns)."""
+        var n = len(self.names)
+        if len(self.entities) < n:
+            self.entities.resize(n, UInt64(0))
+        if len(self.bools) < n:
+            self.bools.resize(n, False)
+
+    def set_entity(mut self, key: Int, val: UInt64):
+        if key >= 0 and key < len(self.names):
+            self._sync_ext()
+            self.entities[key] = val
+
+    def get_entity(self, key: Int) -> UInt64:
+        if key >= 0 and key < len(self.entities):
+            return self.entities[key]
+        return UInt64(0)
+
+    def set_bool(mut self, key: Int, val: Bool):
+        if key >= 0 and key < len(self.names):
+            self._sync_ext()
+            self.bools[key] = val
+
+    def get_bool(self, key: Int) -> Bool:
+        if key >= 0 and key < len(self.bools):
+            return self.bools[key]
+        return False
 
     def find_key(self, name: String) -> Int:
         for i in range(len(self.names)):
@@ -292,6 +352,10 @@ struct BtNode(Copyable, ImplicitlyCopyable, Movable):
 
     @always_inline
     def eval_condition(self, bb: Blackboard) -> Bool:
+        if self.cmp_op == BT_CMP_IS_TRUE: return bb.get_bool(Int(self.bb_key))
+        if self.cmp_op == BT_CMP_IS_FALSE: return not bb.get_bool(Int(self.bb_key))
+        if self.cmp_op == BT_CMP_ENTITY_SET: return bb.get_entity(Int(self.bb_key)) != 0
+        if self.cmp_op == BT_CMP_ENTITY_UNSET: return bb.get_entity(Int(self.bb_key)) == 0
         var v = bb.get_float(Int(self.bb_key))
         var t = self.param_f32
         if self.cmp_op == BT_CMP_LT: return v < t
@@ -313,6 +377,10 @@ struct BtExecutionState(Copyable, Movable):
     var cooldown_ready_at: List[Float32]
     var action_statuses: List[UInt8]
     var action_exec_counts: List[Int]
+    var node_timer: List[Float32]  # per-node start time (Wait / Timeout), < 0 = inactive
+    var node_counter: List[Int]  # per-node iteration counter (Repeat)
+    var service_next: List[Float32]  # per-node next service time
+    var pending_services: List[Int]  # service ids due this tick (drained by game / task library)
 
     def __init__(out self, max_actions: Int = 32):
         self.time_s = 0.0
@@ -325,6 +393,23 @@ struct BtExecutionState(Copyable, Movable):
         self.cooldown_ready_at = List[Float32]()
         self.action_statuses = List[UInt8](length=max(8, max_actions), fill=BT_SUCCESS)
         self.action_exec_counts = List[Int](length=max(8, max_actions), fill=0)
+        self.node_timer = List[Float32]()
+        self.node_counter = List[Int]()
+        self.service_next = List[Float32]()
+        self.pending_services = List[Int]()
+
+    def _ensure_nodes(mut self, n: Int):
+        if len(self.node_timer) < n:
+            self.node_timer.resize(n, Float32(-1.0))
+        if len(self.node_counter) < n:
+            self.node_counter.resize(n, 0)
+        if len(self.service_next) < n:
+            self.service_next.resize(n, Float32(0.0))
+
+    def take_services(mut self) -> List[Int]:
+        var out = self.pending_services^
+        self.pending_services = List[Int]()
+        return out^
 
     def set_action_status(mut self, action_id: Int, status: UInt8):
         if action_id < 0:
@@ -386,11 +471,13 @@ struct BehaviorTree(Copyable, Movable):
     var nodes: List[BtNode]
     var open_stack: List[Int]
     var utility_scorers: List[UtilityAiScorer]
+    var subtree_names: List[String]
 
     def __init__(out self):
         self.nodes = List[BtNode]()
         self.open_stack = List[Int]()
         self.utility_scorers = List[UtilityAiScorer]()
+        self.subtree_names = List[String]()
 
     def _current_parent(self) -> Int32:
         return Int32(self.open_stack[len(self.open_stack) - 1]) if len(self.open_stack) > 0 else Int32(-1)
@@ -425,6 +512,62 @@ struct BehaviorTree(Copyable, Movable):
         var s_idx = len(self.utility_scorers)
         self.utility_scorers.append(scorer^)
         return self._begin_composite(BT_NODE_UTILITY_SELECT, Float32(0.0), s_idx)
+
+    def begin_repeat(mut self, count: Int = 0) -> Int:
+        """Repeats its single child `count` times (0 = forever); fails as soon as the child fails."""
+        return self._begin_composite(BT_NODE_REPEAT, Float32(max(0, count)))
+
+    def begin_timeout(mut self, seconds: Float32) -> Int:
+        return self._begin_composite(BT_NODE_TIMEOUT, max(Float32(0.0), seconds))
+
+    def begin_succeeder(mut self) -> Int:
+        return self._begin_composite(BT_NODE_SUCCEEDER)
+
+    def begin_force_failure(mut self) -> Int:
+        return self._begin_composite(BT_NODE_FORCE_FAILURE)
+
+    def begin_service(mut self, service_id: Int, interval_seconds: Float32) -> Int:
+        """Decorator: while its child is being evaluated, pushes `service_id` onto
+        `BtExecutionState.pending_services` every `interval_seconds` (first time on entry)."""
+        var idx = self._begin_composite(BT_NODE_SERVICE, max(Float32(0.0), interval_seconds))
+        self.nodes[idx].action_id = Int32(service_id)
+        return idx
+
+    def add_wait(mut self, seconds: Float32) -> Int:
+        var idx = len(self.nodes)
+        var n = BtNode(BT_NODE_WAIT)
+        n.parent_idx = self._current_parent()
+        n.subtree_skip = Int32(idx + 1)
+        n.param_f32 = max(Float32(0.0), seconds)
+        self.nodes.append(n)
+        return idx
+
+    def add_blackboard_bool(mut self, bb_key: Int, expected: Bool = True, abort_mode: UInt8 = BT_ABORT_NONE) -> Int:
+        return self.add_blackboard_cmp(bb_key, BT_CMP_IS_TRUE if expected else BT_CMP_IS_FALSE, 0.0, abort_mode)
+
+    def add_blackboard_entity_set(mut self, bb_key: Int, is_set: Bool = True, abort_mode: UInt8 = BT_ABORT_NONE) -> Int:
+        return self.add_blackboard_cmp(bb_key, BT_CMP_ENTITY_SET if is_set else BT_CMP_ENTITY_UNSET, 0.0, abort_mode)
+
+    def add_subtree(mut self, sub: BehaviorTree, name: String = "") -> Int:
+        """Inlines `sub` under a `BT_NODE_SUBTREE` node (reusable subtree reference resolved at build
+        time: indices, parents, skips and utility scorers are rebased). Returns the subtree node index."""
+        var slot = len(self.subtree_names)
+        self.subtree_names.append(name)
+        var root = self._begin_composite(BT_NODE_SUBTREE)
+        self.nodes[root].action_id = Int32(slot)
+        var base = len(self.nodes)
+        var scorer_base = len(self.utility_scorers)
+        for i in range(len(sub.utility_scorers)):
+            self.utility_scorers.append(sub.utility_scorers[i].copy())
+        for i in range(len(sub.nodes)):
+            var n = sub.nodes[i]
+            n.subtree_skip = Int32(Int(n.subtree_skip) + base)
+            n.parent_idx = Int32(root) if n.parent_idx < 0 else Int32(Int(n.parent_idx) + base)
+            if n.kind == BT_NODE_UTILITY_SELECT and n.action_id >= 0:
+                n.action_id = Int32(Int(n.action_id) + scorer_base)
+            self.nodes.append(n)
+        self.end_composite()
+        return root
 
     def end_composite(mut self):
         """Stamps exact O(1) `subtree_skip` index on the closing composite/decorator."""
@@ -529,6 +672,76 @@ struct BehaviorTree(Copyable, Movable):
                 state.set_node_running(idx, False)
                 state.active_action_id = aid
             return st
+
+        if nd.kind == BT_NODE_WAIT:
+            if nd.param_f32 <= Float32(0.0):
+                return BT_SUCCESS
+            if not state.is_node_running(idx) or state.node_timer[idx] < Float32(0.0):
+                state.node_timer[idx] = state.time_s
+                state.set_node_running(idx, True)
+                return BT_RUNNING
+            if state.time_s - state.node_timer[idx] >= nd.param_f32 - Float32(1.0e-5):
+                state.node_timer[idx] = Float32(-1.0)
+                state.set_node_running(idx, False)
+                return BT_SUCCESS
+            return BT_RUNNING
+
+        if nd.kind == BT_NODE_SUBTREE:
+            if idx + 1 >= end_sub:
+                return BT_SUCCESS
+            return self._eval_node(idx + 1, bb, state)
+
+        if nd.kind == BT_NODE_SUCCEEDER or nd.kind == BT_NODE_FORCE_FAILURE:
+            if idx + 1 >= end_sub:
+                return BT_SUCCESS if nd.kind == BT_NODE_SUCCEEDER else BT_FAILURE
+            var cs = self._eval_node(idx + 1, bb, state)
+            if cs == BT_RUNNING:
+                return BT_RUNNING
+            return BT_SUCCESS if nd.kind == BT_NODE_SUCCEEDER else BT_FAILURE
+
+        if nd.kind == BT_NODE_SERVICE:
+            if not state.has_running_in_range(idx + 1, end_sub) or state.time_s >= state.service_next[idx]:
+                if Int(nd.action_id) >= 0:
+                    state.pending_services.append(Int(nd.action_id))
+                state.service_next[idx] = state.time_s + nd.param_f32
+            if idx + 1 >= end_sub:
+                return BT_SUCCESS
+            return self._eval_node(idx + 1, bb, state)
+
+        if nd.kind == BT_NODE_TIMEOUT:
+            if idx + 1 >= end_sub:
+                return BT_FAILURE
+            if not state.has_running_in_range(idx + 1, end_sub) or state.node_timer[idx] < Float32(0.0):
+                state.node_timer[idx] = state.time_s
+            var cs = self._eval_node(idx + 1, bb, state)
+            if cs == BT_RUNNING:
+                if state.time_s - state.node_timer[idx] >= nd.param_f32:
+                    state.clear_running_in_range(idx + 1, end_sub)
+                    state.node_timer[idx] = Float32(-1.0)
+                    return BT_FAILURE
+                return BT_RUNNING
+            state.node_timer[idx] = Float32(-1.0)
+            return cs
+
+        if nd.kind == BT_NODE_REPEAT:
+            if idx + 1 >= end_sub:
+                return BT_FAILURE
+            var cs = self._eval_node(idx + 1, bb, state)
+            if cs == BT_RUNNING:
+                state.set_node_running(idx, True)
+                return BT_RUNNING
+            if cs == BT_FAILURE:
+                state.node_counter[idx] = 0
+                state.set_node_running(idx, False)
+                return BT_FAILURE
+            state.node_counter[idx] += 1
+            var limit = Int(nd.param_f32)
+            if limit > 0 and state.node_counter[idx] >= limit:
+                state.node_counter[idx] = 0
+                state.set_node_running(idx, False)
+                return BT_SUCCESS
+            state.set_node_running(idx, True)
+            return BT_RUNNING
 
         if nd.kind == BT_NODE_INVERTER:
             if idx + 1 >= end_sub:
@@ -646,6 +859,7 @@ struct BehaviorTree(Copyable, Movable):
             state.cooldown_ready_at.resize(len(self.nodes), Float32(0.0))
         if len(state.node_running) < len(self.nodes):
             state.node_running.resize(len(self.nodes), False)
+        state._ensure_nodes(len(self.nodes))
 
         # 1. Reactive observer pass (`BT_ABORT_LOWER_PRIORITY` / `BT_ABORT_SELF`)
         self._check_reactive_aborts(bb, state)
@@ -832,13 +1046,13 @@ def _bt_parse_json_node(
         if k_n < 0 or doc.nodes[k_n].kind != 2:
             return (False, empty_nodes^, empty_scorers^)
         var kind = doc.integer(k_n, -1)
-        if kind < 0 or kind > Int(BT_NODE_ACTION):
+        if kind < 0 or kind > Int(BT_NODE_LAST):
             return (False, empty_nodes^, empty_scorers^)
         var abort_mode = doc.integer(doc.object_get(nd_n, "abort_mode"), Int(BT_ABORT_NONE))
         if abort_mode < 0 or abort_mode > Int(BT_ABORT_BOTH):
             return (False, empty_nodes^, empty_scorers^)
         var cmp_op = doc.integer(doc.object_get(nd_n, "cmp_op"), Int(BT_CMP_EQ))
-        if cmp_op < 0 or cmp_op > Int(BT_CMP_NE):
+        if cmp_op < 0 or cmp_op > Int(BT_CMP_LAST):
             return (False, empty_nodes^, empty_scorers^)
         var subtree_skip = doc.integer(doc.object_get(nd_n, "subtree_skip"), i + 1)
         if subtree_skip <= i or subtree_skip > n_nodes:
@@ -1181,7 +1395,7 @@ struct BehaviorTreeComponent(SerializableComponent):
             var pf = reader.f32()
             if reader.failed:
                 raise Error("BehaviorTreeComponent: truncated node")
-            if kind > BT_NODE_ACTION or abort_mode > BT_ABORT_BOTH or cmp_op > BT_CMP_NE:
+            if kind > BT_NODE_LAST or abort_mode > BT_ABORT_BOTH or cmp_op > BT_CMP_LAST:
                 raise Error("BehaviorTreeComponent: invalid node enum")
             if skip <= i or skip > n_nodes or pidx < -1 or pidx >= i:
                 raise Error("BehaviorTreeComponent: invalid node hierarchy bounds")

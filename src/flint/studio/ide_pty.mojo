@@ -1,6 +1,19 @@
 """Private controlling terminal for a Studio-owned TurboMojo process on Linux."""
 from std.ffi import external_call
-from flint.platform.os import last_errno
+from flint.devtools.job_runner import (
+    ChildExecPrelude,
+    child_exec_prelude,
+    reap_child,
+    signal_process_group,
+)
+
+
+def _c_bytes(s: String) -> List[UInt8]:
+    var out = List[UInt8](capacity=s.byte_length() + 1)
+    for b in s.as_bytes():
+        out.append(b)
+    out.append(0)
+    return out^
 
 
 struct IdePty(Movable):
@@ -28,25 +41,32 @@ struct IdePty(Movable):
         var size: Array[UInt16, 4] = [UInt16(max(1, rows)), UInt16(max(1, cols)), UInt16(0), UInt16(0)]
         var master = Int32(-1)
         # Bash expands the launcher's paths as individual arguments, after exec.
-        var program = String("/bin/bash")
-        var option = String("-c")
-        var command = String(
+        # Every C string and the argv array are built before fork: the child must not allocate.
+        var program = _c_bytes("/bin/bash")
+        var option = _c_bytes("-c")
+        var command = _c_bytes(
             'cd -- "$FLINT_STUDIO_PROJECT" && exec bash "$FLINT_STUDIO_IDE_LAUNCHER" studio'
             ' --ide-embedded "$FLINT_STUDIO_IDE_FILE"'
         )
+        var argv = List[Int](length=4, fill=0)
+        argv[0] = Int(program.unsafe_ptr())
+        argv[1] = Int(option.unsafe_ptr())
+        argv[2] = Int(command.unsafe_ptr())
+        var prelude = ChildExecPrelude()
         var pid = external_call["forkpty", Int32](
             Pointer(to=master), Int(0), Int(0), Pointer(to=size)
         )
         if pid == 0:
+            # forkpty already made the child a session (and process-group) leader.
+            child_exec_prelude(prelude, new_group=False)
             _ = external_call["close_range", Int32](UInt32(3), UInt32(0xFFFFFFFF), UInt32(0))
-            _ = external_call["execl", Int32](
-                program.as_c_string_span(),
-                program.as_c_string_span(),
-                option.as_c_string_span(),
-                command.as_c_string_span(),
-                Int(0),
-            )
+            _ = external_call["execv", Int32](program.unsafe_ptr(), argv.unsafe_ptr())
             external_call["_exit", NoneType](Int32(127))
+        _ = program[0]
+        _ = option[0]
+        _ = command[0]
+        _ = argv[0]
+        _ = prelude.sigdfl[0]
         if pid < 0:
             return False
         self.fd = master
@@ -82,11 +102,8 @@ struct IdePty(Movable):
     def reap(mut self, wait: Bool = False) -> Bool:
         if self.pid <= 0:
             return True
-        var status = Int32(0)
-        var r = external_call["waitpid", Int32](
-            self.pid, Pointer(to=status), Int32(0 if wait else 1)
-        )
-        if r == self.pid or (r < 0 and last_errno() == 10):
+        var rr = reap_child(self.pid, block=wait)
+        if rr[0]:
             self.pid = -1
             if self.fd >= 0:
                 _ = external_call["close", Int32](self.fd)
@@ -95,6 +112,10 @@ struct IdePty(Movable):
         return False
 
     def stop(mut self):
+        """Ends the session without sleeping on the UI thread: closing the master hangs up the
+        terminal, SIGHUP goes to the whole process group (the launcher, TurboMojo and anything they
+        started), and whatever is still alive at the following non-blocking check is SIGKILLed
+        (group-wide) and reaped. SIGKILL is immediate, so the final reap does not wait on the child."""
         if self.reap():
             if self.fd >= 0:
                 _ = external_call["close", Int32](self.fd)
@@ -104,11 +125,8 @@ struct IdePty(Movable):
             _ = external_call["close", Int32](self.fd)
             self.fd = -1
         if self.pid > 0:
-            _ = external_call["kill", Int32](self.pid, Int32(1))
-            for _ in range(40):
-                if self.reap():
-                    return
-                _ = external_call["usleep", Int32](UInt32(10000))
-            _ = external_call["kill", Int32](self.pid, Int32(9))
-            while not self.reap(True):
-                pass
+            signal_process_group(self.pid, Int32(1))
+            if self.reap():
+                return
+            signal_process_group(self.pid, Int32(9))
+            _ = self.reap(True)

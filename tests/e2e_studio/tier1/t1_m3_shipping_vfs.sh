@@ -179,7 +179,7 @@ def main():
     print("COMMIT=" + build_commit())
     print("STAMP=" + build_stamp())
 MOJO
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$bi_src" -o "$bi_bin" >/dev/null 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$bi_src" -o "$bi_bin" >/dev/null 2>&1; then
         fail_test "t1_m3_f26_flint_version_pin_matches_build_info" "failed to compile build_info probe"
         return
     fi
@@ -293,7 +293,7 @@ def main() raises:
 
     srv.close()
 MOJO
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >/dev/null 2>&1; then
         fail_test "t1_m3_f26_asset_server_flpk_first_and_loose_fallback" "failed to compile vfs_probe.mojo"
         return
     fi
@@ -357,7 +357,7 @@ with McpStdioClient([studio_bin, "--project", proj_dir, "--mcp-stdio"], cwd=othe
     if q.get("count", 0) < 1:
         raise SystemExit(f"scene.load did not restore M3Crate: {q}")
 
-    pkg = c.call_tool("project.package", {"output_dir": "dist/mcp_out"})
+    pkg = c.call_tool("project.package", {"output_dir": "dist/mcp_out"}, timeout=900.0)
     print("PKG_OUT=" + pkg.get("output_dir", os.path.join(proj_dir, "dist/mcp_out")))
 PY
     )" || py_rc=$?
@@ -581,7 +581,7 @@ def main() raises:
     if not res[0]:
         raise Error("golden FLIP mismatch: " + res[1])
 MOJO
-            if "$MOJO_BIN" build -I "${ROOT}/src" -I "${ROOT}/tests" -O3 --fp-mode contract=off --Werror "$flip_src" -o "$flip_bin" >/dev/null 2>&1; then
+            if "$MOJO_BIN" build -I "${ROOT}/src" -I "${ROOT}/tests" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$flip_src" -o "$flip_bin" >/dev/null 2>&1; then
                 if "$flip_bin" "$shot_out" "$golden_ref" >/dev/null 2>&1; then
                     has_golden=1
                 fi

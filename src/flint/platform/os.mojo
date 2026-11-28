@@ -14,7 +14,7 @@ def get_time() -> Float64:
 
 
 def unix_time_sec() -> Int:
-    """Wall-clock seconds since the Unix epoch for persisted timestamps."""
+    """Wall-clock seconds since the Unix epoch (time(2)); for persisted timestamps such as frecency."""
     return Int(external_call["time", Int64](Int(0)))
 
 
@@ -51,6 +51,58 @@ def set_signal_action(signal: Int32, action: Int, previous: Int = 0) -> Int32:
         signal, Pointer[UInt8, MutAnyOrigin](unsafe_from_address=action),
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=previous),
     )
+
+
+comptime QuitSignalHandler = def(Int32) abi("C") thin -> None
+comptime _SA_RESTART: Int = 0x10000000
+comptime _SA_RESETHAND: Int = 0x80000000
+comptime _SIGACTION_WORDS: Int = 19  # glibc struct sigaction: 152 bytes; sa_flags at byte 136
+
+
+def _quit_signal_handler(signal: Int32) abi("C"):
+    """Does nothing, which is trivially async-signal-safe. The work is in its flags: SA_RESETHAND puts
+    the signal back to SIG_DFL as it is delivered, and `quit_signal_received()` sees that change."""
+    pass
+
+
+def _quit_signals() -> List[Int32]:
+    var out = List[Int32](capacity=3)
+    out.append(Int32(2))   # SIGINT
+    out.append(Int32(15))  # SIGTERM
+    out.append(Int32(1))   # SIGHUP (the terminal closed)
+    return out^
+
+
+def install_quit_signal_handlers() -> Bool:
+    """SIGINT, SIGTERM and SIGHUP become a quit request instead of killing the process: poll
+    `quit_signal_received()` once a frame and shut down normally (save, remove sockets, ...).
+    Mojo has no globals and a handler gets no pointer, so the flag is the disposition itself: the
+    handler is installed one-shot (SA_RESETHAND). A second signal therefore takes the default action
+    and ends the process at once, as a stuck shutdown should. Call again to re-arm."""
+    var action = List[Int](length=_SIGACTION_WORDS, fill=0)
+    Pointer[QuitSignalHandler, origin=MutAnyOrigin](unsafe_from_address=Int(action.unsafe_ptr()))[unsafe_offset=0] = _quit_signal_handler
+    action[17] = _SA_RESTART | _SA_RESETHAND
+    var ok = True
+    var signals = _quit_signals()
+    for sig in signals:
+        if set_signal_action(sig, Int(action.unsafe_ptr()), 0) != 0:
+            ok = False
+    _ = action^
+    return ok
+
+
+def quit_signal_received() -> Int:
+    """The quit signal (2, 15 or 1) delivered since `install_quit_signal_handlers()`, or 0. One
+    `sigaction` query per signal; a handler someone else installed meanwhile is not a delivery."""
+    var current = List[Int](length=_SIGACTION_WORDS, fill=0)
+    var signals = _quit_signals()
+    for sig in signals:
+        current[0] = -1
+        if set_signal_action(sig, 0, Int(current.unsafe_ptr())) == 0 and current[0] == 0:
+            _ = current^
+            return Int(sig)
+    _ = current^
+    return 0
 
 
 def open_path_fd(var path: String, flags: Int32, mode: Int32 = 0) -> Int:
@@ -144,13 +196,34 @@ def parent_directory(path: String) -> String:
     return String(path[byte=0:cut])
 
 
-def write_synced(path: String, mut data: List[UInt8], fault: Int = FAULT_NONE, sync: Bool = True) -> Bool:
+def file_mode(path: String) -> Int:
+    """Permission bits (`st_mode & 0o7777`) of `path` from stat(2), following symlinks,
+    or -1 when it is missing."""
+    comptime STAT_MODE_OFF: Int = 24 if CompilationTarget.is_x86() else 16
+    var owned = path
+    var buf = List[UInt8](length=256, fill=0)
+    if external_call["stat", Int32](owned.as_c_string_span(), buf.unsafe_ptr()) != 0:
+        return -1
+    var mode = Pointer[UInt32, ImmutAnyOrigin](
+        unsafe_from_address=Int(buf.unsafe_ptr()) + STAT_MODE_OFF
+    )[unsafe_offset=0]
+    _ = len(buf)
+    return Int(mode & 0o7777)
+
+
+def write_synced(
+    path: String, mut data: List[UInt8], fault: Int = FAULT_NONE, sync: Bool = True, mode: Int = -1
+) -> Bool:
     """Writes a whole file and fsyncs it: its bytes are on disk on return.
     `fault` stops part way, for tests (FAULT_*); `sync` False skips the fsync
-    (scratch files nobody needs after a power cut: a replay's saves)."""
+    (scratch files nobody needs after a power cut: a replay's saves). `mode` >= 0
+    fchmods the file to those permission bits before the fsync (best effort: a file we
+    do not own keeps the creation mode); otherwise a new file gets 0666 & ~umask."""
     var fd = open_write(path)
     if fd < 0:
         return False
+    if mode >= 0:
+        _ = external_call["fchmod", Int32](Int32(fd), UInt32(mode & 0o7777))
     var ok = _write_synced_fd(fd, data, fault, sync)
     if not ok and fault == FAULT_NONE:
         _ = remove_file(path)
@@ -188,25 +261,23 @@ def durable_rename(source: String, destination: String, sync: Bool = True) -> Bo
 def write_file_durable(
     path: String, mut data: List[UInt8], fault: Int = FAULT_NONE, sync: Bool = True
 ) -> Bool:
-    """Publish a complete file by renaming a private staging file in the same directory."""
-    var owned = path
-    var stat_buf = List[UInt8](length=256, fill=0)
-    var mode = Int32(0o666)
-    var exists = external_call["stat", Int32](owned.as_c_string_span(), stat_buf.unsafe_ptr()) == 0
-    if exists:
-        comptime MODE_OFFSET: Int = 24 if CompilationTarget.is_x86() else 16
-        var bits = Pointer[UInt32, ImmutAnyOrigin](
-            unsafe_from_address=Int(stat_buf.unsafe_ptr()) + MODE_OFFSET
-        )[unsafe_offset=0]
-        mode = Int32(bits & 0o777)
-        _ = len(stat_buf)
+    """Replaces `path` with `data` so that after a crash or power loss at any
+    moment the file is either the old one or the new one, never a mix: write a
+    private O_EXCL staging file in the same directory and fsync it, rename it over
+    `path`, fsync the directory (`sync` False skips the fsyncs for rebuildable caches).
+    The replacement keeps the existing file's permission bits (an executable script
+    stays executable); a new file gets the usual 0666 & ~umask (0644 under umask 022)."""
+    var existing_mode = file_mode(path)
+    var exists = existing_mode >= 0
+    var mode = Int32(existing_mode) if exists else Int32(0o666)
     var prefix = parent_directory(path) + "/.flint-write-" + String(Int(external_call["getpid", Int32]())) + "-"
     var attempt = 0
     while True:
         var stage = prefix + String(attempt) + ".tmp"
         var fd = open_path_fd(stage, Int32(1 | 64 | 128), mode)  # O_WRONLY | O_CREAT | O_EXCL
         if fd >= 0:
-            if exists and external_call["fchmod", Int32](Int32(fd), UInt32(mode)) != 0:
+            # O_CREAT applies the umask; restore the exact bits of the file being replaced.
+            if exists and external_call["fchmod", Int32](Int32(fd), UInt32(existing_mode)) != 0:
                 close_fd(fd)
                 _ = remove_file(stage)
                 return False
@@ -584,6 +655,8 @@ def write_bytes(path: String, mut data: List[UInt8]) -> Bool:
     var offset = 0
     while offset < len(data):
         var count = Int(external_call["write", Int64](Int32(fd), data.unsafe_ptr().unsafe_offset(offset), Int64(len(data) - offset)))
+        if count < 0 and last_errno() == EINTR:
+            continue  # a signal interrupted the write; retry the rest
         if count <= 0:
             close_fd(fd)
             return False

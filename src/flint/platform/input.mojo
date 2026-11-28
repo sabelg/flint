@@ -46,6 +46,35 @@ comptime EVIOCRMFF: UInt64 = 0x40044581
 comptime KEY_SLOTS: Int = 512
 # Package 3.15: holding a mash-to-hold key repeats its press every this many ticks.
 comptime MASH_REPEAT_TICKS: Int = 8
+# Typematic key repeat when the platform leaves it to the client (Wayland `wl_keyboard.repeat_info`).
+comptime KEY_REPEAT_DELAY_MS: Int = 600
+comptime KEY_REPEAT_RATE_HZ: Int = 25
+comptime KEY_REPEAT_MAX_PER_FRAME: Int = 8
+# `last_mouse_x/y` once the pointer has left the window: far outside every widget and viewport.
+comptime POINTER_OUTSIDE: Float32 = -1.0e6
+
+
+def is_modifier_key(key: Int) -> Bool:
+    """Shift, Ctrl, Alt and Super (GLFW 340-347) and the lock keys never repeat."""
+    return (key >= 340 and key <= 347) or key == 280 or key == 281 or key == 282
+
+
+def layout_shortcut_code(physical: Int, base_codepoint: Int) -> Int:
+    """The key code a shortcut sees for the key at `physical` (a US-position GLFW code) when the
+    active layout prints `base_codepoint` there unshifted: Latin letters become their letter
+    (`Ctrl+Z` is the key labelled Z on AZERTY or QWERTZ), US punctuation and digits become their
+    own GLFW code, and anything else (Cyrillic, dead keys, `&` on AZERTY digits) keeps the
+    physical position as the fallback. Keys outside the printable block never move."""
+    if physical < 32 or physical > 96:
+        return physical
+    var cp = base_codepoint
+    if cp >= 97 and cp <= 122:
+        return cp - 32
+    if cp >= 65 and cp <= 90:
+        return cp
+    if cp == 32 or cp == 39 or (cp >= 44 and cp <= 57) or cp == 59 or cp == 61 or (cp >= 91 and cp <= 93) or cp == 96:
+        return cp
+    return physical
 
 
 def remappable_control(control: Int) -> Bool:
@@ -365,6 +394,24 @@ struct InputState(Copyable, Movable):
     var ime_sel_len: Int
     var ime_active: Bool
     var ime_commit: String
+    # IME `delete_surrounding_text` this frame: UTF-8 bytes to remove before / after the caret
+    # (applied before `ime_commit` is inserted). Cleared by `begin_frame`.
+    var ime_delete_before: Int
+    var ime_delete_after: Int
+    # Typematic key repeat (`key_pressed_or_repeat`): the last non-modifier key pressed repeats after
+    # `repeat_delay_ms`, `repeat_rate_hz` times a second while it is held. Rate 0 turns synthesis off
+    # (repeat disabled, or the platform sends its own repeat presses, as X11 does).
+    var repeat_rate_hz: Int
+    var repeat_delay_ms: Int
+    var repeat_key: Int           # logical key being repeated, -1 when none
+    var repeat_text: String       # the text its press typed, typed again on every repeat
+    var repeat_next_at: Float64   # when it next repeats; < 0 until the first tick after the press
+    var repeat_fired_key: Int     # logical key that repeated this frame, -1 when none
+    var repeat_fired_count: Int
+    # Shortcuts on the active keyboard layout: physical GLFW code -> code that prints there
+    # (`layout_shortcut_code`). Empty means US positions. Only used while `layout_shortcuts` is set.
+    var layout_shortcuts: Bool
+    var layout_key_map: List[Int]
 
     def __init__(out self):
         self.keys = List[Bool](length=512, fill=False)
@@ -399,6 +446,17 @@ struct InputState(Copyable, Movable):
         self.ime_sel_len = 0
         self.ime_active = False
         self.ime_commit = String()
+        self.ime_delete_before = 0
+        self.ime_delete_after = 0
+        self.repeat_rate_hz = KEY_REPEAT_RATE_HZ
+        self.repeat_delay_ms = KEY_REPEAT_DELAY_MS
+        self.repeat_key = -1
+        self.repeat_text = String()
+        self.repeat_next_at = -1.0
+        self.repeat_fired_key = -1
+        self.repeat_fired_count = 0
+        self.layout_shortcuts = False
+        self.layout_key_map = List[Int]()
 
     def begin_frame(mut self):
         for index in range(512):
@@ -416,6 +474,96 @@ struct InputState(Copyable, Movable):
         self.text_input_utf8 = String()
         self.dropped_files.clear()
         self.ime_commit = String()
+        self.ime_delete_before = 0
+        self.ime_delete_after = 0
+        self.repeat_fired_key = -1
+        self.repeat_fired_count = 0
+
+    def set_repeat_info(mut self, rate_hz: Int, delay_ms: Int):
+        """`wl_keyboard.repeat_info`: repeats per second (0 = no synthesized repeat) and the delay before the first."""
+        self.repeat_rate_hz = max(0, min(1000, rate_hz))
+        self.repeat_delay_ms = max(0, min(10000, delay_ms))
+        if self.repeat_rate_hz == 0:
+            self.repeat_key = -1
+
+    def set_repeat_text(mut self, physical: Int, text: String):
+        """The text the press of `physical` typed, so its synthesized repeats type it again."""
+        if physical < 0 or physical >= KEY_SLOTS:
+            return
+        var key = self.key_map[self._layout_code(physical)]
+        if key >= 0 and key == self.repeat_key:
+            self.repeat_text = text
+
+    def tick_key_repeat(mut self, now: Float64):
+        """Once per poll, after the frame's key events: fires the held key's repeats that are due."""
+        if self.repeat_rate_hz <= 0 or self.repeat_key < 0:
+            return
+        if not self.keys[self.repeat_key]:
+            self.repeat_key = -1
+            return
+        if self.repeat_next_at < 0.0:
+            self.repeat_next_at = now + Float64(self.repeat_delay_ms) * 0.001
+            return
+        var interval = 1.0 / Float64(self.repeat_rate_hz)
+        var fired = 0
+        while now >= self.repeat_next_at and fired < KEY_REPEAT_MAX_PER_FRAME:
+            fired += 1
+            self.repeat_next_at += interval
+        if now >= self.repeat_next_at:
+            self.repeat_next_at = now + interval  # a long stall: no burst of stale repeats
+        if fired > 0:
+            self._fire_repeat(self.repeat_key, fired, True)
+
+    def _fire_repeat(mut self, key: Int, count: Int, retype: Bool):
+        self.repeat_fired_key = key
+        self.repeat_fired_count += count
+        if retype and self.repeat_text.byte_length() > 0:
+            for _ in range(count):
+                self.text_input_utf8 += self.repeat_text
+
+    def key_repeated(self, key: Int) -> Bool:
+        """True when `key` is held and auto-repeated this frame (not on its first press)."""
+        return key >= 0 and key == self.repeat_fired_key and self.repeat_fired_count > 0
+
+    def key_pressed_or_repeat(self, key: Int) -> Bool:
+        """A press or a typematic repeat of `key` this frame: for text editing and list navigation."""
+        return self.key_pressed(key) or self.key_repeated(key)
+
+    def set_layout_key_map(mut self, var layout_map: List[Int]):
+        """Installs the layout's shortcut table (`layout_shortcut_code` per physical code; empty = US
+        positions). Keys held under the old table are let go first, so none stays stuck down."""
+        if len(layout_map) != KEY_SLOTS and len(layout_map) != 0:
+            return
+        if len(layout_map) == len(self.layout_key_map):
+            var same = True
+            for i in range(len(layout_map)):
+                if layout_map[i] != self.layout_key_map[i]:
+                    same = False
+                    break
+            if same:
+                return
+        if self.layout_shortcuts:
+            self.release_held()
+        self.layout_key_map = layout_map^
+
+    def _layout_code(self, physical: Int) -> Int:
+        if self.layout_shortcuts and len(self.layout_key_map) == KEY_SLOTS:
+            var code = self.layout_key_map[physical]
+            if code >= 0 and code < KEY_SLOTS:
+                return code
+        return physical
+
+    def pointer_left(mut self):
+        """The pointer left the window: no hover anywhere until it comes back."""
+        self.has_mouse_position = False
+        self.last_mouse_x = POINTER_OUTSIDE
+        self.last_mouse_y = POINTER_OUTSIDE
+
+    def pointer_entered(mut self, x: Float32, y: Float32):
+        """The pointer came (back) in at `x, y`: a position, not a jump, so no delta."""
+        self.last_mouse_x = x
+        self.last_mouse_y = y
+        self.has_mouse_position = True
 
     def push_text_utf8(mut self, text: String):
         self.text_input_utf8 += text
@@ -440,12 +588,19 @@ struct InputState(Copyable, Movable):
         self.ime_sel_len = 0
         self.ime_active = False
 
+    def delete_ime_surrounding(mut self, before_bytes: Int, after_bytes: Int):
+        """IME `delete_surrounding_text`: UTF-8 bytes around the caret to remove before the commit."""
+        self.ime_delete_before += max(0, before_bytes)
+        self.ime_delete_after += max(0, after_bytes)
+
     def clear_ime_preedit(mut self):
         self.ime_preedit = String()
         self.ime_cursor_cp = 0
         self.ime_sel_len = 0
         self.ime_active = False
         self.ime_commit = String()
+        self.ime_delete_before = 0
+        self.ime_delete_after = 0
 
     def push_dropped_file(mut self, path: String):
         self.dropped_files.append(path)
@@ -466,6 +621,7 @@ struct InputState(Copyable, Movable):
             self.mouse_extra_down[index] = False
         for pad in range(MAX_PADS):
             self.pads[pad].clear()
+        self.repeat_key = -1
 
     def set_mapping(mut self, var key_map: List[Int], var pad_map: List[Int], var toggle_keys: List[Bool], var toggle_pads: List[Bool], var mash_keys: List[Bool], var mash_pads: List[Bool], deadzone_left: Float32, deadzone_right: Float32):
         """New bindings (package 3.15, gameplay/bindings.mojo `Bindings.apply`).
@@ -481,6 +637,7 @@ struct InputState(Copyable, Movable):
             self.physical_keys[index] = False
             self.key_latched[index] = False
             self.key_mash_ticks[index] = 0
+        self.repeat_key = -1
         for pad in range(MAX_PADS):
             for control in range(PAD_CONTROLS):
                 if remappable_control(control):
@@ -532,11 +689,12 @@ struct InputState(Copyable, Movable):
         latch on each physical press and ignores releases (package 3.15)."""
         if physical < 0 or physical >= 512:
             return
-        var key = self.key_map[physical]
+        var code = self._layout_code(physical)
+        var key = self.key_map[code]
         if key < 0 or key >= KEY_SLOTS:
             return
-        var was = self.physical_keys[physical]
-        self.physical_keys[physical] = down
+        var was = self.physical_keys[code]
+        self.physical_keys[code] = down
         if self.toggle_keys[key]:
             if down and not was:
                 self.key_latched[key] = not self.key_latched[key]
@@ -547,6 +705,7 @@ struct InputState(Copyable, Movable):
     def release_held(mut self):
         """The window lost the keyboard: every logical key held or latched is
         let go (a release this frame), whatever physical key held it."""
+        self.repeat_key = -1
         for key in range(KEY_SLOTS):
             self.physical_keys[key] = False
             self.key_latched[key] = False
@@ -557,10 +716,22 @@ struct InputState(Copyable, Movable):
     def set_logical_key(mut self, key: Int, down: Bool):
         if key < 0 or key >= 512:
             return
+        if down and self.keys[key]:
+            # A press of a key already down is the platform's own auto-repeat (X11, evdev value 2);
+            # its text already arrived with the event.
+            if not is_modifier_key(key):
+                self._fire_repeat(key, 1, False)
+            return
         if down and not self.keys[key]:
             self.pressed[key] = True
+            if not is_modifier_key(key):
+                self.repeat_key = key
+                self.repeat_text = String()
+                self.repeat_next_at = -1.0
         if not down and self.keys[key]:
             self.released[key] = True
+            if key == self.repeat_key:
+                self.repeat_key = -1
         self.keys[key] = down
 
     def set_mouse(mut self, button: Int, down: Bool):

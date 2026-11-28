@@ -607,15 +607,27 @@ struct VisBufferGpuPicker(Movable):
         instance_to_entity: List[Int] = List[Int](),
     ) -> ViewportPickResult:
         """Explicit synchronous pick helper (for one-shot tests; waits only on its own pick slot fence)."""
-        _ = self.request_pick(out_px, out_py, instance_to_entity)
+        var my_id = self.request_pick(out_px, out_py, instance_to_entity)
         if not self.dispatch_pending_pick(ren, instance_to_entity):
             return ViewportPickResult()
         var last_slot = (self.write_cursor + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT
         var f = self.slots[last_slot].fence
         if f != 0 and ren.vk.device != 0:
             _ = ren.vk.wait(f)
-        var got = self.poll_completed_pick(ren)
-        return got.value() if got else ViewportPickResult()
+        _ = self.harvest_completed_picks(ren)
+        # Take *this* request's result; older async results stay queued for their own caller
+        # (popping the oldest entry used to hand back the previous click's entity).
+        var mine = self.take_pick_result(my_id)
+        return mine.value() if mine else ViewportPickResult()
+
+    def take_pick_result(mut self, request_id: UInt64) -> Optional[ViewportPickResult]:
+        """Removes and returns the completed result for `request_id`, leaving other results queued."""
+        for i in range(len(self.completed_results)):
+            if self.completed_results[i][0] == request_id:
+                var res = self.completed_results[i][1]
+                _ = self.completed_results.pop(i)
+                return Optional[ViewportPickResult](res)
+        return None
 
 
 def pick_renderer_viewport_once(

@@ -13,9 +13,22 @@ A game usually has one socket and several peers. `NetHub[T: NetTransport]` owns 
 - `connect(endpoint)` opens (or finds) a channel by hand; `drop(cid)` forgets one, and a later
   packet from that address starts a fresh channel in the same slot.
 - Channel ids are small stable integers (slots are reused after `drop`), at most `max_channels`.
+- `enable_secure_handshake(cookie_secret, x25519_private)` (server) + `begin_secure_connect(dst,
+  x25519_private, token)` (client) run an X25519 exchange inside the cookie handshake: the cookie
+  reply carries the server public key, the echo carries the client public key and an optional
+  HMAC-SHA256 connect token (`require_connect_tokens`), and both ends derive per-direction
+  ChaCha20-Poly1305 keys with HKDF-SHA256 (`flint.net.kex.derive_session_keys`).
 """
 from std.collections import Dict, List
 from flint.net.crypto import AeadKey, StatelessCookieAuth
+from flint.net.kex import (
+    X25519_KEY_BYTES,
+    derive_session_keys,
+    is_all_zero,
+    verify_connect_token,
+    x25519,
+    x25519_public_key,
+)
 from flint.net.socket_udp import DatagramView, NetEndpoint, NetTransport, UDP_RING_CAPACITY
 from flint.net.channel import (
     CHAN_HANDSHAKE_COOKIE,
@@ -31,6 +44,17 @@ from flint.net.channel import (
 comptime NET_HUB_DEFAULT_MAX_CHANNELS: Int = 256
 comptime NET_HUB_DEFAULT_IDLE_TIMEOUT_MS: Float64 = 30000.0
 comptime _COOKIE_BYTES: Int = 16
+comptime _KX_ECHO_MIN_BYTES: Int = WIRE_HEADER_BYTES + _COOKIE_BYTES + X25519_KEY_BYTES + 1
+comptime NET_HUB_MAX_TOKEN_BYTES: Int = 255
+
+
+@always_inline
+def _copy_ptr_bytes(base_ptr: Int, off: Int, n: Int) -> List[UInt8]:
+    var out = List[UInt8](capacity=max(0, n))
+    var p = Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=base_ptr + off)
+    for i in range(n):
+        out.append(p[unsafe_offset=i])
+    return out^
 
 
 struct NetHub[T: NetTransport & Deinitable](Movable):
@@ -55,6 +79,23 @@ struct NetHub[T: NetTransport & Deinitable](Movable):
     var cookie_auth: StatelessCookieAuth
     var default_crypto_enabled: Bool
     var default_aead_key: AeadKey
+    # X25519 + HKDF-SHA256 per-session keys negotiated inside the cookie handshake
+    var kx_enabled: Bool
+    var kx_private: List[UInt8]
+    var kx_public: List[UInt8]
+    var require_token: Bool
+    var token_key: List[UInt8]
+    var token_protocol_id: UInt32
+    var tokens_rejected: Int
+    var kx_rejected: Int
+    var secure_sessions: Int
+    var peer_client_ids: List[UInt64]
+    var kx_pending: Bool
+    var kx_established: Bool
+    var kx_dst: NetEndpoint
+    var kx_server_public: List[UInt8]
+    var kx_token: List[UInt8]
+    var kx_cid: Int
     var _views: List[DatagramView]
     var _hs_scratch: List[UInt8]
 
@@ -86,6 +127,22 @@ struct NetHub[T: NetTransport & Deinitable](Movable):
         self.cookie_auth = StatelessCookieAuth()
         self.default_crypto_enabled = False
         self.default_aead_key = AeadKey()
+        self.kx_enabled = False
+        self.kx_private = List[UInt8]()
+        self.kx_public = List[UInt8]()
+        self.require_token = False
+        self.token_key = List[UInt8]()
+        self.token_protocol_id = 0
+        self.tokens_rejected = 0
+        self.kx_rejected = 0
+        self.secure_sessions = 0
+        self.peer_client_ids = List[UInt64]()
+        self.kx_pending = False
+        self.kx_established = False
+        self.kx_dst = NetEndpoint()
+        self.kx_server_public = List[UInt8]()
+        self.kx_token = List[UInt8]()
+        self.kx_cid = -1
         self._views = List[DatagramView](capacity=UDP_RING_CAPACITY)
         self._hs_scratch = List[UInt8](capacity=64)
 
@@ -95,6 +152,58 @@ struct NetHub[T: NetTransport & Deinitable](Movable):
         """Requires unknown peers to echo a stateless Poly1305 cookie before allocating a slot."""
         self.require_cookie = True
         self.cookie_auth = StatelessCookieAuth(secret, bucket_ms)
+
+    def enable_secure_handshake(
+        mut self,
+        cookie_secret: AeadKey,
+        x25519_private: List[UInt8],
+        bucket_ms: Float64 = 10000.0,
+    ) -> Bool:
+        """Server: stateless cookie handshake + X25519 key exchange. Every accepted channel gets
+        its own ChaCha20-Poly1305 keys from HKDF-SHA256(client_pub || server_pub, X25519 shared).
+        `x25519_private` is the server's 32-byte static/ephemeral key (`x25519_generate_private()`)."""
+        if len(x25519_private) != X25519_KEY_BYTES:
+            return False
+        self.enable_cookie_handshake(cookie_secret, bucket_ms)
+        self.kx_enabled = True
+        self.kx_private = x25519_private.copy()
+        self.kx_public = x25519_public_key(x25519_private)
+        return True
+
+    def require_connect_tokens(mut self, token_key: List[UInt8], protocol_id: UInt32):
+        """Server: only admit clients whose handshake echo carries a valid, unexpired HMAC-SHA256
+        connect token (`flint.net.kex.issue_connect_token`) for `protocol_id`. Expiry is checked
+        against the `now_ms` clock passed to `poll()`."""
+        self.require_token = True
+        self.token_key = token_key.copy()
+        self.token_protocol_id = protocol_id
+
+    def begin_secure_connect(
+        mut self,
+        dst: NetEndpoint,
+        x25519_private: List[UInt8],
+        connect_token: List[UInt8] = List[UInt8](),
+    ) -> Bool:
+        """Client: starts the cookie + X25519 handshake with a `enable_secure_handshake` server.
+        The channel to `dst` is opened (with per-session keys) once the server's cookie arrives;
+        poll until `kx_established`."""
+        if len(x25519_private) != X25519_KEY_BYTES or len(connect_token) > NET_HUB_MAX_TOKEN_BYTES:
+            return False
+        self.kx_private = x25519_private.copy()
+        self.kx_public = x25519_public_key(x25519_private)
+        self.kx_token = connect_token.copy()
+        self.kx_dst = dst
+        self.kx_pending = True
+        self.kx_established = False
+        self.kx_server_public = List[UInt8]()
+        self.kx_cid = -1
+        return self.send_handshake_init(dst)
+
+    def peer_client_id(self, cid: Int) -> UInt64:
+        """Server: the `client_id` from the connect token that admitted `cid` (0 when none)."""
+        if cid < 0 or cid >= len(self.peer_client_ids):
+            return 0
+        return self.peer_client_ids[cid]
 
     def enable_channel_encryption(mut self, key: AeadKey):
         """Enables ChaCha20-Poly1305 AEAD on all existing and future channels in this hub."""
@@ -138,6 +247,7 @@ struct NetHub[T: NetTransport & Deinitable](Movable):
                 self.chans[i] = self._init_channel(e)
                 self.alive[i] = True
                 self.last_rx_ms[i] = -1.0
+                self.peer_client_ids[i] = 0
                 self.endpoint_to_cid[e] = i
                 return i
         if self.count >= self.max_channels:
@@ -145,6 +255,7 @@ struct NetHub[T: NetTransport & Deinitable](Movable):
         var cid = self.count
         self.chans.append(self._init_channel(e))
         self.alive.append(True)
+        self.peer_client_ids.append(0)
         self.last_rx_ms.append(-1.0)
         self.endpoint_to_cid[e] = cid
         self.count += 1
@@ -194,6 +305,9 @@ struct NetHub[T: NetTransport & Deinitable](Movable):
         hdr.write_into(self._hs_scratch)
         for i in range(_COOKIE_BYTES):
             self._hs_scratch.append(cookie[i])
+        if self.kx_enabled:
+            for i in range(len(self.kx_public)):
+                self._hs_scratch.append(self.kx_public[i])
         if self.transport.queue_send_raw(
             dst, Int(self._hs_scratch.unsafe_ptr()), len(self._hs_scratch)
         ):
@@ -207,10 +321,78 @@ struct NetHub[T: NetTransport & Deinitable](Movable):
         var p = Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=cookie_ptr)
         for i in range(_COOKIE_BYTES):
             self._hs_scratch.append(p[unsafe_offset=i])
+        if self.kx_pending and dst == self.kx_dst:
+            for i in range(len(self.kx_public)):
+                self._hs_scratch.append(self.kx_public[i])
+            self._hs_scratch.append(UInt8(len(self.kx_token)))
+            for i in range(len(self.kx_token)):
+                self._hs_scratch.append(self.kx_token[i])
         _ = self.transport.queue_send_raw(
             dst, Int(self._hs_scratch.unsafe_ptr()), len(self._hs_scratch)
         )
         _ = len(self._hs_scratch)
+
+    def _client_complete_kx(mut self, dst: NetEndpoint, server_pub: List[UInt8]) -> Bool:
+        if self.kx_established:
+            # Re-sent cookie: keep the session (re-keying would reset nonces under the same key).
+            if len(self.kx_server_public) == len(server_pub):
+                var same = True
+                for i in range(len(server_pub)):
+                    if server_pub[i] != self.kx_server_public[i]:
+                        same = False
+                return same
+            return False
+        var shared = x25519(self.kx_private, server_pub)
+        if is_all_zero(shared):
+            return False
+        var keys = derive_session_keys(shared, self.kx_public, server_pub)
+        var cid = self.connect(dst)
+        if cid < 0:
+            return False
+        self.chans[cid].enable_session_encryption(keys[0], keys[1])
+        self.kx_server_public = server_pub.copy()
+        self.kx_established = True
+        self.kx_cid = cid
+        self.secure_sessions += 1
+        return True
+
+    def _server_accept_kx(mut self, v: DatagramView, now_ms: Float64) -> Int:
+        """Verified cookie echo carrying `client_pub (32) | token_len (1) | token`: checks the connect
+        token, derives per-session keys and opens the channel. Returns the cid or -1."""
+        if v.length < _KX_ECHO_MIN_BYTES:
+            self.kx_rejected += 1
+            return -1
+        var pub_off = WIRE_HEADER_BYTES + _COOKIE_BYTES
+        var client_pub = _copy_ptr_bytes(v.data_ptr, pub_off, X25519_KEY_BYTES)
+        var tok_len = Int(v.byte_at(pub_off + X25519_KEY_BYTES))
+        if v.length < _KX_ECHO_MIN_BYTES + tok_len:
+            self.kx_rejected += 1
+            return -1
+        var client_id = UInt64(0)
+        if self.require_token:
+            var token = _copy_ptr_bytes(v.data_ptr, _KX_ECHO_MIN_BYTES, tok_len)
+            var info = verify_connect_token(
+                self.token_key, token, self.token_protocol_id, now_ms
+            )
+            if not info.valid:
+                self.tokens_rejected += 1
+                return -1
+            client_id = info.client_id
+        var shared = x25519(self.kx_private, client_pub)
+        if is_all_zero(shared):
+            self.kx_rejected += 1
+            return -1
+        var keys = derive_session_keys(shared, client_pub, self.kx_public)
+        var cid = self.connect(v.sender)
+        if cid < 0 and self.idle_timeout_ms > 0.0:
+            self._evict_idle_channels(now_ms)
+            cid = self.connect(v.sender)
+        if cid < 0:
+            return -1
+        self.chans[cid].enable_session_encryption(keys[1], keys[0])
+        self.peer_client_ids[cid] = client_id
+        self.secure_sessions += 1
+        return cid
 
     def poll(mut self, now_ms: Float64):
         """Receive and route everything waiting, evict idle peers, resend/ack on every channel,
@@ -230,7 +412,24 @@ struct NetHub[T: NetTransport & Deinitable](Movable):
 
                 # Client side: automatically echo stateless server handshake cookies
                 if kind == CHAN_HANDSHAKE_COOKIE:
-                    if v.length >= WIRE_HEADER_BYTES + _COOKIE_BYTES:
+                    if self.kx_pending and v.sender == self.kx_dst:
+                        if v.length < WIRE_HEADER_BYTES + _COOKIE_BYTES + X25519_KEY_BYTES:
+                            self.kx_rejected += 1
+                            continue
+                        if not self._client_complete_kx(
+                            v.sender,
+                            _copy_ptr_bytes(
+                                v.data_ptr,
+                                WIRE_HEADER_BYTES + _COOKIE_BYTES,
+                                X25519_KEY_BYTES,
+                            ),
+                        ):
+                            self.kx_rejected += 1
+                            continue
+                        self._queue_cookie_echo(
+                            v.sender, v.data_ptr + WIRE_HEADER_BYTES
+                        )
+                    elif v.length >= WIRE_HEADER_BYTES + _COOKIE_BYTES:
                         self._queue_cookie_echo(
                             v.sender, v.data_ptr + WIRE_HEADER_BYTES
                         )
@@ -253,6 +452,15 @@ struct NetHub[T: NetTransport & Deinitable](Movable):
                             ):
                                 self.cookies_rejected += 1
                                 self.datagrams_ignored += 1
+                                continue
+                            if self.kx_enabled:
+                                var kx_res = self._server_accept_kx(v, now_ms)
+                                if kx_res >= 0:
+                                    self.accepted.append(kx_res)
+                                    self.last_rx_ms[kx_res] = now_ms
+                                    self.datagrams_routed += 1
+                                else:
+                                    self.datagrams_ignored += 1
                                 continue
                         else:
                             # Stateless cookie challenge: zero channel slots allocated!
