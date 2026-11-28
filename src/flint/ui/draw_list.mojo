@@ -4,7 +4,7 @@ Provides the CPU UI command accumulator `UiDrawList` streaming compact 64-byte
 primitives (`GpuUiPrim`) to the GPU for sub-0.04 ms tile-binned compute compositing.
 """
 from std.collections import List
-from std.math import isfinite
+from std.math import floor, isfinite
 from std.memory import bitcast
 from flint.render.font import SdfFont, decode_utf8
 
@@ -85,6 +85,26 @@ struct GpuUiPrim(Copyable, ImplicitlyCopyable, Movable):
         self.header = 0
 
 
+@always_inline
+def clip_rect_i(x0: Float32, y0: Float32, x1: Float32, y1: Float32) -> Tuple[Int, Int, Int, Int]:
+    """Integer clip rect that covers `[x0, x1) x [y0, y1)`: floors the min edge and ceils the max
+    edge, so fractional panel edges are never cut short (a lost pixel becomes 2 at 200% HiDPI)."""
+    var lim = Float32(1000000.0)
+    var fx0 = max(-lim, min(lim, x0)) if isfinite(x0) else Float32(0.0)
+    var fy0 = max(-lim, min(lim, y0)) if isfinite(y0) else Float32(0.0)
+    var fx1 = max(-lim, min(lim, x1)) if isfinite(x1) else Float32(0.0)
+    var fy1 = max(-lim, min(lim, y1)) if isfinite(y1) else Float32(0.0)
+    var ix0 = Int(floor(fx0))
+    var iy0 = Int(floor(fy0))
+    var ix1 = Int(floor(fx1))
+    var iy1 = Int(floor(fy1))
+    if Float32(ix1) < fx1:
+        ix1 += 1
+    if Float32(iy1) < fy1:
+        iy1 += 1
+    return (ix0, iy0, ix1, iy1)
+
+
 struct UiDrawList(Movable):
     """CPU-side command list recording vector UI primitives to stream to the GPU."""
     var prims: List[GpuUiPrim]
@@ -117,6 +137,11 @@ struct UiDrawList(Movable):
         if iy1 < iy0:
             iy1 = iy0
         self.clip_stack.append((UInt16(ix0), UInt16(iy0), UInt16(ix1), UInt16(iy1)))
+
+    def push_clip_f(mut self, x0: Float32, y0: Float32, x1: Float32, y1: Float32):
+        """`push_clip` for fractional logical edges: covers the whole span (floor min, ceil max)."""
+        var c = clip_rect_i(x0, y0, x1, y1)
+        self.push_clip(c[0], c[1], c[2], c[3])
 
     def pop_clip(mut self):
         if len(self.clip_stack) > 0:

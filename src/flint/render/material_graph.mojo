@@ -91,6 +91,7 @@ comptime MAT_FLAG_VAT_CROWD: UInt32 = 1 << 8
 comptime MAT_FLAG_TERRAIN_SPLAT: UInt32 = 1 << 9
 comptime MAT_FLAG_EMISSIVE_BLOOM: UInt32 = 1 << 10
 comptime MAT_FLAG_RECEIVE_DECALS: UInt32 = 1 << 11
+comptime MAT_FLAG_ALPHA_BLEND: UInt32 = 1 << 12  # sorted forward blended pass (`opacity`), skips the VisBuffer
 
 
 @always_inline
@@ -724,9 +725,12 @@ def compile_surface_material_shader[NodeT: SurfaceMaterialNode](node: NodeT) -> 
 # ============================================================================
 
 comptime GPU_DECAL_VOLUME_WORDS: Int = 24
-comptime AAA_MAX_DECALS: Int = 32
+comptime AAA_MAX_DECALS: Int = 256
 comptime AAA_GLOBALS_DECAL_COUNT_WORD: Int = 3008
-comptime AAA_GLOBALS_DECAL_TABLE_WORD: Int = 3016  # 32 * 24 = 768 words: [3016 .. 3783] in ring-buffered buf_globals
+# The decal table moved past the fixed globals block: 256 * 24 = 6144 words `[4096 .. 10239]` of ring-buffered
+# buf_globals (the old `[3016 .. 3783]` range stays reserved).
+comptime AAA_GLOBALS_DECAL_TABLE_WORD: Int = 4096
+comptime AAA_GLOBALS_TOTAL_WORDS: Int = AAA_GLOBALS_DECAL_TABLE_WORD + AAA_MAX_DECALS * GPU_DECAL_VOLUME_WORDS  # 10240
 
 comptime DECAL_BLEND_ALBEDO: UInt16 = 1 << 0
 comptime DECAL_BLEND_NORMAL: UInt16 = 1 << 1

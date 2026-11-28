@@ -8,6 +8,9 @@ Every subsystem — from direct Wayland/XDG-shell sockets, PipeWire/PulseAudio &
 
 ## Highlights
 
+- **Hi3D geometry refinement** takes a reference PNG and a coarse GLB and exports a refined 512³ surface with native Mojo CPU inference. [Build and run the refiner](examples/hi3d/README.md).
+- **UltraTex material generation** textures a static Hi3D mesh from a reference image and writes base color and metallic-roughness into a GLB. [Build and run the Mojo texturer](examples/ultratex/README.md).
+
 - **Pure Mojo 1.2, Zero Wrapper Libraries**: No GLFW, SDL, OpenGL, glslang, shaderc, miniaudio, freetype, or Box2D/Jolt C++ wrappers.
 - **Unified 2D + 3D Rendering**:
   - **`SimdCanvas` (`flint.render.simd_canvas`)**: Sub-4 MiB 8-wide SIMD software rasterizer & depth-buffered sprite/3D mesh/beam compositor (`Camera3D` perspective + `blit_sprite_simd`) for instant startup, laptop efficiency, and deterministic headless CI screenshots.

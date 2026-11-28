@@ -3,7 +3,13 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+first=""
+cleanup() {
+    # Never leave a held pane behind if an assertion fails while it waits for release.
+    [[ -n "$first" ]] && kill "$first" 2>/dev/null || true
+    rm -rf "$work"
+}
+trap cleanup EXIT
 project="$work/game with spaces"
 mkdir -p "$project/code" "$work/bin"
 printf '[project]\nentry = "code/entry.mojo"\n' > "$project/flint.toml"
@@ -44,24 +50,32 @@ cat > "$work/bin/pane ide" <<'IDE'
 set -eu
 [[ "$#" == 1 && "$TERM" == xterm-256color && "$COLORTERM" == truecolor ]]
 printf '%s\n%s\n' "$1" "$XDG_STATE_HOME" > "$IDE_TEST_LOG"
-if [[ "${TEST_HOLD:-}" == 1 ]]; then read -r -t 10 -u 8 _; fi
+if [[ "${TEST_HOLD:-}" == 1 ]]; then
+    # Handshake: tell the test this pane is up (and holds its session lock), then keep the
+    # lock until the test releases it. No timeouts: the test decides when the pane goes away.
+    echo ready > "$TEST_READY"
+    read -r _ < "$TEST_RELEASE"
+fi
 IDE
 chmod +x "$work/bin/pane ide"
 export FLINT_TURBOMOJO="$work/bin/pane ide"
-mkfifo "$work/release"
-exec 8<> "$work/release"
-TEST_HOLD=1 IDE_TEST_LOG="$work/first" \
+mkfifo "$work/ready" "$work/release"
+# Open both FIFOs read-write here, so neither side's open() blocks and a write never waits
+# for a reader that has not started yet.
+exec 7<> "$work/ready" 8<> "$work/release"
+TEST_HOLD=1 TEST_READY="$work/ready" TEST_RELEASE="$work/release" IDE_TEST_LOG="$work/first" \
     bash "$root/tools/flint.sh" studio --ide-embedded &
 first=$!
-for ((i=0; i<200; i++)); do
-    [[ -s "$work/first" ]] && break
-    sleep .02
+until read -r -t 1 -u 7 _; do
+    # Waiting on the pane's own signal; only bail out if it died before sending it.
+    kill -0 "$first" 2>/dev/null || { echo 'First pane exited before its ready handshake' >&2; exit 1; }
 done
 [[ -s "$work/first" ]]
 IDE_TEST_LOG="$work/second" bash "$root/tools/flint.sh" studio --ide-embedded 'a file.mojo'
 echo done >&8
 wait "$first"
-exec 8>&-
+first=""
+exec 7>&- 8>&-
 mapfile -t one < "$work/first"
 mapfile -t two < "$work/second"
 [[ "${one[0]}" == "$project/code/entry.mojo" && "${two[0]}" == "$project/code/a file.mojo" ]]

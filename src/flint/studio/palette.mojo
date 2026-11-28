@@ -46,6 +46,8 @@ comptime PALETTE_ITEM_ASSET: Int = 4
 comptime PALETTE_ITEM_AGENT: Int = 5
 
 comptime KEY_CHORD_DELAY_SEC: Float32 = 0.20
+# An armed chord that gets no second key within this window disarms itself.
+comptime KEY_CHORD_TIMEOUT_SEC: Float32 = 3.0
 
 
 def palette_mode_label(mode: Int) -> String:
@@ -206,6 +208,13 @@ struct StudioCommandPalette(Copyable, Movable):
     var viewport_rows: Int
     var frecency: FrecencyStore
     var now_sec: Int
+    var hover_mx: Float32
+    """Mouse position at the last hover-driven selection; hover only steals the selection after the mouse moves."""
+    var hover_my: Float32
+    # IME composition shown after the query (set by the host each frame) and the caret drawn last
+    # frame, in UI pixels, for the IME candidate window.
+    var ime_preedit: String
+    var caret_rect: RectF
 
     def __init__(out self, visible_rows: Int = 9):
         self.is_open = False
@@ -222,6 +231,10 @@ struct StudioCommandPalette(Copyable, Movable):
         self.viewport_rows = self.visible_rows
         self.frecency = FrecencyStore()
         self.now_sec = 0
+        self.hover_mx = Float32(-1.0e9)
+        self.hover_my = Float32(-1.0e9)
+        self.ime_preedit = String()
+        self.caret_rect = RectF()
 
     def __init__(out self, *, copy: Self):
         self.is_open = copy.is_open
@@ -238,6 +251,10 @@ struct StudioCommandPalette(Copyable, Movable):
         self.viewport_rows = copy.viewport_rows
         self.frecency = copy.frecency.copy()
         self.now_sec = copy.now_sec
+        self.hover_mx = copy.hover_mx
+        self.hover_my = copy.hover_my
+        self.ime_preedit = copy.ime_preedit
+        self.caret_rect = copy.caret_rect
 
     def open(
         mut self,
@@ -254,6 +271,8 @@ struct StudioCommandPalette(Copyable, Movable):
         self.now_sec = max(0, now_sec)
         self.selected_idx = 0
         self.scroll_top = 0
+        self.hover_mx = Float32(-1.0e9)  # re-anchored on the first drawn frame; a resting cursor never selects
+        self.hover_my = Float32(-1.0e9)
         if initial_query.byte_length() > 0:
             self.set_query(initial_query)
         else:
@@ -476,20 +495,22 @@ struct KeyChordEntry(Copyable, Movable):
 
 
 struct KeyChordHud(Copyable, Movable):
-    """200 ms delayed non-focus-stealing chord hint box state."""
+    """200 ms delayed non-focus-stealing chord hint box state; disarms after `timeout_sec`."""
     var active: Bool
     var visible: Bool
     var prefix_label: String
     var elapsed_sec: Float32
     var delay_sec: Float32
+    var timeout_sec: Float32
     var entries: List[KeyChordEntry]
 
-    def __init__(out self, delay_sec: Float32 = KEY_CHORD_DELAY_SEC):
+    def __init__(out self, delay_sec: Float32 = KEY_CHORD_DELAY_SEC, timeout_sec: Float32 = KEY_CHORD_TIMEOUT_SEC):
         self.active = False
         self.visible = False
         self.prefix_label = ""
         self.elapsed_sec = Float32(0.0)
         self.delay_sec = max(Float32(0.0), delay_sec)
+        self.timeout_sec = max(self.delay_sec, timeout_sec)
         self.entries = List[KeyChordEntry]()
 
     def __init__(out self, *, copy: Self):
@@ -498,6 +519,7 @@ struct KeyChordHud(Copyable, Movable):
         self.prefix_label = copy.prefix_label
         self.elapsed_sec = copy.elapsed_sec
         self.delay_sec = copy.delay_sec
+        self.timeout_sec = copy.timeout_sec
         self.entries = copy.entries.copy()
 
     def begin_chord(mut self, prefix_label: String, var entries: List[KeyChordEntry]):
@@ -519,6 +541,9 @@ struct KeyChordHud(Copyable, Movable):
             return
         if dt > Float32(0.0):
             self.elapsed_sec += dt
+        if self.timeout_sec > Float32(0.0) and self.elapsed_sec >= self.timeout_sec:
+            self.cancel()
+            return
         if self.elapsed_sec >= self.delay_sec:
             self.visible = True
 
@@ -811,6 +836,9 @@ def draw_command_palette(
     var compact_h = sh < Float32(400.0)
     var margin = Float32(8.0) if (sw < Float32(480.0) or compact_h) else Float32(20.0)
     var pal_w = max(Float32(1.0), min(Float32(600.0), sw - Float32(2.0) * margin))
+    if palette.hover_mx < Float32(-1.0e8):
+        palette.hover_mx = mouse_x
+        palette.hover_my = mouse_y
     var n_res = len(palette.results)
     var row_h = Float32(34.0)
     var header_h = Float32(44.0) if compact_h else Float32(48.0)
@@ -903,12 +931,26 @@ def draw_command_palette(
     var q_x = pal_r.x + Float32(40.0)
     var q_sz = Float32(14.0) if compact_h else Float32(15.0)
     dl.push_clip(Int(q_x), Int(pal_r.y), Int(max(q_x, hdr_right)), Int(pal_r.y + header_h))
-    if palette.raw_query.byte_length() > 0:
+    palette.caret_rect = RectF(q_x, hdr_cy - Float32(9.0), Float32(2.0), Float32(18.0))
+    if palette.raw_query.byte_length() > 0 or palette.ime_preedit.byte_length() > 0:
         _pal_draw_text_cy(
             dl, font_slot, font, palette.raw_query,
             q_x, hdr_cy, q_sz, rgba8_scale_alpha(theme.text_primary, alpha),
         )
         var qw = _pal_measure_text(font, palette.raw_query, q_sz)
+        if palette.ime_preedit.byte_length() > 0:
+            # IME composition: drawn after the query and underlined until it is committed.
+            var pre_w = _pal_measure_text(font, palette.ime_preedit, q_sz)
+            _pal_draw_text_cy(
+                dl, font_slot, font, palette.ime_preedit,
+                q_x + qw, hdr_cy, q_sz, rgba8_scale_alpha(theme.text_primary, alpha),
+            )
+            dl.add_line(
+                q_x + qw, hdr_cy + Float32(9.0), q_x + qw + pre_w, hdr_cy + Float32(9.0),
+                Float32(1.5), rgba8_scale_alpha(theme.accent_primary, alpha),
+            )
+            qw += pre_w
+        palette.caret_rect = RectF(q_x + qw + Float32(2.0), hdr_cy - Float32(9.0), Float32(2.0), Float32(18.0))
         var blink_on = (anim.mode == UI_ANIM_INSTANT) or ((Int(anim.time_sec * Float32(2.0)) % 2) == 0)
         if blink_on:
             dl.add_rect(
@@ -1021,6 +1063,11 @@ def draw_command_palette(
         pal_r.right() - Float32(1.0), strip_y + tabs_h,
         Float32(1.0), rgba8_scale_alpha(theme.border_subtle, alpha),
     )
+    # A mode-tab click above re-filters mid-draw: re-read the result count so the loop below never
+    # indexes past the (possibly shrunk) `results` list. Keep the panel height chosen for this frame.
+    n_res = len(palette.results)
+    if n_res > 0:
+        shown_rows = max(1, min(shown_rows, n_res))
 
     # ---- Results List ----
     var list_y = strip_y + tabs_h + Float32(6.0)
@@ -1203,8 +1250,16 @@ def draw_command_palette(
                 title_base_col, title_hi_col, title_hi_bg,
             )
             dl.pop_clip()
-            if rhov and (mouse_moved or mouse_pressed or mouse_wheel != 0):
-                palette.selected_idx = ri
+            if rhov:
+                # Hover only steals the selection once the pointer actually moves (a resting cursor
+                # under a freshly opened palette never re-selects), or on click / wheel scroll.
+                var moved = mouse_moved and (
+                    abs(mouse_x - palette.hover_mx) + abs(mouse_y - palette.hover_my) > Float32(0.5)
+                )
+                if moved or mouse_pressed or mouse_wheel != 0:
+                    palette.selected_idx = ri
+                    palette.hover_mx = mouse_x
+                    palette.hover_my = mouse_y
                 if mouse_pressed:
                     return palette.accept_index(ri, secondary=key_shift)
 

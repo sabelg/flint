@@ -5,7 +5,7 @@ Speaks the binary X11R6 protocol directly to `/tmp/.X11-unix/X<N>` using standar
 GLX, or C/C++ wrapper libraries are linked.
 """
 from std.ffi import external_call
-from flint.platform.input import InputState
+from flint.platform.input import InputState, layout_shortcut_code
 from flint.platform.traits import WindowBackend
 from flint.input.evdev import EvdevHub
 from flint.platform.dynlib import dl_open, dl_sym, dl_close
@@ -15,6 +15,8 @@ from flint.text.utf8 import encode_codepoint
 from flint.platform.os import env_value, env_now, env_flag, read_bytes, close_fd, get_time
 
 comptime X11_RELEASE_HELD: Int = -1
+comptime X11_ATOM_RESOURCE_MANAGER: Int = 23  # predefined XA_RESOURCE_MANAGER
+comptime X11_PROPERTY_CHANGE_MASK: Int = 0x400000
 comptime X11_MOUSE_BUTTONS: Int = 3
 
 
@@ -69,6 +71,22 @@ def x11_evdev_key(key: Int) -> Int:
     for index in range(26):
         if key == letters[index]:
             return 65 + index
+    # Keypad (GLFW slots): KP_0..KP_9 = 320..329, KP_DECIMAL 330, KP_DIVIDE 331, KP_MULTIPLY 332,
+    # KP_SUBTRACT 333, KP_ADD 334 (KP_ENTER stays Enter, 257).
+    var keypad = [82, 79, 80, 81, 75, 76, 77, 71, 72, 73]
+    for index in range(10):
+        if key == keypad[index]:
+            return 320 + index
+    if key == 83:
+        return 330
+    if key == 98:
+        return 331
+    if key == 55:
+        return 332
+    if key == 74:
+        return 333
+    if key == 78:
+        return 334
     var digits = [11, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     for index in range(10):
         if key == digits[index]:
@@ -150,6 +168,82 @@ def x11_evdev_key(key: Int) -> Int:
     if key == 126:
         return 347  # RightSuper
     return -1
+
+
+def parse_xft_dpi(resources: String) -> Float32:
+    """`Xft.dpi` from the root window's RESOURCE_MANAGER string (`Xft.dpi:\t144` lines, as written by
+    xrdb or the desktop's settings daemon). 0 when absent or not a positive number."""
+    var bytes = resources.as_bytes()
+    var n = len(bytes)
+    var key = String("Xft.dpi")
+    var kb = key.as_bytes()
+    var kn = len(kb)
+    var line_start = 0
+    while line_start < n:
+        var line_end = line_start
+        while line_end < n and bytes[line_end] != 10:
+            line_end += 1
+        var i = line_start
+        while i < line_end and (bytes[i] == 32 or bytes[i] == 9):
+            i += 1
+        var matched = i + kn <= line_end
+        if matched:
+            for k in range(kn):
+                if bytes[i + k] != kb[k]:
+                    matched = False
+                    break
+        if matched:
+            i += kn
+            while i < line_end and (bytes[i] == 32 or bytes[i] == 9):
+                i += 1
+            if i < line_end and bytes[i] == 58:  # ':'
+                i += 1
+                while i < line_end and (bytes[i] == 32 or bytes[i] == 9):
+                    i += 1
+                var whole = 0.0
+                var frac = 0.0
+                var frac_div = 1.0
+                var digits = 0
+                var in_frac = False
+                while i < line_end:
+                    var c = Int(bytes[i])
+                    if c >= 48 and c <= 57:
+                        if in_frac:
+                            frac = frac * 10.0 + Float64(c - 48)
+                            frac_div *= 10.0
+                        else:
+                            whole = whole * 10.0 + Float64(c - 48)
+                        digits += 1
+                        if digits > 9:
+                            break
+                    elif c == 46 and not in_frac:
+                        in_frac = True
+                    else:
+                        break
+                    i += 1
+                var value = whole + frac / frac_div
+                if digits > 0 and value > 0.0:
+                    return Float32(value)
+                return 0.0
+        line_start = line_end + 1
+    return 0.0
+
+
+def x11_dpi_from_physical(pixels: Int, millimeters: Int) -> Float32:
+    """DPI from the screen's size in pixels and millimeters (core setup / RandR); 0 when unknown."""
+    if pixels <= 0 or millimeters <= 0:
+        return 0.0
+    return Float32(Float64(pixels) * 25.4 / Float64(millimeters))
+
+
+def x11_scale_from_dpi(dpi: Float32) -> Float32:
+    """Content scale for a DPI: dpi / 96 rounded to the nearest 0.25 and clamped to 1.0 .. 4.0
+    (1.0 for an unknown or implausible DPI)."""
+    if not (dpi > Float32(0.0)) or dpi > Float32(2000.0):
+        return 1.0
+    var steps = Int(dpi / Float32(96.0) * Float32(4.0) + Float32(0.5))
+    var scale = Float32(steps) / Float32(4.0)
+    return max(Float32(1.0), min(Float32(4.0), scale))
 
 
 def parse_x11_display_number(display: String) -> String:
@@ -345,6 +439,18 @@ struct X11Window(WindowBackend):
     var xcb_disconnect: Int
     var gpu_swapchain: Int
     var evdev: EvdevHub
+    # Pointer enter (1) / leave (2) since the last poll, 0 for neither.
+    var pointer_presence: Int
+    # The core keyboard mapping changed: rebuild the input's layout shortcut table.
+    var layout_dirty: Bool
+    # HiDPI: content scale from `Xft.dpi` (else the screen's physical size), and the root
+    # RESOURCE_MANAGER changed since it was read (the desktop changed its scale).
+    var screen_width_mm: Int
+    var screen_height_mm: Int
+    var dpi: Float32
+    var dpi_scale: Float32
+    var dpi_source: String
+    var resources_dirty: Bool
 
     def __init__(out self):
         self.fd = -1
@@ -431,6 +537,14 @@ struct X11Window(WindowBackend):
         self.xcb_disconnect = 0
         self.gpu_swapchain = 0
         self.evdev = EvdevHub(enable_hotplug=False)
+        self.pointer_presence = 0
+        self.layout_dirty = False
+        self.screen_width_mm = 0
+        self.screen_height_mm = 0
+        self.dpi = 0.0
+        self.dpi_scale = 1.0
+        self.dpi_source = String("default")
+        self.resources_dirty = False
 
     def __moveinit__(out self, deinit existing: Self):
         self.fd = existing.fd
@@ -517,6 +631,14 @@ struct X11Window(WindowBackend):
         self.xcb_disconnect = existing.xcb_disconnect
         self.gpu_swapchain = existing.gpu_swapchain
         self.evdev = existing.evdev^
+        self.pointer_presence = existing.pointer_presence
+        self.layout_dirty = existing.layout_dirty
+        self.screen_width_mm = existing.screen_width_mm
+        self.screen_height_mm = existing.screen_height_mm
+        self.dpi = existing.dpi
+        self.dpi_scale = existing.dpi_scale
+        self.dpi_source = existing.dpi_source^
+        self.resources_dirty = existing.resources_dirty
         existing.fd = -1
         existing.window_id = 0
         existing.gc_id = 0
@@ -764,6 +886,25 @@ struct X11Window(WindowBackend):
         self.keymap.reserve(count * per_kc)
         for i in range(count * per_kc):
             self.keymap.append(x11_get32(extra, i * 4))
+        self.layout_dirty = True
+
+    def layout_key_map(self) -> List[Int]:
+        """For `InputState.set_layout_key_map`: each physical GLFW code -> the code its unshifted
+        group-1 keysym names on the server's keymap (`layout_shortcut_code`)."""
+        var out = List[Int](capacity=512)
+        for code in range(512):
+            out.append(code)
+        if self.keysyms_per_keycode <= 0:
+            return out^
+        for keycode in range(self.min_keycode, self.max_keycode + 1):
+            var physical = x11_evdev_key(keycode - 8)
+            if physical < 0 or physical >= 512:
+                continue
+            var base = (keycode - self.min_keycode) * self.keysyms_per_keycode
+            if base >= len(self.keymap):
+                break
+            out[physical] = layout_shortcut_code(physical, x11_keysym_to_codepoint(self.keymap[base]))
+        return out^
 
     def _append_key_utf8(mut self, detail: Int, state: Int):
         # Skip UTF-8 text generation when Ctrl (4) or Alt/Mod1 (8) is active
@@ -784,6 +925,12 @@ struct X11Window(WindowBackend):
         if ks0 == 0 and g_off != 0:
             ks0 = self.keymap[base]
             ks1 = self.keymap[base + 1] if self.keysyms_per_keycode >= 2 else 0
+        # AltGr (ISO_Level3_Shift, Mod5): XKB's core map keeps levels 3/4 in columns 5/6 (group 2: 7/8).
+        if (state & 0x80) != 0:
+            var l3 = 4 + (2 if group == 1 else 0)
+            if l3 < self.keysyms_per_keycode and self.keymap[base + l3] != 0:
+                ks0 = self.keymap[base + l3]
+                ks1 = self.keymap[base + l3 + 1] if (l3 + 1 < self.keysyms_per_keycode) else 0
         if ks1 == 0:
             if (ks0 >= 97 and ks0 <= 122) or (ks0 >= 0xE0 and ks0 <= 0xF6) or (ks0 >= 0xF8 and ks0 <= 0xFE):
                 ks1 = ks0 - 32
@@ -936,6 +1083,8 @@ struct X11Window(WindowBackend):
         self.black_pixel = x11_get32(body, screen_off + 12)
         self.screen_width = x11_get16(body, screen_off + 20)
         self.screen_height = x11_get16(body, screen_off + 22)
+        self.screen_width_mm = x11_get16(body, screen_off + 24)
+        self.screen_height_mm = x11_get16(body, screen_off + 26)
         self.root_visual = x11_get32(body, screen_off + 32)
         self.root_depth = Int(body[screen_off + 38])
 
@@ -961,8 +1110,9 @@ struct X11Window(WindowBackend):
         x11_put32(cw, 24, self.root_visual)
         x11_put32(cw, 28, 0x00000802)  # CWBackPixel | CWEventMask
         x11_put32(cw, 32, self.black_pixel)
-        # KeyPress|KeyRelease|ButtonPress|ButtonRelease|PointerMotion|Exposure|StructureNotify|FocusChange
-        x11_put32(cw, 36, 0x0022804F)
+        # KeyPress|KeyRelease|ButtonPress|ButtonRelease|EnterWindow|LeaveWindow|PointerMotion|Exposure|
+        # StructureNotify|FocusChange
+        x11_put32(cw, 36, 0x0022807F)
         if self._send_req(cw) < 0:
             self.close()
             return False
@@ -1053,6 +1203,18 @@ struct X11Window(WindowBackend):
 
         self.refresh_keyboard_mapping()
         self.set_title(title)
+        # Follow the desktop's scale: PropertyNotify on the root for RESOURCE_MANAGER (Xft.dpi).
+        var cwa = List[UInt8](length=12, fill=0)
+        cwa[0] = 2  # ChangeWindowAttributes
+        x11_put16(cwa, 2, 3)
+        x11_put32(cwa, 4, self.root_window)
+        x11_put32(cwa, 8, 0x800)  # CWEventMask
+        var cwa_ev = List[UInt8](length=4, fill=0)
+        x11_put32(cwa_ev, 0, X11_PROPERTY_CHANGE_MASK)
+        for b in cwa_ev:
+            cwa.append(b)
+        _ = self._send_req(cwa)
+        self.refresh_dpi()
 
         if self.wm_protocols != 0 and self.wm_delete_window != 0:
             var prop = List[UInt8](length=28, fill=0)
@@ -1224,12 +1386,18 @@ struct X11Window(WindowBackend):
                 else:
                     self.shm_busy1 = False
             elif code == 2 or code == 3:
-                # Filter X11 synthetic key auto-repeat: KeyRelease immediately followed by KeyPress at identical timestamp
+                # Server auto-repeat: KeyRelease immediately followed by KeyPress at the identical timestamp.
+                # Keep it as one press of the held key, which `InputState` reports as a repeat
+                # (`key_pressed_or_repeat`), with its text, at the user's `xset r rate`.
                 if code == 3 and pos + 64 <= len(self.incoming):
                     var next_code = Int(self.incoming[pos + 32]) & 0x7F
                     var next_detail = Int(self.incoming[pos + 33])
                     if next_code == 2 and next_detail == detail:
                         if x11_get32(self.incoming, pos + 4) == x11_get32(self.incoming, pos + 36):
+                            var held = x11_evdev_key(detail - 8)
+                            if held >= 0:
+                                self.pending_keys.append(held)
+                                self.pending_key_down.append(True)
                             self._append_key_utf8(detail, x11_get16(self.incoming, pos + 32 + 28))
                             pos += 64
                             continue
@@ -1271,6 +1439,18 @@ struct X11Window(WindowBackend):
                     self.pending_mouse_x = mx
                     self.pending_mouse_y = my
                     self.has_pending_mouse = True
+            elif code == 7 or code == 8:  # EnterNotify / LeaveNotify (event-x:24, event-y:26, state:28, mode:30)
+                var mode = Int(self.incoming[pos + 30])
+                var buttons_held = (x11_get16(self.incoming, pos + 28) & 0x1F00) != 0
+                if mode == 0 and code == 7:
+                    self.pending_mouse_x = Float32(x11_gets16(self.incoming, pos + 24))
+                    self.pending_mouse_y = Float32(x11_gets16(self.incoming, pos + 26))
+                    self.has_pending_mouse = True
+                    self.pointer_presence = 1
+                elif mode == 0 and code == 8 and not buttons_held and not self.pointer_locked:
+                    # A drag that leaves the window keeps its implicit grab and its motion events.
+                    self.has_pending_mouse = False
+                    self.pointer_presence = 2
             elif code == 9:  # FocusIn
                 self.focused = True
             elif code == 10:  # FocusOut
@@ -1286,6 +1466,10 @@ struct X11Window(WindowBackend):
                 if (cfg_win == 0 or cfg_win == self.window_id) and nw > 0 and nh > 0:
                     self.width = nw
                     self.height = nh
+                    # Pointer positions follow the window, in the pixels `framebuffer_size()` reports
+                    # (every renderer resizes to it), not the size the window was created at.
+                    self.logical_width = nw
+                    self.logical_height = nh
             elif code == 29:  # SelectionClear (offset 8 = window, offset 12 = selection atom)
                 if x11_get32(self.incoming, pos + 12) == self.atom_clipboard:
                     self.clipboard_owned = False
@@ -1310,6 +1494,9 @@ struct X11Window(WindowBackend):
                         self.close_requested = True
             elif code == 17:  # DestroyNotify
                 self.close_requested = True
+            elif code == 28:  # PropertyNotify (window:4, atom:8)
+                if x11_get32(self.incoming, pos + 4) == self.root_window and x11_get32(self.incoming, pos + 8) == X11_ATOM_RESOURCE_MANAGER:
+                    self.resources_dirty = True
 
             pos += 32
 
@@ -1360,14 +1547,79 @@ struct X11Window(WindowBackend):
             for x in range(dst_w):
                 dst_ptr[unsafe_offset=drow + x] = src_ptr[unsafe_offset=srow + xmap_ptr[unsafe_offset=x]] | UInt32(0xFF000000)
 
+    def read_resource_manager(mut self) -> String:
+        """The root window's RESOURCE_MANAGER string (X resources), "" when unset."""
+        if self.fd < 0 or self.root_window == 0:
+            return ""
+        var gp = List[UInt8](length=24, fill=0)
+        gp[0] = 20  # GetProperty
+        gp[1] = 0   # delete = False
+        x11_put16(gp, 2, 6)
+        x11_put32(gp, 4, self.root_window)
+        x11_put32(gp, 8, X11_ATOM_RESOURCE_MANAGER)
+        x11_put32(gp, 12, 31)  # XA_STRING
+        x11_put32(gp, 16, 0)
+        x11_put32(gp, 20, 262144)  # long-length, in 4-byte units: 1 MiB is plenty
+        var seq = self._send_req(gp)
+        if seq < 0:
+            return ""
+        var rep = self._wait_reply(seq)
+        if not rep[0] or len(rep[2]) < 24 or Int(rep[2][1]) != 8:
+            return ""
+        var nbytes = x11_get32(rep[2], 16)
+        ref extra = rep[3]
+        nbytes = min(nbytes, len(extra))
+        if nbytes <= 0:
+            return ""
+        var out = List[UInt8](capacity=nbytes)
+        for i in range(nbytes):
+            out.append(extra[i])
+        return String(unsafe_from_utf8=out)
+
+    def apply_dpi(mut self, xft_dpi: Float32):
+        """Picks the DPI (`Xft.dpi`, else the screen's physical size) and the content scale from it."""
+        if xft_dpi > Float32(0.0):
+            self.dpi = xft_dpi
+            self.dpi_source = String("Xft.dpi")
+        else:
+            var phys = x11_dpi_from_physical(self.screen_width, self.screen_width_mm)
+            # Servers without real EDID data report 96 dpi or nonsense; only trust a plausible size.
+            if phys >= Float32(48.0) and phys <= Float32(600.0):
+                self.dpi = phys
+                self.dpi_source = String("physical")
+            else:
+                self.dpi = 96.0
+                self.dpi_source = String("default")
+        self.dpi_scale = x11_scale_from_dpi(self.dpi)
+
+    def refresh_dpi(mut self):
+        self.resources_dirty = False
+        self.apply_dpi(parse_xft_dpi(self.read_resource_manager()))
+
     def poll(mut self, mut input: InputState):
         self.evdev.poll(input)
         if self.fd < 0:
             return
         self.receive()
+        if self.resources_dirty:
+            self.refresh_dpi()
+        # The server repeats held keys itself; InputState must not synthesize a second stream.
+        if input.repeat_rate_hz != 0:
+            input.set_repeat_info(0, 0)
+        if self.layout_dirty:
+            self.layout_dirty = False
+            input.set_layout_key_map(self.layout_key_map())
+        if self.pointer_presence == 2 and not self.has_pending_mouse:
+            input.pointer_left()
         if self.has_pending_mouse:
-            input.move_mouse(self.map_mouse_x(self.pending_mouse_x), self.map_mouse_y(self.pending_mouse_y))
+            var px = self.map_mouse_x(self.pending_mouse_x)
+            var py = self.map_mouse_y(self.pending_mouse_y)
+            if self.pointer_presence == 1:
+                input.pointer_entered(px, py)
+            else:
+                input.move_mouse(px, py)
             self.has_pending_mouse = False
+        self.pointer_presence = 0
         if self.pointer_locked and (self.pending_rel_x != 0.0 or self.pending_rel_y != 0.0):
             input.add_mouse_delta(self.pending_rel_x, self.pending_rel_y)
             self.pending_rel_x = 0
@@ -1483,17 +1735,29 @@ struct X11Window(WindowBackend):
         var dst_w = max(1, self.width)
         var dst_h = max(1, self.height)
         var use_scaled = source_width != dst_w or source_height != dst_h
+        var shm_ready = self._ensure_shm(dst_w, dst_h)
+        if shm_ready and self.shm_busy0 and self.shm_busy1:
+            # Both slots are still being read by the server: never overwrite one mid-read. Give the
+            # ShmCompletion a moment, then drop this frame (the next one is fresher anyway).
+            if self.wait_io(1, 4):
+                self.receive()
+            if self.shm_busy0 and self.shm_busy1:
+                if get_time() - self.last_present_at < 0.25:
+                    return
+                # A completion that never came (server reset, lost event): do not stall forever.
+                self.shm_busy0 = False
+                self.shm_busy1 = False
         if use_scaled:
             self.scale_pixels_into_buffer(pixels, source_width, source_height, dst_w, dst_h)
 
-        if self._ensure_shm(dst_w, dst_h):
+        if shm_ready:
             var slot: Int
             if self.shm_busy0 and not self.shm_busy1:
                 slot = 1
-            elif self.shm_busy0 and self.shm_busy1:
-                slot = self.shm_slot ^ 1
+            elif self.shm_busy1 and not self.shm_busy0:
+                slot = 0
             else:
-                slot = self.shm_slot ^ 1 if (not (self.shm_busy0 or self.shm_busy1)) else 0
+                slot = self.shm_slot ^ 1
             self.shm_slot = slot
             var frame_px = dst_w * dst_h
             var frame_bytes = frame_px * 4
@@ -1591,6 +1855,8 @@ struct X11Window(WindowBackend):
             var remain_ms = Int((target_dt - (now - self.last_present_at)) * 1000.0)
             if remain_ms > 1 and remain_ms <= 16:
                 _ = self.wait_io(1, remain_ms)
+            self.last_present_at = get_time()
+        else:
             self.last_present_at = get_time()
 
     def toggle_fullscreen(mut self):
@@ -1815,7 +2081,9 @@ struct X11Window(WindowBackend):
         return (max(1, self.width), max(1, self.height))
 
     def content_scale(self) -> Float32:
-        return 1.0
+        """`Xft.dpi` / 96 (physical DPI when unset), in 0.25 steps from 1.0 to 4.0. X11 windows are
+        sized in device pixels, so this only scales the UI; the framebuffer is the window size."""
+        return self.dpi_scale
 
     def should_close(self) -> Bool:
         return self.close_requested

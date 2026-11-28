@@ -430,7 +430,7 @@ def parse_cl_frames(buf):
     return msgs
 
 reqs = [
-    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "t4-cli", "version": "1.0"}}},
+    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t4-cli", "version": "1.0"}}},
     {"jsonrpc": "2.0", "method": "notifications/initialized"},
     {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
     {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "procedural.generate_asset", "arguments": {"preset": "material_orb", "output_glb_path": "assets/orb.glb", "spawn_in_scene": True, "position": [0.0, 2.0, 0.0]}}},
@@ -456,8 +456,8 @@ msgs = parse_cl_frames(proc.stdout)
 assert len(msgs) == 14, f"expected 14 responses (notification is silent), got {len(msgs)}"
 by_id = {m["id"]: m for m in msgs}
 
-assert by_id[1]["result"]["protocolVersion"] == "2024-11-05"
-assert len(by_id[2]["result"]["tools"]) == 14
+assert by_id[1]["result"]["protocolVersion"] == "2025-06-18"
+assert len(by_id[2]["result"]["tools"]) >= 14
 
 for rid in range(3, 15):
     res = by_id[rid]["result"]

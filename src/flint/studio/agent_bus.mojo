@@ -84,6 +84,12 @@ comptime GHOST_MATERIAL: UInt8 = 4
 
 comptime MAX_TRAIL_MARKS: Int = 32
 comptime MAX_STEPS_PER_SESSION: Int = 512
+comptime MAX_THOUGHT_SUMMARY_BYTES: Int = 16 * 1024
+"""A streamed thought keeps only its newest text past this size (agents can think for megabytes)."""
+comptime MAX_PENDING_APPROVALS: Int = 128
+comptime MAX_PENDING_APPROVALS_PER_AGENT: Int = 32
+"""Beyond these `queue_approval` refuses (returns 0): an agent flooding gated calls cannot grow the
+queue without bound. Identical gated MCP calls from one client are coalesced into one approval."""
 comptime TRAIL_HEAT_DURATION_SEC: Float32 = 4.0
 comptime TRAIL_ARC_DURATION_SEC: Float32 = 3.5
 comptime FOLLOW_SETTLE_HOLD_SEC: Float32 = 0.45
@@ -269,6 +275,18 @@ def _status_for_action(kind: UInt8) -> UInt8:
 
 
 @always_inline
+def _utf8_tail(s: String, max_bytes: Int) -> String:
+    """The last <= `max_bytes` bytes of `s`, starting on a UTF-8 character boundary."""
+    var b = s.as_bytes()
+    var n = len(b)
+    if n <= max_bytes:
+        return s
+    var start = n - max_bytes
+    while start < n and (b[start] & 0xC0) == 0x80:
+        start += 1
+    return String(s[byte=start:n])
+
+
 def _safe_vec3(v: Vec3, fallback: Vec3 = Vec3()) -> Vec3:
     if isfinite(v.x) and isfinite(v.y) and isfinite(v.z):
         return v
@@ -301,6 +319,8 @@ struct AgentGhostPreview(Copyable, Movable):
     var agent_id: UInt32
     var step_id: UInt64
     var entity_id: Int
+    var editor_id: UInt64
+    """Stable `editor_id` of `entity_id` when the preview was queued (0 = not stamped yet)."""
     var label: String
     var from_pos: Vec3
     var has_from_pos: Bool
@@ -327,6 +347,7 @@ struct AgentGhostPreview(Copyable, Movable):
         self.agent_id = agent_id
         self.step_id = step_id
         self.entity_id = entity_id
+        self.editor_id = UInt64(0)
         self.label = label
         self.from_pos = _safe_vec3(from_pos)
         self.has_from_pos = has_from_pos
@@ -408,6 +429,9 @@ struct AgentStep(Copyable, Movable):
     var file_existed_before: Bool
     var old_text: String
     var new_text: String
+    var file_post_hash: UInt64
+    """FNV-1a of the bytes Studio wrote for this edit; a revert only rewrites the file while the
+    disk still holds exactly these bytes (anything else means someone changed it since)."""
 
     var params_json: String
     var result_json: String
@@ -457,6 +481,7 @@ struct AgentStep(Copyable, Movable):
         self.file_existed_before = False
         self.old_text = String()
         self.new_text = String()
+        self.file_post_hash = 0
 
         self.params_json = String()
         self.result_json = String()
@@ -531,6 +556,10 @@ struct PendingApproval(Copyable, Movable):
     var tool_name: String
     var tool_kind: String
 
+    var mcp_client_key: Int
+    """MCP connection whose gated call this is; approving re-runs the call for that client only."""
+    var target_editor_id: UInt64
+    """Stable id of the entity a non-ghost gated call targets, pinned when the approval is queued."""
     # Deferred MCP socket response framing (for APPROVAL_SRC_MCP_TOOL)
     var client_fd: Int
     var request_id_raw: String
@@ -570,9 +599,11 @@ struct PendingApproval(Copyable, Movable):
         self.summary = summary
         self.tool_name = String()
         self.tool_kind = String()
+        self.mcp_client_key = 0
         self.client_fd = -1
         self.request_id_raw = String()
         self.use_content_length = False
+        self.target_editor_id = 0
         self.raw_payload_json = String()
         self.file_path = String()
         self.old_text = String()
@@ -602,6 +633,8 @@ struct AgentRevertPlan(Copyable, Movable):
     var file_paths: List[String]
     var file_existed: List[Bool]
     var file_old_texts: List[String]
+    var file_post_hashes: List[UInt64]
+    """Per file: hash of what the agent's last write in the step/turn left on disk (0 = unknown)."""
     var reverted_step_ids: List[UInt64]
     var reason: String
 
@@ -617,6 +650,7 @@ struct AgentRevertPlan(Copyable, Movable):
         self.file_paths = List[String]()
         self.file_existed = List[Bool]()
         self.file_old_texts = List[String]()
+        self.file_post_hashes = List[UInt64]()
         self.reverted_step_ids = List[UInt64]()
         self.reason = String()
 
@@ -891,6 +925,8 @@ struct AgentTelemetryBus(Copyable, Movable):
             self.sessions[si].turns[ti].ended_sec = now_sec
             self.sessions[si].turns[ti].stop_reason = stop_reason
         self.sessions[si].status = AGENT_STATUS_ERROR if stop_reason == "error" else AGENT_STATUS_IDLE
+        # "Approve for turn" lasts exactly until the turn ends.
+        self.sessions[si].auto_approve_turn_id = 0
         self.sessions[si].has_active_world_pos = False
         self.sessions[si].active_entity_id = -1
         self.sessions[si].active_callout = String()
@@ -998,12 +1034,17 @@ struct AgentTelemetryBus(Copyable, Movable):
             and self.sessions[si].steps[n - 1].status == STEP_RUNNING
         ):
             self.sessions[si].steps[n - 1].summary += chunk
+            if self.sessions[si].steps[n - 1].summary.byte_length() > MAX_THOUGHT_SUMMARY_BYTES:
+                self.sessions[si].steps[n - 1].summary = _utf8_tail(
+                    self.sessions[si].steps[n - 1].summary, MAX_THOUGHT_SUMMARY_BYTES
+                )
             self.sessions[si].last_event_sec = self.theatre_time_sec
             self.event_seq += 1
             return self.sessions[si].steps[n - 1].step_id
         var sid = self.next_step_id
         self.next_step_id += 1
-        var st = AgentStep(sid, agent_id, self.sessions[si].active_turn_id, STEP_SOURCE_ACP, ACT_THOUGHT, "Thinking", chunk)
+        var first = chunk if chunk.byte_length() <= MAX_THOUGHT_SUMMARY_BYTES else _utf8_tail(chunk, MAX_THOUGHT_SUMMARY_BYTES)
+        var st = AgentStep(sid, agent_id, self.sessions[si].active_turn_id, STEP_SOURCE_ACP, ACT_THOUGHT, "Thinking", first)
         st.status = STEP_RUNNING
         st.started_sec = now_sec
         return self._append_step(si, st^)
@@ -1102,7 +1143,10 @@ struct AgentTelemetryBus(Copyable, Movable):
         existed_before: Bool,
         now_sec: Float64 = 0.0,
         elapsed_ms: Float32 = 0.0,
+        post_hash: UInt64 = 0,
     ) -> UInt64:
+        """Records a finished file edit. Live ACP writes call this only after the approved write
+        hit the disk, with `post_hash` = hash of the bytes written (see `AgentStep.file_post_hash`)."""
         var si = self.find_session_index(agent_id)
         if si < 0:
             return 0
@@ -1114,6 +1158,7 @@ struct AgentTelemetryBus(Copyable, Movable):
         st.file_existed_before = existed_before
         st.old_text = old_text
         st.new_text = new_text
+        st.file_post_hash = post_hash
         st.status = STEP_COMPLETED
         st.progress = Float32(1.0)
         st.started_sec = now_sec
@@ -1301,7 +1346,46 @@ struct AgentTelemetryBus(Copyable, Movable):
 
     # ---- Unified Approval Queue ----
 
+    def _find_duplicate_approval(self, item: PendingApproval) -> Int:
+        if item.source != APPROVAL_SRC_MCP_TOOL or item.tool_name.byte_length() == 0:
+            return -1
+        for i in range(len(self.pending_approvals)):
+            ref pa = self.pending_approvals[i]
+            if (
+                not pa.resolved
+                and pa.source == APPROVAL_SRC_MCP_TOOL
+                and pa.agent_id == item.agent_id
+                and pa.mcp_client_key == item.mcp_client_key
+                and pa.tool_name == item.tool_name
+                and pa.raw_payload_json == item.raw_payload_json
+            ):
+                return i
+        return -1
+
+    def pending_count_for_agent(self, agent_id: UInt32) -> Int:
+        var c = 0
+        for i in range(len(self.pending_approvals)):
+            if not self.pending_approvals[i].resolved and self.pending_approvals[i].agent_id == agent_id:
+                c += 1
+        return c
+
     def queue_approval(mut self, var item: PendingApproval) -> UInt64:
+        """Queues an approval and returns its id. An identical gated MCP call from the same client
+        that is already waiting is coalesced (its id is returned; the duplicate's step is closed).
+        Returns 0 when the queue is full for this agent (or overall): the caller must refuse the
+        request itself."""
+        var dup = self._find_duplicate_approval(item)
+        if dup >= 0:
+            self._close_refused_step(item.agent_id, item.step_id, '{"ok":false,"coalesced":true}')
+            self.event_seq += 1
+            return self.pending_approvals[dup].approval_id
+        if (
+            self.pending_count_for_agent(item.agent_id) >= MAX_PENDING_APPROVALS_PER_AGENT
+            or self.pending_approval_count() >= MAX_PENDING_APPROVALS
+        ):
+            self._close_refused_step(item.agent_id, item.step_id, '{"ok":false,"error":"approval queue full"}')
+            self.event_seq += 1
+            return 0
         var aid = self.next_approval_id
         self.next_approval_id += 1
         item.approval_id = aid
@@ -1321,6 +1405,29 @@ struct AgentTelemetryBus(Copyable, Movable):
         self.event_seq += 1
         return aid
 
+    def _close_refused_step(mut self, agent_id: UInt32, step_id: UInt64, result_json: String):
+        if step_id == 0:
+            return
+        var si = self.find_session_index(agent_id)
+        if si < 0:
+            return
+        var sidx = self.sessions[si].find_step_index(step_id)
+        if sidx >= 0 and self.sessions[si].steps[sidx].status == STEP_AWAITING_APPROVAL:
+            self.sessions[si].steps[sidx].status = STEP_REJECTED
+            self.sessions[si].steps[sidx].progress = Float32(1.0)
+            self.sessions[si].steps[sidx].result_json = result_json
+
+    def turn_allowance_active(self, agent_id: UInt32) -> Bool:
+        """True while "Approve for turn" covers this agent's current turn (and it is not paused)."""
+        var si = self.find_session_index(agent_id)
+        if si < 0:
+            return False
+        ref sess = self.sessions[si]
+        if sess.paused or sess.auto_approve_turn_id == 0 or sess.auto_approve_turn_id != sess.active_turn_id:
+            return False
+        var ti = sess.find_turn_index(sess.active_turn_id)
+        return ti >= 0 and sess.turns[ti].active
+
     def resolve_approval(
         mut self,
         approval_id: UInt64,
@@ -1339,6 +1446,11 @@ struct AgentTelemetryBus(Copyable, Movable):
                 var si = self.find_session_index(out.agent_id)
                 if si >= 0:
                     if approved and allow_turn:
+                        # An agent with no open turn (an external MCP client that was never prompted
+                        # from Studio) gets one, so the allowance has a defined end (`end_turn`).
+                        var ti_open = self.sessions[si].find_turn_index(self.sessions[si].active_turn_id)
+                        if self.sessions[si].active_turn_id == 0 or ti_open < 0 or not self.sessions[si].turns[ti_open].active:
+                            _ = self._open_implicit_turn(si)
                         self.sessions[si].auto_approve_turn_id = self.sessions[si].active_turn_id
                     var sidx = self.sessions[si].find_step_index(out.step_id)
                     if sidx >= 0:
@@ -1351,6 +1463,14 @@ struct AgentTelemetryBus(Copyable, Movable):
                 self.event_seq += 1
                 return (True, out^)
         return (False, PendingApproval())
+
+    def _open_implicit_turn(mut self, si: Int) -> UInt32:
+        var tid = self.next_turn_id
+        self.next_turn_id += 1
+        var turn = AgentTurn(tid, self.sessions[si].agent_id, "(approved for this turn)", 0.0)
+        self.sessions[si].turns.append(turn^)
+        self.sessions[si].active_turn_id = tid
+        return tid
 
     def pending_approval_count(self) -> Int:
         var c = 0
@@ -1442,6 +1562,7 @@ struct AgentTelemetryBus(Copyable, Movable):
             plan.file_paths.append(st.file_path)
             plan.file_existed.append(st.file_existed_before)
             plan.file_old_texts.append(st.old_text)
+            plan.file_post_hashes.append(st.file_post_hash)
         plan.reverted_step_ids.append(step_id)
         return plan^
 
@@ -1476,15 +1597,19 @@ struct AgentTelemetryBus(Copyable, Movable):
                 plan.restore_world_lz4 = st.pre_world_lz4.copy()
                 plan.expected_hash = st.pre_hash
             if st.kind == ACT_CODE_EDIT and st.file_path.byte_length() > 0:
-                var already = False
+                var already = -1
                 for fi in range(len(plan.file_paths)):
                     if plan.file_paths[fi] == st.file_path:
-                        already = True
+                        already = fi
                         break
-                if not already:
+                if already < 0:
                     plan.file_paths.append(st.file_path)
                     plan.file_existed.append(st.file_existed_before)
                     plan.file_old_texts.append(st.old_text)
+                    plan.file_post_hashes.append(st.file_post_hash)
+                else:
+                    # Earliest old text, but the latest write is what must still be on disk.
+                    plan.file_post_hashes[already] = st.file_post_hash
         if len(plan.restore_world_lz4) == 0 and len(plan.file_paths) == 0:
             plan.valid = False
             plan.reason = "turn has no world or file changes to revert"

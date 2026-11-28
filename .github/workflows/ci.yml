@@ -53,7 +53,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
 
       - name: Run CPU-only CI subset
-        run: bash tools/ci.sh
+        run: bash tools/ci.sh --no-studio
 
       - name: Upload suite logs
         if: always()
@@ -62,6 +62,77 @@ jobs:
           name: ci-logs
           path: build/ci-logs/
           if-no-files-found: ignore
+
+  studio:
+    name: Studio suites (tools/ci.sh --studio)
+    # The 8 Studio editor-model suites (-O1, headless) and the profile-compare CLI test. A job of
+    # their own: each suite imports the whole editor, so they build in parallel with the CPU job.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          run-install: false
+
+      - name: Cache pixi environment
+        uses: actions/cache@v4
+        with:
+          path: |
+            .pixi
+            ~/.cache/rattler
+          key: pixi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.toml') }}
+          restore-keys: |
+            pixi-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install Mojo 1.2 toolchain
+        run: pixi install
+
+      - name: Run Studio suites (headless, -O1)
+        run: bash tools/ci.sh --studio
+
+      - name: Upload suite logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs-studio
+          path: build/ci-logs/
+          if-no-files-found: ignore
+
+  e2e-studio:
+    name: Studio e2e tiers 2-4 (flint.sh test e2e-studio --extended)
+    # The gate runs tier 1 only; tiers 2-4 (boundary, cross-feature, scenario) add far more
+    # than the gate's budget, so they run here as a job of their own.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      FLINT_STUDIO_E2E_JOBS: "4"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          run-install: false
+
+      - name: Cache pixi environment
+        uses: actions/cache@v4
+        with:
+          path: |
+            .pixi
+            ~/.cache/rattler
+          key: pixi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.toml') }}
+          restore-keys: |
+            pixi-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install Mojo 1.2 toolchain
+        run: pixi install
+
+      - name: Install lavapipe (software Vulkan)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
+
+      - name: Run Studio e2e tiers 2-4
+        run: bash tools/flint.sh test e2e-studio --extended
 
   gate:
     name: Full gate (self-hosted GPU)

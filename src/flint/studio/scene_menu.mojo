@@ -35,7 +35,16 @@ comptime TOGGLE_COL_OVERLAY = 30
 comptime RELOAD_SO = 31
 comptime PACKAGE = 32
 comptime PACKAGE_PROFILES = 33
-comptime RECOVER_AUTOSAVE = 34
+comptime OPEN_SCENE = 34
+comptime SAVE_AS = 35
+comptime RECOVER_AUTOSAVE = 36
+comptime SELECT_ALL = 37
+comptime RENAME = 38
+comptime WINDOW_RESET_LAYOUT = 39
+comptime WINDOW_CONSOLE = 40
+comptime HELP_SHORTCUTS = 41
+comptime HELP_PALETTE = 42
+comptime PIVOT_MODE = 43
 
 
 struct SceneMenu(Movable):
@@ -58,21 +67,26 @@ struct SceneMenu(Movable):
         self.message = ""
         self.bar.add_group("File", 48)
         self.bar.item(SAVE, "Save scene", "Ctrl+S")
-        self.bar.item(LOAD, "Load saved scene", "Ctrl+O")
+        self.bar.item(OPEN_SCENE, "Open scene...", "Ctrl+O")
         self.bar.item(NEW_SCENE, "New scene", "Ctrl+N")
+        self.bar.item(SAVE_AS, "Save scene as...", "Ctrl+Shift+S")
+        self.bar.item(LOAD, "Revert to saved")
         self.bar.item(RECOVER_AUTOSAVE, "Recover autosave", "", True, True)
         self.bar.add_group("Edit", 48)
         self.bar.item(UNDO, "Undo", "Ctrl+Z")
         self.bar.item(REDO, "Redo", "Ctrl+Shift+Z")
         self.bar.item(DUPLICATE, "Duplicate", "Ctrl+D", True, True)
         self.bar.item(DELETE_SEL, "Delete", "Del")
-        self.bar.add_group("Transform", 88)
+        self.bar.item(SELECT_ALL, "Select all", "Ctrl+A")
+        self.bar.item(RENAME, "Rename", "F2")
+        self.bar.add_group("Transform", 100)
         self.bar.item(MOVE, "Move", "W")
         self.bar.item(ROTATE, "Rotate", "E")
         self.bar.item(SCALE, "Scale", "R")
         self.bar.item(SNAP, "Snap to grid", "G", True, True, 1)
         self.bar.item(GIZMO_SPACE, "Gizmo: World Space", "X")
-        self.bar.item(FRAME_SEL, "Frame selection", "F", True, True)
+        self.bar.item(FRAME_SEL, "Frame selection", "F")
+        self.bar.item(PIVOT_MODE, "Pivot: Bounds Centre", "", True, True)
         self.bar.add_group("Play", 50)
         self.bar.item(PLAY, "Play scene", "F5")
         self.bar.item(PAUSE, "Pause simulation", "F6")
@@ -98,6 +112,12 @@ struct SceneMenu(Movable):
         self.bar.add_group("Build", 56)
         self.bar.item(PACKAGE, "Package project", "", self.has_project)
         self.bar.item(PACKAGE_PROFILES, "Package with profile...", "", self.has_project)
+        self.bar.add_group("Window", 66)
+        self.bar.item(WINDOW_RESET_LAYOUT, "Reset layout")
+        self.bar.item(WINDOW_CONSOLE, "Console")
+        self.bar.add_group("Help", 46)
+        self.bar.item(HELP_SHORTCUTS, "Keyboard shortcuts", "F1")
+        self.bar.item(HELP_PALETTE, "Command palette", "Ctrl+K")
 
     def sync_toggle_states(
         mut self,

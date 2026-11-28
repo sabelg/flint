@@ -2,7 +2,7 @@
 
 Runs build, gameplay `.so` compilation, cook, test, and shell commands without
 stalling Studio's render loop. Streams combined stdout/stderr incrementally,
-tracks elapsed duration & exit codes, supports safe cancellation (`SIGTERM`/`SIGKILL`),
+tracks elapsed duration & exit codes, supports safe cancellation (`SIGTERM` to the whole process group, polled `SIGKILL` after a grace period),
 and parses Mojo compiler diagnostics automatically via `flint.devtools.problems`.
 """
 from std.collections import List
@@ -30,6 +30,14 @@ comptime _EAGAIN: Int32 = 11
 comptime _ECHILD: Int32 = 10
 comptime _SIGTERM: Int32 = 15
 comptime _SIGKILL: Int32 = 9
+comptime _SIGPIPE: Int32 = 13
+comptime _PR_SET_PDEATHSIG: Int32 = 1
+
+comptime JOB_CANCEL_GRACE_SEC: Float64 = 0.4
+"""After SIGTERM a cancelled job's process group gets this long before SIGKILL. The wait is
+polled (`JobRunner.poll_all`), never slept on the UI thread."""
+comptime MAX_FINISHED_JOBS: Int = 16
+"""Finished jobs kept by `JobRunner`; older ones are pruned by `poll_all`."""
 
 
 def _c_bytes(s: String) -> List[UInt8]:
@@ -39,6 +47,62 @@ def _c_bytes(s: String) -> List[UInt8]:
         out.append(sb[i])
     out.append(0)
     return out^
+
+
+struct ChildExecPrelude(Movable):
+    """Everything a forked child needs before `exec`, allocated in the parent: between `fork` and
+    `exec` only async-signal-safe calls are allowed (another thread may hold the allocator lock)."""
+    var parent_pid: Int32
+    var sigdfl: List[UInt64]
+    """Zeroed `struct sigaction` = `SIG_DFL`, used to reset SIGPIPE (an ignored signal stays ignored
+    across `exec`, and Studio ignores SIGPIPE)."""
+    var sigold: List[UInt64]
+    """Scratch for the previous action (same `sigaction` FFI signature as the rest of the engine)."""
+
+    def __init__(out self):
+        self.parent_pid = external_call["getpid", Int32]()
+        self.sigdfl = List[UInt64](length=24, fill=0)
+        self.sigold = List[UInt64](length=24, fill=0)
+
+
+def child_exec_prelude(p: ChildExecPrelude, new_group: Bool = True):
+    """Runs in the forked child only. Puts the child in its own process group (so cancel / stop
+    can signal the whole tree with `kill(-pgid)`), asks the kernel to SIGKILL it if Studio dies,
+    and restores default SIGPIPE. Allocation-free."""
+    if new_group:
+        _ = external_call["setpgid", Int32](Int32(0), Int32(0))
+    _ = external_call["prctl", Int32](_PR_SET_PDEATHSIG, UInt64(9), UInt64(0), UInt64(0), UInt64(0))
+    if external_call["getppid", Int32]() != p.parent_pid:
+        external_call["_exit", NoneType](Int32(127))  # parent already gone: PDEATHSIG would never fire
+    _ = external_call["sigaction", Int32](_SIGPIPE, p.sigdfl.unsafe_ptr(), p.sigold.unsafe_ptr())
+
+
+def signal_process_group(pid: Int32, sig: Int32):
+    """Signals `pid`'s whole process group (the child leads its own group), falling back to the
+    single process when the group is already gone."""
+    if pid <= 0:
+        return
+    if external_call["kill", Int32](-pid, sig) != 0:
+        _ = external_call["kill", Int32](pid, sig)
+
+
+def reap_child(pid: Int32, block: Bool = False) -> Tuple[Bool, Int]:
+    """`waitpid(pid)` without blocking (unless `block`). Returns `(reaped, exit_code)`; `exit_code` is
+    0..255, 128+signal, or -1 when the status is unknown (ECHILD: someone else reaped it). An
+    unknown status is never reported as success."""
+    if pid <= 0:
+        return (True, -1)
+    while True:
+        var st = Int32(0)
+        var r = external_call["waitpid", Int32](pid, Pointer(to=st), Int32(0 if block else 1))
+        if r == pid:
+            var wst = Int(st)
+            return (True, ((wst >> 8) & 255) if (wst & 127) == 0 else (128 + (wst & 127)))
+        if r < 0:
+            if last_errno() == _EINTR:
+                continue
+            return (True, -1)  # ECHILD or worse: the child is gone, its status unknown
+        return (False, -1)
 
 
 def _set_fd_nonblock_cloexec(fd: Int32):
@@ -68,6 +132,8 @@ struct BackgroundJob(Movable):
     var output_bytes: List[UInt8]
     var streamed_line_cursor: Int
     var diagnostics: List[Diagnostic]
+    var kill_deadline_sec: Float64
+    """While > 0 the job was cancelled and its group gets SIGKILL at this time unless reaped first."""
 
     def __init__(
         out self,
@@ -93,9 +159,15 @@ struct BackgroundJob(Movable):
         self.output_bytes = List[UInt8]()
         self.streamed_line_cursor = 0
         self.diagnostics = List[Diagnostic]()
+        self.kill_deadline_sec = 0.0
 
     def __deinit__(deinit self):
-        self.cancel()
+        # Last chance to reap: no grace period here, the process group is killed outright.
+        if self.pid > 0:
+            signal_process_group(self.pid, _SIGKILL)
+            _ = reap_child(self.pid, block=True)
+        if self.pipe_fd >= 0:
+            close_fd(Int(self.pipe_fd))
 
     def is_running(self) -> Bool:
         return self.state == JOB_RUNNING
@@ -131,6 +203,10 @@ struct BackgroundJob(Movable):
 
     def start_argv(mut self, argv: List[String], cwd: String = "", now_sec: Float64 = -1.0) -> Bool:
         self.cancel()
+        if self.pid > 0:  # a previous run is still being reaped: finish it now
+            signal_process_group(self.pid, _SIGKILL)
+            _ = reap_child(self.pid, block=True)
+            self.pid = -1
         if len(argv) == 0:
             return False
         if cwd.byte_length() > 0:
@@ -156,25 +232,35 @@ struct BackgroundJob(Movable):
         for i in range(len(args)):
             ptrs[i] = Int(args[i].unsafe_ptr())
         var dir_c = _c_bytes(self.cwd)
+        var devnull_c = _c_bytes("/dev/null")
+        var has_cwd = self.cwd.byte_length() > 0
+        var prelude = ChildExecPrelude()
 
         var pid = external_call["fork", Int32]()
         if pid == 0:
+            # Child: nothing below allocates (every buffer was built before fork).
+            child_exec_prelude(prelude)
             var devnull = external_call["openat", Int32](
-                Int32(-100), _c_bytes("/dev/null").unsafe_ptr(), Int32(0), Int32(0)
+                Int32(-100), devnull_c.unsafe_ptr(), Int32(0), Int32(0)
             )
             if devnull >= 0:
                 _ = external_call["dup2", Int32](devnull, Int32(0))
             _ = external_call["dup2", Int32](wr, Int32(1))
             _ = external_call["dup2", Int32](wr, Int32(2))
             _ = external_call["close_range", Int32](UInt32(3), UInt32(0xFFFFFFFF), UInt32(0))
-            if self.cwd.byte_length() > 0:
+            if has_cwd:
                 _ = external_call["chdir", Int32](dir_c.unsafe_ptr())
             _ = external_call["execvp", Int32](args[0].unsafe_ptr(), ptrs.unsafe_ptr())
             external_call["_exit", NoneType](Int32(127))
 
+        if pid > 0:
+            # Also set the group from the parent, so a cancel right after fork cannot miss it.
+            _ = external_call["setpgid", Int32](pid, pid)
         _ = len(args)
         _ = ptrs[0]
         _ = dir_c[0]
+        _ = devnull_c[0]
+        _ = prelude.sigdfl[0]
 
         close_fd(Int(wr))
         if pid < 0:
@@ -192,6 +278,7 @@ struct BackgroundJob(Movable):
         self.output_bytes.clear()
         self.streamed_line_cursor = 0
         self.diagnostics.clear()
+        self.kill_deadline_sec = 0.0
         return True
 
     def start_shell(mut self, shell_cmd: String, cwd: String = "", now_sec: Float64 = -1.0) -> Bool:
@@ -231,28 +318,46 @@ struct BackgroundJob(Movable):
 
     def poll(mut self, now_sec: Float64 = -1.0) -> Bool:
         """Drains output and checks process exit. Returns True if output arrived or state changed."""
+        if self.state == JOB_CANCELLED:
+            self._reap_cancelled(now_sec)
+            return False
         if self.state != JOB_RUNNING:
             return False
         var changed = self._drain_pipe()
         if self.pid > 0:
-            var st = Int32(0)
-            var r = external_call["waitpid", Int32](self.pid, Pointer(to=st), Int32(1))
-            if r == self.pid or (r < 0 and last_errno() == _ECHILD):
+            var rr = reap_child(self.pid)
+            if rr[0]:
                 _ = self._drain_pipe()
                 if self.pipe_fd >= 0:
                     close_fd(Int(self.pipe_fd))
                     self.pipe_fd = -1
-                var wst = Int(st)
-                if r == self.pid:
-                    self.exit_code = ((wst >> 8) & 255) if (wst & 127) == 0 else (128 + (wst & 127))
-                else:
-                    self.exit_code = 0
+                self.exit_code = rr[1]
                 self.pid = -1
                 self.finished_sec = now_sec if now_sec >= 0.0 else get_time()
+                # exit_code -1 = status unknown (ECHILD): a failure, never a success.
                 self.state = JOB_SUCCEEDED if self.exit_code == 0 else JOB_FAILED
                 self.diagnostics = parse_compiler_output(self.output_text(), self.cwd, DIAG_SRC_BUILD)
                 changed = True
         return changed
+
+    def _reap_cancelled(mut self, now_sec: Float64 = -1.0):
+        """Non-blocking second half of `cancel`: reap the group, SIGKILL it once the grace ends."""
+        if self.pid <= 0:
+            self.kill_deadline_sec = 0.0
+            return
+        var rr = reap_child(self.pid)
+        if rr[0]:
+            self.pid = -1
+            self.kill_deadline_sec = 0.0
+            return
+        var t = now_sec if now_sec >= 0.0 else get_time()
+        if self.kill_deadline_sec > 0.0 and t >= self.kill_deadline_sec:
+            signal_process_group(self.pid, _SIGKILL)
+            self.kill_deadline_sec = -1.0  # SIGKILL sent; later polls keep reaping
+
+    def is_reaping(self) -> Bool:
+        """True while a cancelled job's processes have not been reaped yet."""
+        return self.pid > 0 and self.state == JOB_CANCELLED
 
     def take_new_lines(mut self) -> List[String]:
         """Returns complete output lines received since the previous `take_new_lines()` call."""
@@ -282,25 +387,17 @@ struct BackgroundJob(Movable):
             self.streamed_line_cursor = n
         return out^
 
-    def cancel(mut self):
-        if self.pid > 0:
-            _ = external_call["kill", Int32](self.pid, _SIGTERM)
-            var exited = False
-            for _ in range(20):
-                var st = Int32(0)
-                var r = external_call["waitpid", Int32](self.pid, Pointer(to=st), Int32(1))
-                if r == self.pid or (r < 0 and last_errno() == _ECHILD):
-                    exited = True
-                    break
-                _ = external_call["usleep", Int32](UInt32(10000))
-            if not exited:
-                _ = external_call["kill", Int32](self.pid, _SIGKILL)
-                var st = Int32(0)
-                _ = external_call["waitpid", Int32](self.pid, Pointer(to=st), Int32(0))
-            self.pid = -1
-            if self.state == JOB_RUNNING:
-                self.state = JOB_CANCELLED
-                self.finished_sec = get_time()
+    def cancel(mut self, now_sec: Float64 = -1.0):
+        """Asks the job's whole process group to stop (SIGTERM) and returns at once. Later `poll()`
+        calls reap it and send SIGKILL once `JOB_CANCEL_GRACE_SEC` has passed."""
+        if self.state == JOB_RUNNING:
+            var t = now_sec if now_sec >= 0.0 else get_time()
+            self.state = JOB_CANCELLED
+            self.finished_sec = t
+            if self.pid > 0:
+                signal_process_group(self.pid, _SIGTERM)
+                self.kill_deadline_sec = t + JOB_CANCEL_GRACE_SEC
+                self._reap_cancelled(t)
         if self.pipe_fd >= 0:
             close_fd(Int(self.pipe_fd))
             self.pipe_fd = -1
@@ -404,8 +501,30 @@ struct JobRunner(Movable):
         self.jobs.append(job^)
         return jid
 
+    def remove(mut self, job_id: Int) -> Bool:
+        """Drops a finished job once its result was harvested. A running or reaping job stays."""
+        var idx = self.find_index(job_id)
+        if idx < 0 or self.jobs[idx].is_running() or self.jobs[idx].is_reaping():
+            return False
+        _ = self.jobs.pop(idx)
+        return True
+
+    def prune_finished(mut self, keep: Int = MAX_FINISHED_JOBS):
+        """Bounds the job list: keeps the `keep` newest finished jobs, every running or still reaping
+        one, and `last_completed_id` (for `latest_diagnostics`)."""
+        var finished = 0
+        var i = len(self.jobs) - 1
+        while i >= 0:
+            if self.jobs[i].is_finished() and not self.jobs[i].is_reaping():
+                finished += 1
+                if finished > keep and self.jobs[i].id != self.last_completed_id:
+                    _ = self.jobs.pop(i)
+            i -= 1
+
     def poll_all(mut self, now_sec: Float64 = -1.0) -> List[Int]:
-        """Polls all running jobs and returns IDs of jobs that finished on this tick."""
+        """Polls all jobs (reaping cancelled ones) and returns IDs of jobs that finished on this
+        tick. Finished jobs beyond `MAX_FINISHED_JOBS` from earlier ticks are pruned first."""
+        self.prune_finished()
         var newly_done = List[Int]()
         for i in range(len(self.jobs)):
             var was_running = self.jobs[i].is_running()
@@ -425,6 +544,13 @@ struct JobRunner(Movable):
     def cancel_all(mut self):
         for i in range(len(self.jobs)):
             self.jobs[i].cancel()
+
+    def reaping_count(self) -> Int:
+        var n = 0
+        for i in range(len(self.jobs)):
+            if self.jobs[i].is_reaping():
+                n += 1
+        return n
 
     def active_count(self) -> Int:
         var n = 0

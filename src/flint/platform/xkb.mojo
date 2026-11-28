@@ -1000,6 +1000,21 @@ struct XkbKeymap(Movable):
         var base = (evdev_code * MAX_XKB_GROUPS + grp) * MAX_XKB_LEVELS
         return self.syms[base + level]
 
+    def base_codepoint(self, evdev_code: Int) -> Int:
+        """The unmodified (level 1) character of `evdev_code` in the active group, ignoring every
+        modifier: what the key is labelled on this layout, for shortcut matching. 0 if none."""
+        if evdev_code < 0 or evdev_code >= MAX_EVDEV_KEYS:
+            return 0
+        var n_groups = self.group_counts[evdev_code]
+        if n_groups <= 0:
+            return 0
+        var grp = self.active_group % n_groups
+        if self.level_counts[evdev_code * MAX_XKB_GROUPS + grp] <= 0:
+            grp = 0
+            if self.level_counts[evdev_code * MAX_XKB_GROUPS] <= 0:
+                return 0
+        return self.syms[(evdev_code * MAX_XKB_GROUPS + grp) * MAX_XKB_LEVELS]
+
     def translate_key_to_utf8(self, evdev_code: Int) -> String:
         var cp = self.translate_key_to_codepoint(evdev_code)
         if cp <= 0:

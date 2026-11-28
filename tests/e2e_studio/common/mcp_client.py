@@ -134,8 +134,31 @@ def run_batch(
     return parse_frames(proc.stdout, framing=framing)
 
 
+MCP_E2E_PROTOCOL = "2025-06-18"
+"""Revision the harness negotiates by default: the newest Flint speaks, so tool results carry
+`structuredContent`. Clients on `2024-11-05` get only the text content block."""
+
+
+def tool_payload(res: dict[str, Any]) -> Any:
+    """The tool's JSON payload: `structuredContent` (2025-06-18) or the parsed text block (2024-11-05)."""
+    sc = res.get("structuredContent")
+    if sc is not None:
+        return sc
+    for block in res.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            try:
+                return json.loads(block.get("text", ""))
+            except ValueError:
+                return None
+    return None
+
+
 class McpStdioClient:
-    """Interactive streaming MCP JSON-RPC 2.0 stdio client."""
+    """Interactive streaming MCP JSON-RPC 2.0 stdio client.
+
+    `--mcp-stdio` refuses everything but `initialize`/`ping` until `initialize` (-32002), so with
+    `auto_initialize` (the default) the first other request performs the handshake on 2025-06-18.
+    Pass `auto_initialize=False` to exercise the pre-initialize lifecycle."""
 
     def __init__(
         self,
@@ -144,6 +167,7 @@ class McpStdioClient:
         framing: str = "cl",
         timeout: float = 30.0,
         allow_stderr: bool = False,
+        auto_initialize: bool = True,
     ) -> None:
         if framing not in ("cl", "ndjson"):
             raise ValueError(f"framing must be 'cl' or 'ndjson', got {framing!r}")
@@ -152,6 +176,9 @@ class McpStdioClient:
         self.framing = framing
         self.timeout = timeout
         self.allow_stderr = allow_stderr
+        self.auto_initialize = auto_initialize
+        self.initialized = False
+        self.protocol_version: str | None = None
         self._next_id = 1
         self._buf = bytearray()
         self._raw_seen = bytearray()
@@ -292,20 +319,29 @@ class McpStdioClient:
                     f"buf={bytes(self._buf)!r}, stderr={stderr_tail!r}"
                 )
 
-    def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def request(
+        self, method: str, params: dict[str, Any] | None = None, timeout: float | None = None
+    ) -> dict[str, Any]:
+        self._ensure_initialized(method)
         rid = self._alloc_id()
         req: dict[str, Any] = {"jsonrpc": "2.0", "id": rid, "method": method}
         if params is not None:
             req["params"] = params
         self._send_raw(encode_frame(req, framing=self.framing))
-        resp = self._read_frame()
+        resp = self._read_frame(timeout)
         if resp.get("id") != rid:
             raise AssertionError(f"Mismatched JSON-RPC response id: expected {rid}, got {resp!r}")
         return resp
 
+    def _ensure_initialized(self, method: str | None) -> None:
+        if self.initialized or not self.auto_initialize or method in ("initialize", "ping"):
+            return
+        self.initialize()
+        self.notify_initialized()
+
     def initialize(
         self,
-        protocol_version: str = "2024-11-05",
+        protocol_version: str = MCP_E2E_PROTOCOL,
         auth_token: str | None = None,
         client_name: str = "e2e-studio",
     ) -> dict[str, Any]:
@@ -319,7 +355,23 @@ class McpStdioClient:
         resp = self.request("initialize", params)
         if "error" in resp:
             raise AssertionError(f"initialize failed with error: {resp['error']!r}")
+        self.initialized = True
+        self.protocol_version = resp["result"].get("protocolVersion")
         return resp["result"]
+
+    def structured(self) -> bool:
+        """Whether the negotiated revision carries `structuredContent` (>= 2025-06-18)."""
+        return (self.protocol_version or "") >= "2025-06-18"
+
+    def _payload(self, name: str, res: dict[str, Any]) -> Any:
+        sc = res.get("structuredContent")
+        if self.structured():
+            if not isinstance(sc, dict):
+                raise AssertionError(f"tools/call({name}) missing structuredContent on {self.protocol_version}: {res!r}")
+            return sc
+        if sc is not None:
+            raise AssertionError(f"tools/call({name}) sent structuredContent to a {self.protocol_version} client: {res!r}")
+        return tool_payload(res)
 
     def notify_initialized(self, quiet_wait_s: float = 0.05) -> None:
         note = {"jsonrpc": "2.0", "method": "notifications/initialized"}
@@ -345,14 +397,17 @@ class McpStdioClient:
             raise AssertionError(f"tools/list result.tools is not a list: {resp!r}")
         return tools
 
-    def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-        resp = self.request("tools/call", {"name": name, "arguments": arguments or {}})
+    def call_tool(
+        self, name: str, arguments: dict[str, Any] | None = None, timeout: float | None = None
+    ) -> dict[str, Any]:
+        # `timeout` overrides the client default for slow tools (project.package compiles the game).
+        resp = self.request("tools/call", {"name": name, "arguments": arguments or {}}, timeout)
         if "error" in resp:
             raise AssertionError(f"tools/call({name}) JSON-RPC error: {resp['error']!r}")
         res = resp.get("result", {})
         if res.get("isError", False):
             raise AssertionError(f"tools/call({name}) returned isError=True: {res!r}")
-        sc = res.get("structuredContent")
+        sc = self._payload(name, res)
         if not isinstance(sc, dict) or sc.get("ok") is not True:
             raise AssertionError(f"tools/call({name}) structuredContent.ok != True: {res!r}")
         return sc
@@ -362,7 +417,7 @@ class McpStdioClient:
         if "error" in resp:
             raise AssertionError(f"Expected tool error result, got protocol error: {resp['error']!r}")
         res = resp.get("result", {})
-        sc = res.get("structuredContent")
+        sc = self._payload(name, res)
         if not res.get("isError", False):
             raise AssertionError(f"Expected isError=True for {name}, got: {res!r}")
         if not isinstance(sc, dict) or sc.get("ok") is not False:
@@ -370,6 +425,7 @@ class McpStdioClient:
         return sc
 
     def expect_protocol_error(self, payload: dict[str, Any] | bytes, expected_code: int) -> dict[str, Any]:
+        self._ensure_initialized(None if isinstance(payload, bytes) else payload.get("method"))
         if isinstance(payload, bytes):
             self._send_raw(payload)
         else:
@@ -422,7 +478,7 @@ def _main(argv: list[str]) -> int:
     cmd = [ns.bin, *ns.extra_arg, "--mcp-stdio"]
     with McpStdioClient(cmd, cwd=ns.cwd, framing=ns.framing, timeout=ns.timeout) as client:
         init_res = client.initialize()
-        if init_res.get("protocolVersion") != "2024-11-05":
+        if init_res.get("protocolVersion") != MCP_E2E_PROTOCOL:
             raise AssertionError(f"Unexpected protocolVersion: {init_res!r}")
         client.notify_initialized()
         tools = client.list_tools()

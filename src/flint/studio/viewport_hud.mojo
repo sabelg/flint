@@ -57,6 +57,8 @@ from flint.ui.theme import (
 
 # Unified Header Bar geometry & Workspace Presets
 comptime STUDIO_HEADER_BAR_H: Float32 = 40.0
+comptime STUDIO_STATUS_BAR_H: Float32 = 22.0
+"""Bottom status bar: scene file + unsaved mark, selection, tool state, last message (click = console)."""
 
 comptime WORKSPACE_EDIT: Int = 0
 comptime WORKSPACE_AGENT_STUDIO: Int = 1

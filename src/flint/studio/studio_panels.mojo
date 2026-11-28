@@ -31,6 +31,7 @@ from flint.ui.context import (
     format_float2,
     hash_ui_id,
     pack_rgba8,
+    utf8_drop_last_char,
 )
 from flint.ui.draw_list import (
     UI_FLAG_BORDER,
@@ -149,6 +150,72 @@ def _ascii_lower_panel(s: String) -> String:
         else:
             out.append(b)
     return String(unsafe_from_utf8=out)
+
+
+def ascii_contains_ci(hay: String, needle_lower: String) -> Bool:
+    """ASCII case-insensitive substring test against an already-lowercased needle, without
+    allocating a lowered copy of `hay` (the Hierarchy filter runs it on every row)."""
+    var n = needle_lower.byte_length()
+    if n == 0:
+        return True
+    var h = hay.byte_length()
+    if n > h:
+        return False
+    var hb = hay.as_bytes()
+    var nb = needle_lower.as_bytes()
+    for start in range(h - n + 1):
+        var ok = True
+        for j in range(n):
+            var c = hb[start + j]
+            if c >= 65 and c <= 90:
+                c += 32
+            if c != nb[j]:
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
+comptime OUTLINER_TOP_H: Float32 = 36.0
+"""Height of the outliner's toolbar/search strip above the scrollable list."""
+comptime OUTLINER_ROW_GAP: Float32 = 1.0
+comptime OUTLINER_ROW_STRIDE: Float32 = OUTLINER_ROW_H + OUTLINER_ROW_GAP
+"""Vertical pitch of outliner rows (`OUTLINER_ROW_H` from `flint.ui.theme` plus a 1 px gap)."""
+comptime OUTLINER_ROOT_EXTRA_GAP: Float32 = 4.0
+"""Extra space between the World root header band and the first entity row."""
+comptime _OUTLINER_LIST_TOP_PAD: Float32 = 6.0
+
+
+def outliner_list_rect(panel_rect: RectF) -> RectF:
+    """The scrollable row area of `draw_outliner_panel_v2` (below the search/header strip)."""
+    var list_y = panel_rect.y + OUTLINER_TOP_H
+    return RectF(panel_rect.x, list_y + Float32(1.0), panel_rect.w, max(Float32(16.0), panel_rect.bottom() - list_y - Float32(2.0)))
+
+
+def outliner_content_h(n_rows: Int) -> Float32:
+    """Scrollable content height of an outliner showing the World root plus `n_rows` entity rows."""
+    return Float32(1 + max(0, n_rows)) * OUTLINER_ROW_STRIDE + OUTLINER_ROOT_EXTRA_GAP + Float32(10.0)
+
+
+def outliner_row_window(panel_rect: RectF, n_rows: Int, state: OutlinerPanelState, wheel: Float32 = 0.0) -> Tuple[Int, Int]:
+    """`[first, last)` of the entity rows `draw_outliner_panel_v2` can draw this frame (with a margin
+    for this frame's wheel scroll), so callers build row views only for those."""
+    if n_rows <= 0:
+        return (0, 0)
+    var lr = outliner_list_rect(panel_rect)
+    var content_h = outliner_content_h(n_rows)
+    var max_scroll = max(Float32(0.0), content_h - lr.h)
+    var sy = state.scroll_y if isfinite(state.scroll_y) else Float32(0.0)
+    sy = max(Float32(0.0), min(max_scroll, sy))
+    var slack = Int(abs(wheel) * Float32(36.0) / OUTLINER_ROW_STRIDE) + 4 if isfinite(wheel) else 4
+    # Entity row vi sits at list.y + pad - scroll + stride + root_gap + vi * stride.
+    var row0 = _OUTLINER_LIST_TOP_PAD + OUTLINER_ROW_STRIDE + OUTLINER_ROOT_EXTRA_GAP
+    var first = Int((sy - row0 - OUTLINER_ROW_H) / OUTLINER_ROW_STRIDE) - 1 - slack
+    var last = Int((sy + lr.h - row0) / OUTLINER_ROW_STRIDE) + 1 + slack
+    first = max(0, min(n_rows, first))
+    last = max(first, min(n_rows, last))
+    return (first, last)
 
 
 def _ascii_upper_panel(s: String) -> String:
@@ -726,7 +793,7 @@ def _draw_color_swatch_row_v2(
     row_w: Float32,
 ) -> Bool:
     """Left-label color swatch + interactive RGB capsule scrubber row."""
-    var row_pair = ui.property_row_label(label_text, row_w)
+    var row_pair = ui.property_row_label(label_text, row_w, id=id)
     var ctrl = row_pair[1]
     var r8 = Int(max(Float32(0.0), min(Float32(1.0), color.x)) * Float32(255.0) + Float32(0.5))
     var g8 = Int(max(Float32(0.0), min(Float32(1.0), color.y)) * Float32(255.0) + Float32(0.5))
@@ -789,7 +856,7 @@ def _draw_segmented_row_v2(
     row_w: Float32,
 ) -> Bool:
     """Left-label compact segmented pill selector for enums (shading mode, collider kind)."""
-    var row_pair = ui.property_row_label(label_text, row_w)
+    var row_pair = ui.property_row_label(label_text, row_w, id=id)
     var ctrl = row_pair[1]
     var n = len(options)
     if n <= 0:
@@ -964,7 +1031,7 @@ def draw_studio_stats_panel(
     if panel_rect.w < Float32(60.0) or panel_rect.h < Float32(40.0):
         return
     ui.set_studio_theme(theme.copy())
-    ui.draw_list.push_clip(Int(panel_rect.x), Int(panel_rect.y), Int(panel_rect.right()), Int(panel_rect.bottom()))
+    ui.draw_list.push_clip_f(panel_rect.x, panel_rect.y, panel_rect.right(), panel_rect.bottom())
     ui.draw_list.add_rect(panel_rect.x, panel_rect.y, panel_rect.w, panel_rect.h, theme.l1_shell)
 
     var pad = Float32(8.0)
@@ -1376,23 +1443,26 @@ def draw_outliner_panel_v2(
     selected_has_parent: Bool,
     bus: AgentTelemetryBus,
     mut state: OutlinerPanelState,
+    row_base: Int = 0,
+    total_rows: Int = -1,
 ) -> OutlinerAction:
     """Renders the Obsidian & Flint Ember Scene Outliner with symmetric toolbar, inline search
     clear, contextual `[Unparent]` at `(panel.x+28, panel.y+16)` compatibility rect, distinct
     world-root header band with mono count pill, `OUTLINER_ROW_H` rows with continuous tree
     guides + L-ticks, reclaimed leaf padding, bordered selection pill, `+N` collapsed badges,
-    visibility/lock hover wells, draggable 4->6px scrollbar, and live Agent Activity Badges."""
+    visibility/lock hover wells, draggable 4->6px scrollbar, and live Agent Activity Badges.
+
+    Windowed mode (`total_rows >= 0`): `rows` holds only rows `[row_base, row_base + len(rows))`
+    of an already-filtered list of `total_rows` (see `outliner_row_window`), so a big scene
+    builds row views only for what is on screen. Otherwise `rows` is the whole list and the
+    panel applies the search filter itself. Keyboard row traversal then covers the windowed rows
+    (the window keeps a few rows of slack around the viewport, and follows the scroll)."""
     var act = OutlinerAction()
     if panel_rect.w < Float32(40.0) or panel_rect.h < Float32(40.0):
         return act^
 
-    ui.set_studio_theme(theme.copy())
-    ui.draw_list.push_clip(
-        Int(panel_rect.x),
-        Int(panel_rect.y),
-        Int(panel_rect.right()),
-        Int(panel_rect.bottom()),
-    )
+    ui.set_studio_theme(theme)
+    ui.draw_list.push_clip_f(panel_rect.x, panel_rect.y, panel_rect.right(), panel_rect.bottom())
 
     # Panel L1 backdrop
     ui.draw_list.add_rect(panel_rect.x, panel_rect.y, panel_rect.w, panel_rect.h, theme.l1_shell)
@@ -1446,6 +1516,7 @@ def draw_outliner_panel_v2(
         ui.hovered_rect = ui._clip_hovered_rect(search_r)
         if ui.mouse_pressed_l:
             ui._set_focused(search_wid)
+            ui.active_id = search_wid  # keeps the focus through end_frame (as text_input does)
     var search_foc = (not blocked) and ui.focused_id == search_wid
     if search_foc:
         ui._focused_text_id = search_wid
@@ -1456,14 +1527,15 @@ def draw_outliner_panel_v2(
             ui._focused_text_id = 0
             has_query_raw = False
         elif ui.key_bs_pressed and state.search_query.byte_length() > 0:
-            var codepoints = decode_utf8(state.search_query)
-            state.search_query = encode_utf8(codepoints, 0, max(0, len(codepoints) - 1))
+            var next_q = utf8_drop_last_char(state.search_query)
+            state.search_query = next_q
             has_query_raw = state.search_query.byte_length() > 0
-        elif ui.text_utf8.byte_length() > 0 and not ui.key_ctrl:
-            state.search_query += ui.text_utf8
+        elif (ui.text_utf8.byte_length() > 0 or ui.ime_commit.byte_length() > 0) and not ui.key_ctrl:
+            state.search_query += ui.text_utf8 + ui.ime_commit
+            ui.ime_commit = ""
             has_query_raw = True
 
-    ui.draw_list.push_clip(Int(search_r.x), Int(search_r.y), Int(search_r.right()), Int(search_r.bottom()))
+    ui.draw_list.push_clip_f(search_r.x, search_r.y, search_r.right(), search_r.bottom())
     ui.draw_list.add_recessed_well(
         search_r.x, search_r.y, search_r.w, search_r.h,
         theme.l0_canvas,
@@ -1504,6 +1576,8 @@ def draw_outliner_panel_v2(
         ui.draw_text_in_rect(q_rect, "Find entity", theme.font_caption, theme.text_muted, UI_ALIGN_LEFT, UI_FONT_REGULAR, Float32(0.0), True, False)
     if search_foc:
         ui.draw_list.add_line(caret_x, top_y + Float32(5.0), caret_x, top_y + ctrl_h - Float32(5.0), Float32(1.2), theme.focus_ring)
+        # IME candidate window anchor (platform text-input cursor rectangle)
+        ui.text_caret_rect = RectF(caret_x, top_y + Float32(2.0), Float32(2.0), max(Float32(1.0), ctrl_h - Float32(4.0)))
     ui.draw_list.pop_clip()
 
     # `+ Add` quick-spawn button (accent-tinted icon + crisp hover border)
@@ -1518,30 +1592,34 @@ def draw_outliner_panel_v2(
     ui.draw_list.add_line(panel_rect.x, list_y, panel_rect.right(), list_y, Float32(1.0), theme.border_subtle)
 
     # Scrollable entity list region
-    var list_rect = RectF(panel_rect.x, list_y + Float32(1.0), panel_rect.w, max(Float32(16.0), panel_rect.bottom() - list_y - Float32(2.0)))
+    var list_rect = outliner_list_rect(panel_rect)
     var row_h = OUTLINER_ROW_H
-    var row_gap = Float32(1.0)
-    var stride = row_h + row_gap
-    var root_extra_gap = Float32(4.0)
+    var row_gap = OUTLINER_ROW_GAP
+    var stride = OUTLINER_ROW_STRIDE
+    var root_extra_gap = OUTLINER_ROOT_EXTRA_GAP
+    var windowed = total_rows >= 0
     var filter_l = _ascii_lower_panel(String(state.search_query.strip()))
-    var has_filter = filter_l.byte_length() > 0
+    var has_filter = filter_l.byte_length() > 0 and not windowed
 
-    # Collect filtered row indices
+    # Collect filtered row indices (windowed callers have already filtered)
     var vis_indices = List[Int](capacity=len(rows))
     for i in range(len(rows)):
-        if (not has_filter) or _ascii_lower_panel(rows[i].name).find(filter_l) >= 0:
+        if (not has_filter) or ascii_contains_ci(rows[i].name, filter_l):
             vis_indices.append(i)
+    var n_list = total_rows if windowed else len(vis_indices)
+    var first_vi = max(0, row_base) if windowed else 0
 
-    var tree_open = state.world_root_open or has_filter
-    var total_rows = 1 + (len(vis_indices) if tree_open else 0)
-    var content_h = Float32(total_rows) * stride + root_extra_gap + Float32(10.0)
+    var query_active = filter_l.byte_length() > 0
+    var tree_open = state.world_root_open or query_active
+    var n_shown = n_list if tree_open else 0
+    var content_h = outliner_content_h(n_shown)
     var max_scroll = max(Float32(0.0), content_h - list_rect.h)
     if (not ptr_blocked) and list_rect.contains(ui.mouse_x, ui.mouse_y) and ui.mouse_wheel != Float32(0.0):
         state.scroll_y = max(Float32(0.0), min(max_scroll, state.scroll_y - ui.mouse_wheel * Float32(36.0)))
     var tree_id = ui.widget_id("outliner_v2_world_root")
     ui._register_focusable(tree_id, allow_auto_focus=False)
     var tree_focused = not blocked and ui.focused_id == tree_id
-    if search_foc and ui.key_enter_pressed and has_filter and len(vis_indices) > 0:
+    if search_foc and ui.key_enter_pressed and query_active and len(vis_indices) > 0 and first_vi == 0:
         var first_entity_id = rows[vis_indices[0]].entity_id
         act.select_entity_id = first_entity_id
         state.keyboard_entity_id = first_entity_id
@@ -1549,7 +1627,8 @@ def draw_outliner_panel_v2(
         ui._set_focused(tree_id)
         ui._focused_text_id = 0
     if tree_focused and (ui.key_up_pressed or ui.key_down_pressed or ui.key_home_pressed or ui.key_end_pressed):
-        # One Tab stop for the tree; arrow keys traverse all rows, including offscreen rows.
+        # One Tab stop for the tree; arrow keys traverse all rows, including offscreen rows
+        # (windowed mode: every row in the window, which keeps slack rows beyond the viewport).
         var current = -1
         for vi in range(len(vis_indices)):
             if rows[vis_indices[vi]].entity_id == state.keyboard_entity_id:
@@ -1563,12 +1642,16 @@ def draw_outliner_panel_v2(
         if target >= 0:
             act.select_entity_id = state.keyboard_entity_id
             act.select_range = ui.key_shift
-        var offset = Float32(target + 1) * stride + root_extra_gap + Float32(4.0)
+        var g_target = first_vi + target if target >= 0 else -1
+        var offset = Float32(g_target + 1) * stride + root_extra_gap + Float32(4.0)
         state.scroll_y = min(state.scroll_y, offset)
         state.scroll_y = max(state.scroll_y, offset + row_h - list_rect.h)
     state.scroll_y = max(Float32(0.0), min(max_scroll, state.scroll_y))
+    # Rows scrolled partly under the header strip stay hit-testable only inside the list area,
+    # so they never take clicks meant for the search box above.
+    var in_list = list_rect.contains(ui.mouse_x, ui.mouse_y)
 
-    ui.draw_list.push_clip(Int(list_rect.x), Int(list_rect.y), Int(list_rect.right()), Int(list_rect.bottom()))
+    ui.draw_list.push_clip_f(list_rect.x, list_rect.y, list_rect.right(), list_rect.bottom())
 
     var sb_reserve = Float32(9.0) if max_scroll > Float32(0.5) else Float32(0.0)
     var row_x = list_rect.x + Float32(6.0)
@@ -1579,7 +1662,7 @@ def draw_outliner_panel_v2(
     var root_r = RectF(row_x, cur_y, row_w, row_h)
     if root_r.bottom() >= list_rect.y and root_r.y <= list_rect.bottom():
         var root_wid = tree_id
-        var root_hov = (not ptr_blocked) and list_rect.contains(ui.mouse_x, ui.mouse_y) and root_r.contains(ui.mouse_x, ui.mouse_y)
+        var root_hov = (not ptr_blocked) and in_list and root_r.contains(ui.mouse_x, ui.mouse_y)
         var root_bg = theme.l2_card if root_hov else rgba8_scale_alpha(theme.l2_card, Float32(0.72))
         var root_brd = theme.border_control if root_hov else theme.border_subtle
         ui.draw_list.add_card_surface(root_r.x, root_r.y, root_r.w, root_r.h, root_bg, root_brd, RADIUS_SM, 1.0, True, False)
@@ -1589,12 +1672,12 @@ def draw_outliner_panel_v2(
             if ui.mouse_pressed_l:
                 ui._set_focused(tree_id)
                 state.keyboard_entity_id = -1
-                if not has_filter:
+                if not query_active:
                     state.world_root_open = not state.world_root_open
         if tree_focused and state.keyboard_entity_id < 0:
             if ui.show_focus_ring(tree_id):
                 ui.draw_list.add_rect(root_r.x, root_r.y, root_r.w, root_r.h, 0, RADIUS_SM, 2.0, theme.focus_ring)
-            if not has_filter:
+            if not query_active:
                 if ui.key_enter_pressed or ui.key_space_pressed or ui.pad_confirm:
                     state.world_root_open = not state.world_root_open
                 elif ui.key_left_pressed or ui.key_right_pressed:
@@ -1608,7 +1691,7 @@ def draw_outliner_panel_v2(
         draw_studio_icon(ui.draw_list, ICON_GRID, root_r.x + Float32(21.0), root_r.center_y() - Float32(6.5), Float32(13.0), theme.accent_primary, Float32(1.35))
 
         # Mono count pill badge on right edge
-        var count = String(len(vis_indices)) + "/" + String(total_entity_count) if has_filter else String(total_entity_count)
+        var count = String(n_list) + "/" + String(total_entity_count) if query_active else String(total_entity_count)
         var count_tw = ui._measure_text_styled(count, theme.font_mono, UI_FONT_MONO)
         var pill_w = max(Float32(20.0), count_tw + Float32(10.0))
         var pill_h = Float32(16.0)
@@ -1623,7 +1706,7 @@ def draw_outliner_panel_v2(
     state.hovered_entity_id = -1
 
     # Entity rows (strict O(visible) culling; zero idle spring dict allocations!)
-    if has_filter and len(vis_indices) == 0:
+    if query_active and n_list == 0:
         ui.draw_text_in_rect(
             RectF(row_x + Float32(8.0), cur_y, max(Float32(40.0), row_w - Float32(16.0)), Float32(24.0)),
             "No matching entities",
@@ -1638,8 +1721,11 @@ def draw_outliner_panel_v2(
     if tree_open:
         var indent_step = Float32(13.0)
         var n_vis = len(vis_indices)
-        for vi in range(n_vis):
-            var row = rows[vis_indices[vi]].copy()
+        if windowed:
+            ui.culled_items_this_frame += max(0, n_list - n_vis)
+        for li in range(n_vis):
+            var vi = first_vi + li
+            ref row = rows[vis_indices[li]]
             var ry = cur_y + Float32(vi) * stride
             if ry + row_h < list_rect.y or ry > list_rect.bottom():
                 ui.culled_items_this_frame += 1
@@ -1647,7 +1733,7 @@ def draw_outliner_panel_v2(
 
             var rr = RectF(row_x, ry, row_w, row_h)
             var rwid = ui.widget_id("outliner_row_" + String(row.entity_id))
-            var hov = (not ptr_blocked) and list_rect.contains(ui.mouse_x, ui.mouse_y) and rr.contains(ui.mouse_x, ui.mouse_y)
+            var hov = (not ptr_blocked) and in_list and rr.contains(ui.mouse_x, ui.mouse_y)
             if hov:
                 state.hovered_entity_id = row.entity_id
                 ui.hovered_id = rwid
@@ -1664,7 +1750,7 @@ def draw_outliner_panel_v2(
             if tree_focused and state.keyboard_entity_id == row.entity_id:
                 if ui.show_focus_ring(tree_id):
                     ui.draw_list.add_rect(rr.x, rr.y, rr.w, rr.h, 0, RADIUS_SM, 2.0, theme.focus_ring)
-                if row.has_children and not has_filter and ((ui.key_left_pressed and row.is_expanded) or (ui.key_right_pressed and not row.is_expanded)):
+                if row.has_children and not query_active and ((ui.key_left_pressed and row.is_expanded) or (ui.key_right_pressed and not row.is_expanded)):
                     act.toggle_expand_entity_id = row.entity_id
                 elif ui.key_enter_pressed or ui.key_space_pressed or ui.pad_confirm:
                     act.select_entity_id = row.entity_id
@@ -1674,7 +1760,7 @@ def draw_outliner_panel_v2(
             # Continuous depth >= 1 tree guide hairlines + crisp horizontal L-tick
             var base_indent_x = rr.x + Float32(8.0)
             var shown_depth = min(row.depth, max(0, Int((row_w - Float32(96.0)) / indent_step)))
-            var next_depth = rows[vis_indices[vi + 1]].depth if (vi + 1 < n_vis) else -1
+            var next_depth = rows[vis_indices[li + 1]].depth if (li + 1 < n_vis) else -1
             for d in range(shown_depth):
                 var gx = base_indent_x + Float32(d) * indent_step + Float32(7.0)
                 var is_last_at_d = (d == shown_depth - 1) and (next_depth <= d)
@@ -1685,7 +1771,7 @@ def draw_outliner_panel_v2(
 
             var ix = base_indent_x + Float32(shown_depth) * indent_step
             var clicked_sub = False
-            if row.has_children and not has_filter:
+            if row.has_children and not query_active:
                 var chev_r = RectF(ix, rr.y, Float32(15.0), rr.h)
                 var chev_hov = hov and chev_r.contains(ui.mouse_x, ui.mouse_y)
                 if chev_hov and ui.mouse_pressed_l:
@@ -1774,7 +1860,7 @@ def draw_outliner_panel_v2(
                 badge_edge = bcx - Float32(10.0)
 
             # Collapsed parent `+N` child-count pill badge
-            if row.has_children and (not row.is_expanded) and (not has_filter):
+            if row.has_children and (not row.is_expanded) and (not query_active):
                 var c_txt = ("+" + String(row.child_count)) if row.child_count > 0 else String("···")
                 var c_tw = ui._measure_text_styled(c_txt, Float32(10.0), UI_FONT_MONO)
                 var c_w = max(Float32(18.0), c_tw + Float32(8.0))
@@ -1906,8 +1992,8 @@ def draw_inspector_panel_v2(
     if panel_rect.w < Float32(80.0) or panel_rect.h < Float32(60.0):
         return act^
 
-    ui.set_studio_theme(theme.copy())
-    ui.draw_list.push_clip(Int(panel_rect.x), Int(panel_rect.y), Int(panel_rect.right()), Int(panel_rect.bottom()))
+    ui.set_studio_theme(theme)
+    ui.draw_list.push_clip_f(panel_rect.x, panel_rect.y, panel_rect.right(), panel_rect.bottom())
     ui.draw_list.add_rect(panel_rect.x, panel_rect.y, panel_rect.w, panel_rect.h, theme.l1_shell)
 
     var pad = Float32(10.0)
@@ -1964,6 +2050,7 @@ def draw_inspector_panel_v2(
     var name_foc = (not blocked) and ui.focused_id == name_wid
     var edit_name = entity.name
     if name_foc:
+        ui.text_caret_rect = RectF(name_r.right() - Float32(4.0), name_r.y + Float32(2.0), Float32(2.0), Float32(18.0))
         ui._focused_text_id = name_wid
         ui._focused_text_seen = True
         ui._text_widget_ids.append(name_wid)
@@ -1971,12 +2058,13 @@ def draw_inspector_panel_v2(
             ui.focused_id = 0
             ui._focused_text_id = 0
         elif ui.key_bs_pressed and edit_name.byte_length() > 0:
-            var cps = decode_utf8(edit_name)
-            edit_name = encode_utf8(cps, 0, max(0, len(cps) - 1))
+            var next_n = utf8_drop_last_char(edit_name)
+            edit_name = next_n
             act.changed_name = True
             act.new_name = edit_name
-        elif ui.text_utf8.byte_length() > 0 and not ui.key_ctrl:
-            edit_name += ui.text_utf8
+        elif (ui.text_utf8.byte_length() > 0 or ui.ime_commit.byte_length() > 0) and not ui.key_ctrl:
+            edit_name += ui.text_utf8 + ui.ime_commit
+            ui.ime_commit = ""
             act.changed_name = True
             act.new_name = edit_name
     if name_foc or name_hov:
@@ -2328,8 +2416,8 @@ def draw_asset_browser_panel_v2(
     _ = mounted_packs
     _ = mcp_clients
 
-    ui.set_studio_theme(theme.copy())
-    ui.draw_list.push_clip(Int(panel_rect.x), Int(panel_rect.y), Int(panel_rect.right()), Int(panel_rect.bottom()))
+    ui.set_studio_theme(theme)
+    ui.draw_list.push_clip_f(panel_rect.x, panel_rect.y, panel_rect.right(), panel_rect.bottom())
     ui.draw_list.add_rect(panel_rect.x, panel_rect.y, panel_rect.w, panel_rect.h, theme.l1_shell)
 
     var blocked = ui._blocked_by_modal()
@@ -2496,7 +2584,7 @@ def draw_asset_browser_panel_v2(
             state.scroll_y = max(Float32(0.0), min(max_scroll, state.scroll_y - ui.mouse_wheel * Float32(36.0)))
         state.scroll_y = max(Float32(0.0), min(max_scroll, state.scroll_y))
 
-        ui.draw_list.push_clip(Int(content_area.x), Int(content_area.y), Int(content_area.right()), Int(content_area.bottom()))
+        ui.draw_list.push_clip_f(content_area.x, content_area.y, content_area.right(), content_area.bottom())
         for idx in range(len(filtered)):
             var r_idx = idx // cols
             var c_idx = idx % cols

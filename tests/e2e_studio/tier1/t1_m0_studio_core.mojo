@@ -1542,6 +1542,10 @@ def run_pending_m3_m0_runtime_checks(mut runner: StudioSuiteRunner, tmp: String)
         sc_inp.begin_frame()
         sc_inp.set_mouse(0, False)
         studio_sc.render_editor_frame(1600, 900, input=sc_inp)
+        # The toolbar's Import / Create buttons open a modal that would swallow the later card clicks.
+        studio_sc.asset_browser_state.dialog = 0
+        sc_inp.begin_frame()
+        studio_sc.render_editor_frame(1600, 900, input=sc_inp)
     var spawned_empty = False
     var spawned_cube = False
     var spawned_point_light = False

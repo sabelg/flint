@@ -2,7 +2,7 @@
 
 **Goal:** a person can make a complete game in Flint Studio and ship it, without leaving Studio and without writing scene-setup code. That means importing art, placing a level, writing and hot-reloading gameplay, playtesting in the editor, and packaging a build.
 
-**Source:** an expert review of Studio on `main` (`7f64fbb`), written 2026-11-21. Five reviewers took part: an editor UX lead, a gameplay programmer, a technical artist and animator, a level designer who also covered UI and audio, and a build/release engineer. Code references are approximate (`~`) because the files change often.
+**Source:** an expert review of Studio on `main` (`7f64fbb`), written 2026-11-21; checkboxes last updated 2026-11-26 on `studio-redesign`. Five reviewers took part: an editor UX lead, a gameplay programmer, a technical artist and animator, a level designer who also covered UI and audio, and a build/release engineer. Code references are approximate (`~`) because the files change often.
 
 ---
 
@@ -13,7 +13,7 @@
 **What works today:**
 - **Editor core:** undo/redo that merges rapid edits and keeps up to 512 steps or 64 MB; GPU picking without stalling the frame; move/rotate/scale gizmos that work on multi-selections and snap to grid and angle; a hierarchy you can reparent by drag-and-drop.
 - **Scene files and play-in-editor:** deterministic `.flscn` JSON and LZ4 `.flscnb` scenes. Play-in-editor (PIE) saves the world when you press play and restores it on stop, checked with an fnv64 hash.
-- **Automation:** the MCP v2 server with 14 tools (`devtools/mcp_v2.mojo`).
+- **Automation:** the MCP v2 server with 31 tools (`devtools/mcp_v2.mojo`; count the `{"name":...}` entries in its `tools/list` reply).
 - **Engine runtimes** (not yet exposed in Studio):
   - **Assets and rendering:** GLB loading with skins, morph targets and animation (`assets/glb_native.mojo`); GPU skinning; a one-call model uploader (`render/aaa_renderer.mojo:~4114`).
   - **Animation:** animation graphs (`anim/graph.mojo`), sockets, ragdolls, and the MotionBricks inbetweening runtime.
@@ -76,9 +76,12 @@ Each milestone ends with an acceptance test played on a **test-harness game**: a
 ### M0: Studio as a safe daily tool (1–2 weeks)
 
 **Editor safety**
-- [ ] Esc no longer quits Studio. Add an unsaved-changes guard on quit and a "*" marker for unsaved changes.
-- [ ] Turn off editor hotkeys during PIE (use a play-mode input context).
-- [ ] Save and restore the dock layout with the existing `DockSpace.save_json` / `load_json`.
+- [x] Esc no longer quits Studio. Add an unsaved-changes guard on quit and a "*" marker for unsaved changes.
+  Done: `request_quit` opens the unsaved-changes modal ([`studio_app.mojo:~4729`](../src/flint/studio/studio_app.mojo)) and `mark_dirty` adds the " *" title marker ([`studio_app.mojo:~3474-3479`](../src/flint/studio/studio_app.mojo)); covered by `test_m3b_f11_input_context_hotkeys_dirty_modal_and_layout` ([`tests/test_studio_core_bugs.mojo:~2197`](../tests/test_studio_core_bugs.mojo)).
+- [x] Turn off editor hotkeys during PIE (use a play-mode input context).
+  Done: the `StudioPlay` input context blocks the editor's bindings, and Esc in PIE only releases the pointer (`pie_release_cursor`, [`studio_app.mojo:~1882`](../src/flint/studio/studio_app.mojo)); covered in [`tests/test_studio_core_bugs.mojo:~4621`](../tests/test_studio_core_bugs.mojo).
+- [x] Save and restore the dock layout with the existing `DockSpace.save_json` / `load_json`.
+  Done: `_load_studio_dockspace` / `_save_studio_dockspace` ([`studio_app.mojo:~1703-1738`](../src/flint/studio/studio_app.mojo)); JSON validation covered by `test_m3a_dockspace_json_validation_and_env_spotlight_tier0` ([`tests/test_studio_core_bugs.mojo:~2084`](../tests/test_studio_core_bugs.mojo)).
 - [ ] Add F to frame the selection, Ctrl+Shift+Z for redo, Ctrl+C/V built on duplicate, and a local/world gizmo toggle.
 
 **Inspector**
@@ -138,7 +141,8 @@ Gameplay code is written in TurboMojo (`tmide`, opened in Studio with F8). This 
 ### M3: It ships (about 2 weeks)
 - [ ] Studio runs from the project directory; scenes live in `<project>/scenes/`.
 - [ ] The `new` scaffold loads `assets/main.flscn` and pins the engine commit; `flint_version` is enforced.
-- [ ] Add a Build → Package menu item using the profile picker, and MCP tools `scene.save`, `scene.load` and `project.package`.
+- [x] MCP tools `scene.save`, `scene.load` and `project.package` ([`mcp_v2.mojo:~2703, ~2731, ~3407`](../src/flint/devtools/mcp_v2.mojo)); covered by [`tests/test_flint_v5_assets_studio_mcp.mojo:~4146`](../tests/test_flint_v5_assets_studio_mcp.mojo) and [`tests/e2e_studio/tier1/t1_m3_shipping_vfs.sh`](../tests/e2e_studio/tier1/t1_m3_shipping_vfs.sh) (case 4).
+- [ ] Add a Build → Package menu item using the profile picker.
 - [ ] `package` uses the incremental cooker with a cache directory.
 - [ ] Every schema has a version and migration hooks; unknown components load as opaque blobs.
 - [ ] Add a game-content test harness: headless golden-image and input-replay checks run from `run.sh`.

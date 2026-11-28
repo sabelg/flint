@@ -2437,7 +2437,7 @@ def test_inspector_sections_and_frame_selection() raises:
     input.begin_frame()
     input.set_mouse(0, False)
     studio.render_editor_frame(1280, 720, input=input)
-    var position = studio.ui_ctx.cached_rects[hash_ui_id(scroll, "prow:Position")]
+    var position = studio.ui_ctx.cached_rects[hash_ui_id(scroll, "prow:tr_pos")]
     assert_true(position.h > 24)
     var z_x = (position.right() - 12) * ui_scale
     var z_y = (position.bottom() - 10) * ui_scale

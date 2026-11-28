@@ -853,7 +853,10 @@ def test_mcp_v2_hooks_gate_and_new_tools() raises:
     cleanup.append("--")
     cleanup.append(project)
     assert_equal(run_process_redirected(cleanup), 0)
-    assert_true(built.find('"compiled":true') >= 0 and built.find('"reloaded":true') >= 0, built)
+    # MCP v2 returns the tool result as JSON text inside `content`, so its quotes arrive escaped.
+    var compiled = built.find('"compiled":true') >= 0 or built.find('\\"compiled\\":true') >= 0
+    var reloaded = built.find('"reloaded":true') >= 0 or built.find('\\"reloaded\\":true') >= 0
+    assert_true(compiled and reloaded, built)
 
     assets.close()
     studio.shutdown()

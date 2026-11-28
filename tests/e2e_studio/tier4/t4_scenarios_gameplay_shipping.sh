@@ -343,7 +343,7 @@ def main() raises:
         raise Error("Scenario 3 schema/api_v2 assertions failed")
 MOJO
     local compile_log="${TMPD}/s3_probe.compile.log"
-    if ! "$MOJO_BIN" build -I "${ROOT}/src" -I "${ROOT}/tests" -O3 --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >"$compile_log" 2>&1; then
+    if ! "$MOJO_BIN" build -I "${ROOT}/src" -I "${ROOT}/tests" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$probe_src" -o "$probe_bin" >"$compile_log" 2>&1; then
         local c_err
         c_err="$(tail -n 6 "$compile_log" | tr '\n' ' ')"
         fail_test "t4_s3_gameplay_so_hot_reload_kcc_bt_nav_audio_hud_shift_f1" "M2 contract pending (s3_probe compile failed): ${c_err}"
@@ -497,7 +497,7 @@ def main() raises:
     if not res[0]:
         raise Error("golden FLIP mismatch: " + res[1])
 MOJO
-            if "$MOJO_BIN" build -I "${ROOT}/src" -I "${ROOT}/tests" -O3 --fp-mode contract=off --Werror "$flip_src" -o "$flip_bin" >/dev/null 2>&1; then
+            if "$MOJO_BIN" build -I "${ROOT}/src" -I "${ROOT}/tests" "${E2E_MOJO_OPT:--O3}" --fp-mode contract=off --Werror "$flip_src" -o "$flip_bin" >/dev/null 2>&1; then
                 if "$flip_bin" "$shot_out" "$golden_ref" >/dev/null 2>&1; then
                     golden_ok=1
                 fi

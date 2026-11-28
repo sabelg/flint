@@ -196,26 +196,30 @@ struct ToastManager(Copyable, Movable):
         )
         var should_hold = self.typing_active and (not own_job) and (sev != TOAST_ERROR)
 
-        # Deduplicate against identical recent toast within the dedup window
+        # Deduplicate against an identical recent toast within the dedup window. A refresh changes
+        # `created_sec`, so `items` is not time-ordered: scan every item (the list is small) instead of
+        # stopping at the first old one, and move the refreshed toast to the end so it shows as newest.
         var i = len(self.items) - 1
         while i >= 0:
             ref existing = self.items[i]
-            if (self.clock_sec - existing.created_sec) > TOAST_DEDUP_WINDOW_SEC:
-                break
             if (
-                existing.severity == sev
+                (self.clock_sec - existing.created_sec) <= TOAST_DEDUP_WINDOW_SEC
+                and existing.severity == sev
                 and existing.title == title
                 and existing.message == message
             ):
-                self.items[i].created_sec = self.clock_sec
-                self.items[i].shown_at_sec = self.clock_sec
-                self.items[i].ttl_sec = resolved_ttl
-                self.items[i].remaining_sec = resolved_ttl
-                self.items[i].repeat_count += 1
-                self.items[i].visible = True
-                self.items[i].own_job = self.items[i].own_job or own_job
-                self.items[i].held = should_hold and (not self.items[i].own_job)
-                return self.items[i].id
+                var it = self.items.pop(i)
+                it.created_sec = self.clock_sec
+                it.shown_at_sec = self.clock_sec
+                it.ttl_sec = resolved_ttl
+                it.remaining_sec = resolved_ttl
+                it.repeat_count += 1
+                it.visible = True
+                it.own_job = it.own_job or own_job
+                it.held = should_hold and (not it.own_job)
+                var rid = it.id
+                self.items.append(it^)
+                return rid
             i -= 1
 
         var tid = self.next_id

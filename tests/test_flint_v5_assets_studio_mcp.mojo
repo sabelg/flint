@@ -90,6 +90,7 @@ from flint.core.math import Quat, Vec2, Vec3
 from flint.core.serial import BlobReader, BlobWriter
 from flint.core.transform import Mat4
 from flint.devtools.mcp_v2 import (
+    MCP_GATE_AUTO,
     FlintMcpUnixListener,
     McpServerV2,
     McpUnixSessionClient,
@@ -106,7 +107,7 @@ from flint.physics.world import (
 )
 from flint.physics.plugin import ColliderComponent, RigidBodyComponent
 from flint.platform.input import InputState
-from flint.platform.os import file_size, get_time, is_directory, make_dirs, read_bytes, remove_file, write_bytes
+from flint.platform.os import env_flag, file_size, get_time, is_directory, make_dirs, read_bytes, remove_file, write_bytes
 from flint.platform.vulkan import LAYOUT_SHADER_READ_ONLY, LAYOUT_UNDEFINED, VulkanGpu
 from flint.procedural import (
     ENFORCER_BONE_COUNT,
@@ -211,6 +212,15 @@ from flint.ui.draw_list import UiDrawList
 def _assert(cond: Bool, msg: String) raises:
     if not cond:
         raise Error("ASSERTION FAILED: " + msg)
+
+
+def _gpu_skip(what: String) raises:
+    """Report a GPU-only block that did not run. Silent skips hid broken GPU picking, so the
+    skip is printed, and `FLINT_REQUIRE_GPU=1` (set by the gate when a Vulkan device exists)
+    turns it into a failure."""
+    if env_flag("FLINT_REQUIRE_GPU"):
+        raise Error("ASSERTION FAILED: FLINT_REQUIRE_GPU=1 but GPU test did not run: " + what)
+    print("  [SKIP] no Vulkan device: " + what)
 
 
 def _str_bytes(s: String) -> List[UInt8]:
@@ -888,6 +898,8 @@ def test_c_visbuffer_picking() raises:
 
         async_picker.shutdown(ren)
         ren.shutdown()
+    else:
+        _gpu_skip("headless FlintAaaVulkanRenderer 1-pixel VisBuffer pick + async picker (ren.active is False)")
 
     # Bug 1 regression: Studio E2E instance-to-entity filtering (mesh_id=-1 / OOB), 1-arg vs explicit overload, and delete-all empty-map check
     var st_pick = FlintStudioState(headless=True, render_tier=RENDER_TIER_2_AAA_VISBUFFER_RT, width=320, height=240)
@@ -1038,6 +1050,8 @@ def test_c_visbuffer_picking() raises:
         )
 
         st_picker.shutdown(st_gpu)
+    else:
+        _gpu_skip("Studio tier-2 VisBuffer pick entity filtering (ScalableRenderer.uses_vulkan() is False)")
     st_pick.shutdown()
 
     # Tier-0 / software fallback picking through VisBufferGpuPicker unified queue
@@ -1347,7 +1361,12 @@ def _large_mcp_worker(ctx_addr: Int, job_idx: Int):
             var small_buf = Array[Int32, 1](fill=16384)
             _ = external_call["setsockopt", Int32](Int32(cli.fd), Int32(1), Int32(7), Pointer(to=small_buf[0]), UInt32(4))
             ctx.ready.store(1)
-            if cli.send_raw_request(ctx.req_payload, timeout_ms=4000):
+            # Socket clients must `initialize` before any tool call.
+            var init_ok = cli.send_raw_request(
+                '{"jsonrpc":"2.0","id":998,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"big-xfer"}}}',
+                timeout_ms=4000,
+            ) and cli.recv_response_blocking(timeout_ms=4000)[0]
+            if init_ok and cli.send_raw_request(ctx.req_payload, timeout_ms=4000):
                 var got = cli.recv_response_blocking(timeout_ms=4000)
                 ctx.resp_ok = got[0]
                 ctx.resp_text = got[1]
@@ -1374,11 +1393,11 @@ def test_f_mcp_v2_end_to_end(tmp_root: String, mut pool: JobPool) raises:
 
     # 1. initialize
     var r_init = mcp.handle_jsonrpc(
-        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"flint-test-agent"}}}',
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"flint-test-agent"}}}',
         studio, assets, pool,
     )
     var d_init = parse_json(_str_bytes(r_init))
-    _assert(d_init.valid and d_init.text(d_init.object_get(d_init.object_get(d_init.root, "result"), "protocolVersion")) == "2024-11-05", "MCP initialize failed")
+    _assert(d_init.valid and d_init.text(d_init.object_get(d_init.object_get(d_init.root, "result"), "protocolVersion")) == "2025-06-18", "MCP initialize failed (2025-06-18 negotiates structuredContent)")
 
     # Notification (no id) -> empty response
     var r_notif = mcp.handle_jsonrpc('{"jsonrpc":"2.0","method":"notifications/initialized"}', studio, assets, pool)
@@ -1620,11 +1639,11 @@ def test_f_mcp_v2_end_to_end(tmp_root: String, mut pool: JobPool) raises:
     # 9. Verify `auth_token` enforcement on `McpServerV2`
     var auth_mcp = McpServerV2(workspace_root=tmp_root, auth_token="flint-secret-token-42")
     var r_unauth = auth_mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":20,"method":"tools/list","params":{}}', studio, assets, pool)
-    _assert(r_unauth.find("-32600") >= 0, "unauthenticated tools/list must fail with -32600")
+    _assert(r_unauth.find("-32001") >= 0, "unauthenticated tools/list must fail with -32001 (unauthorized)")
     var r_bad_tok = auth_mcp.handle_jsonrpc(
         '{"jsonrpc":"2.0","id":21,"method":"initialize","params":{"auth_token":"wrong-token"}}', studio, assets, pool
     )
-    _assert(r_bad_tok.find("-32600") >= 0, "wrong auth_token initialize must fail with -32600")
+    _assert(r_bad_tok.find("-32001") >= 0, "wrong auth_token initialize must fail with -32001 (unauthorized)")
     var r_good_tok = auth_mcp.handle_jsonrpc(
         '{"jsonrpc":"2.0","id":22,"method":"initialize","params":{"auth_token":"flint-secret-token-42"}}', studio, assets, pool
     )
@@ -1680,6 +1699,25 @@ def test_f_mcp_v2_end_to_end(tmp_root: String, mut pool: JobPool) raises:
     var got1 = client.recv_response_blocking(timeout_ms=500)
     _assert(got1[0] and got1[1].find('"id":101') >= 0, "Unix socket Content-Length ping round-trip failed")
 
+    # Before `initialize` a socket client may only ping: tool calls are refused with -32002.
+    _assert(
+        client.send_raw_request('{"jsonrpc":"2.0","id":1011,"method":"tools/call","params":{"name":"ecs.query_entities","arguments":{}}}'),
+        "send pre-init tools/call failed",
+    )
+    _ = listener.poll_once(mcp, studio, assets, pool)
+    var got_pre = client.recv_response_blocking(timeout_ms=500)
+    _assert(got_pre[0] and got_pre[1].find("-32002") >= 0, "pre-initialize tools/call must be refused with -32002: " + got_pre[1])
+    _assert(
+        client.send_raw_request('{"jsonrpc":"2.0","id":1012,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"sock-test"}}}'),
+        "send socket initialize failed",
+    )
+    _ = listener.poll_once(mcp, studio, assets, pool)
+    var got_init = client.recv_response_blocking(timeout_ms=500)
+    _assert(
+        got_init[0] and got_init[1].find('"protocolVersion":"2025-06-18"') >= 0 and got_init[1].find('"listChanged":false') >= 0,
+        "socket initialize must negotiate 2025-06-18 and advertise listChanged:false: " + got_init[1],
+    )
+
     _assert(
         client.send_raw_request('{"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"ecs.query_entities","arguments":{}}}'),
         "send 2nd request on persistent Unix socket failed",
@@ -1702,6 +1740,8 @@ def test_f_mcp_v2_end_to_end(tmp_root: String, mut pool: JobPool) raises:
     var small_srv_buf = Array[Int32, 1](fill=16384)
     _ = external_call["setsockopt", Int32](Int32(listener.listen_fd), Int32(1), Int32(7), Pointer(to=small_srv_buf[0]), UInt32(4))
 
+    # Socket clients start gated (`MCP_GATE_MUTATING`); this transfer test opts every client into AUTO.
+    mcp.set_gate_mode(MCP_GATE_AUTO)
     # Spawn a 2-way parallel test: job 0 = client send/recv (>300 KiB), job 1 = server poll loop!
     _run_large_mcp_pair(pool, listener, mcp, studio, assets, xfer_ctx)
     _assert(xfer_ctx.resp_ok, "> 256 KiB EAGAIN-safe JSON-RPC round-trip failed")
@@ -3366,9 +3406,9 @@ def test_j_studio_v5_unification_ux_and_headless_smoke(tmp_root: String) raises:
 
     # Bulk duplicate & bulk delete + Undo
     var dup_ids = st.duplicate_selected(record_undo=True)
-    _assert(len(dup_ids) == 2 and st.live_entity_count() == 5, "duplicate_selected failed")
-    _assert(st.despawn_selected(record_undo=True) == 2 and st.live_entity_count() == 3, "despawn_selected failed")
-    _assert(st.undo() and st.live_entity_count() == 5 and st.undo() and st.state_hash() == h_post_bulk, "undo bulk delete/dup mismatch")
+    _assert(len(dup_ids) == 2 and st.live_entity_count() == 6, "duplicate_selected failed (p subtree + d: 3 new entities)")
+    _assert(st.despawn_selected(record_undo=True) == 2 and st.live_entity_count() == 4, "despawn_selected failed (the duplicated child is reparented up, not deleted)")
+    _assert(st.undo() and st.live_entity_count() == 6 and st.undo() and st.state_hash() == h_post_bulk, "undo bulk delete/dup mismatch")
 
     # Simulated UI Hierarchy & Multi-Select click interaction (`emit_studio_ui_draw_list`)
     var ui_dl = UiDrawList()
@@ -4130,6 +4170,7 @@ def test_o_mcp_v2_m0_scene_and_transform_tools(tmp_root: String, mut pool: JobPo
     var studio = FlintStudioState(headless=True, render_tier=RENDER_TIER_0_HEADLESS_SIMD, width=160, height=120)
     var assets = AssetServer(enable_watcher=False)
     var mcp = McpServerV2(workspace_root=proj)
+    _ = mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}', studio, assets, pool)  # 2025-06-18: tool results carry structuredContent
 
     var r_list = mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}', studio, assets, pool)
     _assert(r_list.find('"scene.save"') >= 0, "tools/list missing scene.save")
@@ -4154,7 +4195,10 @@ def test_o_mcp_v2_m0_scene_and_transform_tools(tmp_root: String, mut pool: JobPo
         '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"scene.set_entity_enabled","arguments":{"entity_id":0,"enabled":false}}}',
         studio, assets, pool,
     )
-    _assert(r_dis.find('\\"ok\\":true') >= 0 and not studio.entities[0].visible, "scene.set_entity_enabled false failed")
+    _assert(
+        r_dis.find('\\"ok\\":true') >= 0 and not studio.entities[0].enabled and studio.entities[0].visible,
+        "scene.set_entity_enabled false must clear Enabled and leave Visible alone: " + r_dis,
+    )
 
     var r_qv = mcp.handle_jsonrpc(
         '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ecs.query_entities","arguments":{"visible_only":true}}}',
@@ -4163,9 +4207,9 @@ def test_o_mcp_v2_m0_scene_and_transform_tools(tmp_root: String, mut pool: JobPo
     _assert(r_qv.find('\\"count\\":0') >= 0, "visible_only query should exclude disabled entity: " + r_qv)
 
     _ = studio.undo()
-    _assert(studio.entities[0].visible, "undo did not re-enable entity")
+    _assert(studio.entities[0].enabled, "undo did not re-enable entity")
     _ = studio.redo()
-    _assert(not studio.entities[0].visible, "redo did not re-disable entity")
+    _assert(not studio.entities[0].enabled and studio.entities[0].visible, "redo did not re-disable entity")
 
     var r_sv = mcp.handle_jsonrpc(
         '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"scene.save","arguments":{"path":"scenes/m0_unit.flscn"}}}',
@@ -4240,6 +4284,7 @@ def test_o_mcp_v2_m0_scene_and_transform_tools(tmp_root: String, mut pool: JobPo
     var ch_rc = external_call["chdir", Int32](rel_caller.as_c_string_span())
     _assert(ch_rc == 0, "chdir to rel_caller failed")
     var rel_mcp = McpServerV2(workspace_root="../mcp_m0_rel_proj")
+    _ = rel_mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}', studio, assets, pool)  # 2025-06-18: tool results carry structuredContent
     var r_rel_sv = rel_mcp.handle_jsonrpc(
         '{"jsonrpc":"2.0","id":97,"method":"tools/call","params":{"name":"scene.save","arguments":{"path":"scenes/rel.flscn"}}}',
         studio, assets, pool,
@@ -4263,7 +4308,7 @@ def test_o_mcp_v2_m0_scene_and_transform_tools(tmp_root: String, mut pool: JobPo
         '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"scene.load","arguments":{"path":"scenes/m0_unit.flscn"}}}',
         studio, assets, pool,
     )
-    _assert(r_ld.find('\\"ok\\":true') >= 0 and studio.live_entity_count() == 1 and not studio.entities[0].visible, "scene.load failed to restore disabled entity")
+    _assert(r_ld.find('\\"ok\\":true') >= 0 and studio.live_entity_count() == 1 and not studio.entities[0].enabled and studio.entities[0].visible, "scene.load failed to restore disabled entity (Enabled off, Visible on)")
 
     assets.close()
     studio.shutdown()
@@ -4336,6 +4381,8 @@ def test_p_mcp_v2_m1_assets_prefab_material_and_upload(tmp_root: String, mut poo
         ref assets_srv = st.app.resources.get_ptr_mut[AssetServer]().value()[unsafe_offset=0]
         return s_mcp.handle_jsonrpc(req, st, assets_srv, pl)
 
+    _ = _call_mcp(mcp, studio, pool, '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}')  # 2025-06-18: tool results carry structuredContent
+
     # 1. tools/list has all 22 tools including the 4 new M1 tools
     var r_tl = _call_mcp(mcp, studio, pool, '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
     _assert(r_tl.find('"asset.import"') >= 0, "tools/list missing asset.import")
@@ -4348,6 +4395,22 @@ def test_p_mcp_v2_m1_assets_prefab_material_and_upload(tmp_root: String, mut poo
         mcp, studio, pool, '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"asset.list","arguments":{}}}'
     )
     _assert(r_empty.find('\\"count\\":0') >= 0, "empty project asset.list must return count=0: " + r_empty)
+
+    # 2b. A source outside the workspace is refused until its directory is on the import allow-list.
+    var r_not_allowed = _call_mcp(
+        mcp,
+        studio,
+        pool,
+        '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"asset.import","arguments":{"source_path":"'
+        + ext
+        + '/ext_crate.glb","dest_path":"assets/models/ext_crate.glb"}}}',
+    )
+    _assert(
+        r_not_allowed.find('"isError":true') >= 0 and r_not_allowed.find("allow-list") >= 0
+        and file_size(proj + "/assets/models/ext_crate.glb") < 0,
+        "asset.import from a directory outside the workspace and allow-list must be refused: " + r_not_allowed,
+    )
+    mcp.allow_import_dir(ext)
 
     # 3. Boundary rejections: system file, traversal, corrupt payloads write ZERO bytes to disk
     var r_sys = _call_mcp(
@@ -4596,6 +4659,7 @@ def test_p_mcp_v2_m1_assets_prefab_material_and_upload(tmp_root: String, mut poo
         project_root=proj_g1,
     )
     var mcp_g1 = McpServerV2(workspace_root=proj_g1)
+    _ = _call_mcp(mcp_g1, s1, pool, '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}')  # 2025-06-18: tool results carry structuredContent
     populate_default_studio_scene(s1)
     _assert(
         s1.app.resources.get_ptr[ScalableRenderer]().value()[].cpu_meshes.__len__() >= 6,
@@ -4874,7 +4938,7 @@ def test_r_mcp_v2_m2_runtime_tools(tmp_root: String, mut pool: JobPool) raises:
     var mcp = McpServerV2(workspace_root=ws)
 
     _ = mcp.handle_jsonrpc(
-        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"m2-test"}}}',
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"m2-test"}}}',
         studio, assets, pool,
     )
 
@@ -5108,7 +5172,7 @@ def test_s_mcp_v2_m5b_r2_regressions(tmp_root: String, mut pool: JobPool) raises
     var assets = AssetServer(enable_watcher=False)
     var mcp = McpServerV2(workspace_root=ws)
     _ = mcp.handle_jsonrpc(
-        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"r2-test"}}}',
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"r2-test"}}}',
         studio, assets, pool,
     )
 
@@ -5425,7 +5489,7 @@ def test_t_m3_studio_menu_and_mcp_project_package(tmp_root: String, mut pool: Jo
     # 4. MCP project.package tool registration, traversal/symlink sandboxing, and valid package
     var mcp = McpServerV2(workspace_root=proj)
     _ = mcp.handle_jsonrpc(
-        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"m3-test"}}}',
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"m3-test"}}}',
         studio, assets, pool,
     )
     var r_list = mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}', studio, assets, pool)
@@ -5526,7 +5590,7 @@ def test_t_m3_studio_menu_and_mcp_project_package(tmp_root: String, mut pool: Jo
     var assets_c = AssetServer(enable_watcher=False)
     var mcp_c = McpServerV2(workspace_root=proj_custom)
     _ = mcp_c.handle_jsonrpc(
-        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"m3-custom-pak"}}}',
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"m3-custom-pak"}}}',
         studio_c, assets_c, pool,
     )
     var r_custom = mcp_c.handle_jsonrpc(
@@ -5591,6 +5655,7 @@ def test_u_mcp_pie_isolation_and_material_assign_ext(
     var assets = AssetServer(enable_watcher=False)
     assets.loose_root = ws
     var mcp = McpServerV2(ws)
+    _ = mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}', studio, assets, pool)  # 2025-06-18: tool results carry structuredContent
 
     var r_sp = mcp.handle_jsonrpc(
         '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ecs.spawn_entity","arguments":{"name":"Hero","position":[0.0,10.0,0.0],"mass":1.0}}}',

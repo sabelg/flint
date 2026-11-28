@@ -109,6 +109,13 @@ struct SdfFont(Copyable, Movable):
     var gid_extra: Dict[Int, Int]
     var dynamic_gids: List[Int]
     var baked_cp_map: Dict[Int, Int]
+    # Cached shaper (fallback chain built once, not per call). It is rebuilt by
+    # `sync_shaper` whenever `_shaper_fingerprint()` changes: the mutators call
+    # it, and code that assigns `source`/`fallbacks` directly gets the
+    # uncached path until the next sync, so shaping output never goes stale.
+    var _shaper: TextShaper
+    var _shaper_key: UInt64
+    var _shaper_epoch: UInt64
 
     def __init__(out self):
         self.valid = False
@@ -143,6 +150,9 @@ struct SdfFont(Copyable, Movable):
         self.gid_extra = Dict[Int, Int]()
         self.dynamic_gids = List[Int]()
         self.baked_cp_map = Dict[Int, Int]()
+        self._shaper = TextShaper()
+        self._shaper_key = 0
+        self._shaper_epoch = 0
 
     def load(mut self, path: String) -> Bool:
         return self.load_bytes(read_bytes(path))
@@ -262,6 +272,8 @@ struct SdfFont(Copyable, Movable):
         self.dirty_y1 = self.atlas_height
         self.atlas_version = 1
         self.valid = True
+        self._shaper_epoch += 1
+        self.sync_shaper()
         return True
 
     def load_ttf(
@@ -299,6 +311,8 @@ struct SdfFont(Copyable, Movable):
         self.source = font^
         self.has_source = True
         self._ensure_dynamic_page()
+        self._shaper_epoch += 1
+        self.sync_shaper()
         return True
 
     def load_otf(
@@ -395,6 +409,8 @@ struct SdfFont(Copyable, Movable):
         self.fallback_scales.append(mscale)
         if self.valid:
             self._ensure_dynamic_page()
+        self._shaper_epoch += 1
+        self.sync_shaper()
         return True
 
     def add_fallback_bytes(mut self, var data: List[UInt8], weight: Float32 = 0, match_ascent: Bool = False) -> Bool:
@@ -413,6 +429,55 @@ struct SdfFont(Copyable, Movable):
         self.fallback_scales.clear()
         if self.valid and self.baked_height > 0:
             self.flush()
+        self._shaper_epoch += 1
+        self.sync_shaper()
+
+    @staticmethod
+    @always_inline
+    def _mix_key(h: UInt64, v: UInt64) -> UInt64:
+        return (h ^ v) * UInt64(0x100000001B3)
+
+    def _shaper_fingerprint(self) -> UInt64:
+        """Cheap key over everything `fallback_chain()` reads. A change in any
+        of it (a new source, fallback, bake size or baked table) changes the key."""
+        var h = UInt64(0xCBF29CE484222325)
+        h = Self._mix_key(h, self._shaper_epoch)
+        h = Self._mix_key(h, UInt64(1 if self.valid else 0) | (UInt64(2) if self.has_source else UInt64(0)))
+        h = Self._mix_key(h, UInt64(self.baked_count))
+        h = Self._mix_key(h, UInt64(len(self.baked_cp_map)))
+        h = Self._mix_key(h, UInt64(len(self.kerning)))
+        h = Self._mix_key(h, UInt64(Int(self.bake_px * Float32(64.0))) if isfinite(self.bake_px) else UInt64(0))
+        if self.has_source:
+            h = Self._mix_key(h, UInt64(1 if self.source.valid else 0))
+            h = Self._mix_key(h, UInt64(len(self.source.data)))
+            h = Self._mix_key(h, UInt64(self.source.glyph_count))
+            h = Self._mix_key(h, UInt64(self.source.units_per_em))
+            for ci in range(len(self.source.coords)):
+                h = Self._mix_key(h, UInt64(Int(self.source.coords[ci] * Float32(16384.0))))
+        h = Self._mix_key(h, UInt64(len(self.fallbacks)))
+        for i in range(len(self.fallbacks)):
+            h = Self._mix_key(h, UInt64(len(self.fallbacks[i].data)))
+            h = Self._mix_key(h, UInt64(self.fallbacks[i].glyph_count))
+            var sc = self.fallback_scales[i] if i < len(self.fallback_scales) else Float32(1.0)
+            h = Self._mix_key(h, UInt64(Int(sc * Float32(65536.0))) if isfinite(sc) else UInt64(0))
+        return h if h != 0 else UInt64(1)
+
+    @always_inline
+    def shaper_current(self) -> Bool:
+        """True when the cached shaper matches the font's current source and fallbacks."""
+        return self._shaper_key != 0 and self._shaper_key == self._shaper_fingerprint()
+
+    def sync_shaper(mut self):
+        """Rebuilds the cached shaper if the source or fallbacks changed (cheap no-op otherwise)."""
+        var key = self._shaper_fingerprint()
+        if key == self._shaper_key:
+            return
+        self._shaper = TextShaper(self.fallback_chain(), "", 0)
+        self._shaper_key = key
+
+    def invalidate_shaper(mut self):
+        """Forces the next `sync_shaper` to rebuild (after editing `source`/`fallbacks` in place)."""
+        self._shaper_epoch += 1
 
     def fallback_chain(self) -> FontFallbackChain:
         var chain = FontFallbackChain()
@@ -510,6 +575,8 @@ struct SdfFont(Copyable, Movable):
         self.source = font^
         self.has_source = True
         self._ensure_dynamic_page()
+        self._shaper_epoch += 1
+        self.sync_shaper()
         return True
 
     def ensure_glyph_id(mut self, glyph_id: Int, font_index: Int = 0, code: Int = 0) -> Int:
@@ -624,6 +691,8 @@ struct SdfFont(Copyable, Movable):
     ) -> List[ShapedGlyph]:
         if not self.valid and not self.has_source and len(self.fallbacks) == 0:
             return List[ShapedGlyph]()
+        if alt_choice == 0 and self.shaper_current():
+            return self._shaper.shape_text(text, px, base_dir)
         var shaper = TextShaper(self.fallback_chain(), "", alt_choice)
         return shaper.shape_text(text, px, base_dir)
 
@@ -635,6 +704,7 @@ struct SdfFont(Copyable, Movable):
         alt_choice: Int = 0,
     ) -> List[Tuple[ShapedGlyph, Int]]:
         var out = List[Tuple[ShapedGlyph, Int]]()
+        self.sync_shaper()
         var shaped = self.shape_text(text, px, base_dir, alt_choice)
         for sg in shaped:
             var idx = self.ensure_glyph_id(sg.glyph_id, sg.font_index, sg.codepoint)

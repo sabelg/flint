@@ -128,11 +128,30 @@ def _run_sh(cmd: String, out_path: String) -> Int:
         return -1
 
 
+def _cwd() -> String:
+    var buf = List[UInt8](length=4096, fill=0)
+    var got = external_call["getcwd", Int](buf.unsafe_ptr(), 4096)
+    if got == 0:
+        return String()
+    var n = 0
+    while n < len(buf) and buf[n] != 0:
+        n += 1
+    var sl = List[UInt8](capacity=n)
+    for i in range(n):
+        sl.append(buf[i])
+    return String(unsafe_from_utf8=sl)
+
+
 def _repo_root() -> String:
-    if file_size("/home/user/flint/tools/flint.sh") > 0:
-        return "/home/user/flint"
-    if file_size("tools/flint.sh") > 0:
-        return "."
+    # The checkout under test: FLINT_ROOT when set, else the working directory
+    # (tools/flint.sh runs tests from the repo root). Never a fixed path, or a
+    # worktree run would scaffold against a different checkout's commit.
+    var env = _env_present("FLINT_ROOT")
+    if env[0] and file_size(env[1] + "/tools/flint.sh") > 0:
+        return env[1]
+    var cwd = _cwd()
+    if cwd.byte_length() > 0 and file_size(cwd + "/tools/flint.sh") > 0:
+        return cwd
     return "/home/user/flint"
 
 
@@ -357,6 +376,8 @@ def test_f03_flint_new_crash_handler_and_logs(tmp_root: String, repo_root: Strin
         "bash " + _sh_quote(repo_root + "/tools/flint.sh") + " new " + _sh_quote(proj),
         new_out,
     )
+    if rc_new != 0:
+        print("  [F03] flint.sh new rc=" + String(rc_new) + " output:\n" + _read_text(new_out))
     assert_equal(rc_new, 0)
 
     var main_src = _read_text(proj + "/src/main.mojo")
@@ -382,6 +403,9 @@ def test_f03_flint_new_crash_handler_and_logs(tmp_root: String, repo_root: Strin
         + " --headless-smoke",
         smoke_out,
     )
+    if rc_smoke != 0:
+        # Show what the scaffolded game printed.
+        print("  [F03] headless smoke rc=" + String(rc_smoke) + " output:\n" + _read_text(smoke_out))
     assert_equal(rc_smoke, 0)
 
     var expected_log = game_xdg + "/hygiene_sample_game/logs/hygiene_sample_game.log"

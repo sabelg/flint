@@ -41,6 +41,137 @@ def nearest_frame(seconds: Float32) -> Int:
     return max(0, Int(scaled))
 
 
+def last_frame(duration: Float32) -> Int:
+    """The last whole track frame inside a move of `duration` seconds: frame `f` sits at
+    `f / TRACK_FPS`, so this is `floor(duration * TRACK_FPS)` (with a small tolerance for
+    durations that are an exact frame multiple). Every timing-track loop, lane mapping and
+    event search uses this one definition."""
+    if not isfinite(duration) or duration <= Float32(0.0):
+        return 0
+    var scaled = Float64(duration) * Float64(TRACK_FPS) + 0.0001
+    if scaled >= 1000000000.0:
+        return 1000000000
+    return max(0, Int(scaled))
+
+
+def _same_vec(a: Vec3, b: Vec3) -> Bool:
+    return a.x == b.x and a.y == b.y and a.z == b.z
+
+
+def same_motion(a: MotionSequence, b: MotionSequence) -> Bool:
+    """Field-for-field equality of two presets, events (frame and kind, in order) included."""
+    if (
+        a.model_path != b.model_path
+        or a.first != b.first
+        or a.second != b.second
+        or a.contact != b.contact
+        or a.support != b.support
+        or a.sound != b.sound
+        or a.overlap != b.overlap
+        or a.scale != b.scale
+        or a.cue != b.cue
+        or a.yaw != b.yaw
+        or not _same_vec(a.start, b.start)
+        or not _same_vec(a.eye_a, b.eye_a)
+        or not _same_vec(a.eye_b, b.eye_b)
+        or not _same_vec(a.aim, b.aim)
+        or not _same_vec(a.ledge, b.ledge)
+        or len(a.markers) != len(b.markers)
+        or len(a.events) != len(b.events)
+    ):
+        return False
+    for i in range(len(a.markers)):
+        if a.markers[i] != b.markers[i]:
+            return False
+    for i in range(len(a.events)):
+        if a.events[i].frame != b.events[i].frame or a.events[i].kind != b.events[i].kind:
+            return False
+    return True
+
+
+comptime HISTORY_LIMIT = 128
+
+
+struct MotionHistory(Movable):
+    """Snapshot undo/redo for a `MotionSequence`, plus the unsaved-changes state.
+
+    The editor calls `track` once per frame after applying input; any change since the last
+    snapshot becomes one undo step. While `busy` (a drag in progress) changes are held back,
+    so a whole drag undoes in one step."""
+
+    var current: MotionSequence
+    var saved: MotionSequence
+    var undo_stack: List[MotionSequence]
+    var redo_stack: List[MotionSequence]
+
+    def __init__(out self, seq: MotionSequence):
+        self.current = seq.copy()
+        self.saved = seq.copy()
+        self.undo_stack = []
+        self.redo_stack = []
+
+    def track(mut self, seq: MotionSequence, busy: Bool = False) -> Bool:
+        """Record an edit. Returns True when a new undo step was pushed."""
+        if busy or same_motion(seq, self.current):
+            return False
+        self.undo_stack.append(self.current.copy())
+        if len(self.undo_stack) > HISTORY_LIMIT:
+            _ = self.undo_stack.pop(0)
+        self.current = seq.copy()
+        self.redo_stack.clear()
+        return True
+
+    def can_undo(self) -> Bool:
+        return len(self.undo_stack) > 0
+
+    def can_redo(self) -> Bool:
+        return len(self.redo_stack) > 0
+
+    def undo(mut self, mut seq: MotionSequence) -> Bool:
+        _ = self.track(seq)
+        if not self.undo_stack:
+            return False
+        self.redo_stack.append(self.current.copy())
+        self.current = self.undo_stack.pop()
+        seq = self.current.copy()
+        return True
+
+    def redo(mut self, mut seq: MotionSequence) -> Bool:
+        _ = self.track(seq)
+        if not self.redo_stack:
+            return False
+        self.undo_stack.append(self.current.copy())
+        self.current = self.redo_stack.pop()
+        seq = self.current.copy()
+        return True
+
+    def mark_saved(mut self, seq: MotionSequence):
+        _ = self.track(seq)
+        self.saved = seq.copy()
+
+    def dirty(self, seq: MotionSequence) -> Bool:
+        return not same_motion(seq, self.saved)
+
+
+struct QuitGuard(Movable):
+    """Esc / window close with unsaved changes asks first; a second request discards."""
+
+    var armed: Bool
+
+    def __init__(out self):
+        self.armed = False
+
+    def request(mut self, dirty: Bool) -> Bool:
+        """Returns True when the editor should quit now."""
+        if not dirty or self.armed:
+            return True
+        self.armed = True
+        return False
+
+    def cancel(mut self):
+        self.armed = False
+
+
 def frame_joint(
     mut player: MotionPlayer, model: NativeModel, seq: MotionSequence, frame: Int, joint: Int
 ) -> Vec3:
@@ -94,7 +225,7 @@ struct MotionTools(Movable):
         self.pin_frame = frame
         self.pinned = True
         self.first_slip = -1
-        for i in range(frame, nearest_frame(player.duration(model, seq)) + 1):
+        for i in range(frame, last_frame(player.duration(model, seq)) + 1):
             if frame_joint(player, model, seq, i, self.marker).distance_to(target) > 0.02:
                 self.first_slip = i
                 break
@@ -176,7 +307,7 @@ struct MotionTools(Movable):
             )
             c.draw_text(16, bar + 105, "Arrows step   Drag timeline to inspect", 0xFFBBD0DF, 2)
         elif self.tab == TIMING:
-            var last = max(1, Int(player.duration(model, seq) * TRACK_FPS + 0.0001))
+            var last = max(1, last_frame(player.duration(model, seq)))
             for k in range(4):
                 var y = bar + 28 + k * 18
                 c.draw_text(16, y, cue_kind(k), UInt32(0xFFFFC455 if k == self.kind else 0xFFBDCFDC), 2)

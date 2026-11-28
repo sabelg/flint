@@ -514,10 +514,10 @@ struct StudioTheme(Copyable, Movable):
         self.axis_y = rgba8(79, 196, 120, 255)         # #4FC478
         self.axis_z = rgba8(76, 150, 240, 255)         # #4C96F0
 
-        # Text hierarchy (WCAG AA/AAA verified on L0-L2)
+        # Text hierarchy (WCAG AA verified on every opaque surface L0-L3, l3_hover included)
         self.text_primary = rgba8(238, 242, 247, 255)   # #EEF2F7 (13.6:1 on L2)
-        self.text_secondary = rgba8(169, 180, 196, 255) # #A9B4C4 (7.3:1 on L2)
-        self.text_muted = rgba8(132, 145, 163, 255)     # #8491A3 (4.93:1 AA on L2)
+        self.text_secondary = rgba8(169, 180, 196, 255) # #A9B4C4 (5.3:1 on l3_hover)
+        self.text_muted = rgba8(157, 168, 186, 255)     # #9DA8BA (4.64:1 on l3_hover; was #8491A3, 3.5:1)
         self.text_on_accent = rgba8(11, 14, 20, 255)    # #0B0E14
 
         # Typography & geometry rhythm
@@ -568,6 +568,80 @@ struct StudioTheme(Copyable, Movable):
         self.diff_add_fg = rgb_hex(0x6EE7B7)
         self.diff_del_fg = rgb_hex(0xFCA5A5)
         self.diff_hunk_bg = rgba8(148, 163, 184, 24)
+
+    def same_tokens(self, other: Self) -> Bool:
+        """True when every token equals `other`'s (lets `UiContext.set_studio_theme` skip a copy)."""
+        if len(self.syntax) != len(other.syntax):
+            return False
+        for i in range(len(self.syntax)):
+            if self.syntax[i] != other.syntax[i]:
+                return False
+        return (
+            self.name == other.name
+            and self.id == other.id
+            and self.is_dark == other.is_dark
+            and self.reduced_motion == other.reduced_motion
+            and self.l0_canvas == other.l0_canvas
+            and self.l1_shell == other.l1_shell
+            and self.l2_card == other.l2_card
+            and self.l3_raised == other.l3_raised
+            and self.l3_hover == other.l3_hover
+            and self.l3_press == other.l3_press
+            and self.l4_overlay == other.l4_overlay
+            and self.l4_scrim == other.l4_scrim
+            and self.border_subtle == other.border_subtle
+            and self.border_control == other.border_control
+            and self.border_strong == other.border_strong
+            and self.bevel_top == other.bevel_top
+            and self.accent_primary == other.accent_primary
+            and self.accent_soft == other.accent_soft
+            and self.focus_ring == other.focus_ring
+            and self.play_mode == other.play_mode
+            and self.play_tint == other.play_tint
+            and self.play_paused == other.play_paused
+            and self.agent_active == other.agent_active
+            and self.agent_flow == other.agent_flow
+            and self.agent_soft == other.agent_soft
+            and self.status_ok == other.status_ok
+            and self.status_warn == other.status_warn
+            and self.status_danger == other.status_danger
+            and self.axis_x == other.axis_x
+            and self.axis_y == other.axis_y
+            and self.axis_z == other.axis_z
+            and self.text_primary == other.text_primary
+            and self.text_secondary == other.text_secondary
+            and self.text_muted == other.text_muted
+            and self.text_on_accent == other.text_on_accent
+            and self.font_title == other.font_title
+            and self.font_section == other.font_section
+            and self.font_body == other.font_body
+            and self.font_caption == other.font_caption
+            and self.font_mono == other.font_mono
+            and self.row_height == other.row_height
+            and self.header_height == other.header_height
+            and self.scrollbar_width == other.scrollbar_width
+            and self.radius_xs == other.radius_xs
+            and self.radius_sm == other.radius_sm
+            and self.radius_md == other.radius_md
+            and self.radius_lg == other.radius_lg
+            and self.space_xs == other.space_xs
+            and self.space_sm == other.space_sm
+            and self.space_md == other.space_md
+            and self.space_lg == other.space_lg
+            and self.syntax_keyword == other.syntax_keyword
+            and self.syntax_type == other.syntax_type
+            and self.syntax_string == other.syntax_string
+            and self.syntax_number == other.syntax_number
+            and self.syntax_comment == other.syntax_comment
+            and self.syntax_func == other.syntax_func
+            and self.syntax_macro == other.syntax_macro
+            and self.syntax_operator == other.syntax_operator
+            and self.diff_add_bg == other.diff_add_bg
+            and self.diff_del_bg == other.diff_del_bg
+            and self.diff_add_fg == other.diff_add_fg
+            and self.diff_del_fg == other.diff_del_fg
+            and self.diff_hunk_bg == other.diff_hunk_bg
+        )
 
     def _sync_syntax_fields(mut self):
         if len(self.syntax) >= SYN_COUNT:
@@ -624,7 +698,7 @@ struct StudioTheme(Copyable, Movable):
 
         t.text_primary = rgb_hex(0xD5DDF8)
         t.text_secondary = rgb_hex(0xA9B1D6)
-        t.text_muted = rgb_hex(0x8890B4)
+        t.text_muted = rgb_hex(0x9A9FB8)  # >= 4.5:1 on every opaque surface (was #767D9F, 3.0:1 on l3_hover)
         t.text_on_accent = rgb_hex(0x16161E)
 
         t.syntax = _make_syntax_list(
@@ -691,7 +765,7 @@ struct StudioTheme(Copyable, Movable):
 
         t.text_primary = rgb_hex(0xEEF2F6)
         t.text_secondary = rgb_hex(0xB2BCC6)
-        t.text_muted = rgb_hex(0x7F8994)
+        t.text_muted = rgb_hex(0x979FA8)  # >= 4.5:1 on every opaque surface (was #7F8994, 3.5:1 on l3_hover)
         t.text_on_accent = rgb_hex(0x0B0E11)
 
         t.syntax = _make_syntax_list(
@@ -758,7 +832,7 @@ struct StudioTheme(Copyable, Movable):
 
         t.text_primary = rgb_hex(0x181B22)
         t.text_secondary = rgb_hex(0x4B5563)
-        t.text_muted = rgb_hex(0x646D7A)
+        t.text_muted = rgb_hex(0x5B636F)  # >= 4.5:1 on every opaque surface (was #646D7A, 4.0:1 on l3_press)
         t.text_on_accent = rgb_hex(0xFFFFFF)
 
         t.syntax = _make_syntax_list(

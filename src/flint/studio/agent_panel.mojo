@@ -611,6 +611,8 @@ struct AgentMissionControlPanel(Copyable, Movable):
         if self.prompt_focused:
             if input.text_input_utf8.byte_length() > 0:
                 _append_printable_utf8(self.prompt_text, input.text_input_utf8)
+            if input.ime_commit.byte_length() > 0:
+                _append_printable_utf8(self.prompt_text, input.ime_commit)
             if input.key_pressed(_KEY_BACKSPACE):
                 self.prompt_text = _trim_last_utf8_char(self.prompt_text)
             if input.key_pressed(_KEY_ESCAPE):

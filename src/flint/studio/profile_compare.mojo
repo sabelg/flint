@@ -5,6 +5,27 @@ from flint.assets.json import JsonDocument, parse_json
 from flint.platform.os import read_bytes
 
 
+comptime GPU_PREFIX = "gpu:"
+comptime CPU_PREFIX = "cpu:"
+comptime FRAME_COLUMN = "frame"
+comptime WORK_COLUMN = "frame less pace"  # Derived: frame time minus the "pace" scope.
+
+
+def gpu_column(key: String) -> String:
+    """GPU timings (the `gpu_ms` counter's keys) live in their own `gpu:` namespace, so a GPU
+    pass and a CPU scope that share a name stay two columns."""
+    return GPU_PREFIX + key
+
+
+def cpu_column(name: String) -> String:
+    """A CPU scope keeps its name unless that name is reserved: the derived `frame less pace`
+    column, or anything that looks like a namespaced column. Those get a `cpu:` prefix, so the
+    mapping stays one-to-one and a scope can never overwrite a derived or GPU column."""
+    if name == WORK_COLUMN or name.startswith(GPU_PREFIX) or name.startswith(CPU_PREFIX):
+        return CPU_PREFIX + name
+    return name
+
+
 struct Samples(Copyable, Movable):
     var values: List[Float64]
 
@@ -54,7 +75,7 @@ struct Capture(Movable):
             frames.append(dur * 0.001)
         if len(frames) == 0:
             raise Error("No completed Flint frames in " + path)
-        var total = self.column("frame")
+        var total = self.column(FRAME_COLUMN)
         self.columns[total].values = frames^
         for i in range(doc.array_size(events)):
             var e = doc.at(events, i)
@@ -62,7 +83,7 @@ struct Capture(Movable):
             if ph != "X" and ph != "C":
                 continue
             var name = doc.text(doc.object_get(e, "name"))
-            if not name or name == "frame":
+            if not name or name == FRAME_COLUMN:
                 continue
             var args = doc.object_get(e, "args")
             var id = doc.integer(doc.object_get(args, "frame"))
@@ -73,7 +94,7 @@ struct Capture(Movable):
                         var key = doc.nodes[args].keys[k]
                         var ms = doc.number(doc.nodes[args].children[k], -1)
                         if key != "frame" and isfinite(ms) and ms >= 0:
-                            self.add(key, frame, ms)
+                            self.add(gpu_column(key), frame, ms)
                 continue
             var ts = doc.number(doc.object_get(e, "ts"), -1)
             var dur = doc.number(doc.object_get(e, "dur"), -1)
@@ -93,9 +114,9 @@ struct Capture(Movable):
                 if frame >= 0 and ts + dur > self.starts[frame] + self.columns[total].values[frame] * 1000 + 2:
                     continue
             if frame >= 0:
-                self.add(name, frame, dur * 0.001)
+                self.add(cpu_column(name), frame, dur * 0.001)
         if "pace" in self.indexes:
-            var work = self.column("frame less pace")
+            var work = self.column(WORK_COLUMN)
             var pace = self.indexes["pace"]
             for i in range(len(self.starts)):
                 self.columns[work].values[i] = max(Float64(0), self.columns[total].values[i] - max(Float64(0), self.columns[pace].values[i]))

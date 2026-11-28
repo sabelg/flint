@@ -16,9 +16,10 @@ from flint.core.perf_history import PerfTable
 from flint.devtools.mcp_v2 import (
     JSONRPC_INVALID_PARAMS,
     JSONRPC_INVALID_REQUEST,
+    MCP_ERR_UNAUTHORIZED,
     JSONRPC_METHOD_NOT_FOUND,
     JSONRPC_PARSE_ERROR,
-    MCP_PROTOCOL_VERSION,
+    MCP_PROTOCOL_LATEST,
     McpServerV2,
 )
 from flint.lab import EngineBenchSuite, LabCaseResult, compute_latency_percentiles
@@ -228,7 +229,7 @@ def test_t1_studio_scene_save_load_and_asset_browser(tmp_root: String) raises:
     var loaded = FlintStudioState()
     assert_true(loaded.load_scene_file(scene_path))
     assert_equal(loaded.state_hash(), saved_hash)
-    assert_false(loaded.can_undo())
+    assert_true(loaded.can_undo())  # Load is one undoable step (back to the empty world)
     assert_false(loaded.can_redo())
 
     var scanned = loaded.scan_asset_browser(dir_path=scene_dir)
@@ -252,7 +253,7 @@ def test_t1_mcp_v2_protocol_tools_and_auth(tmp_root: String) raises:
 
         var init_req = (
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{'
-            '"protocolVersion":"2024-11-05","auth_token":"secret-42",'
+            '"protocolVersion":"2025-06-18","auth_token":"secret-42",'
             '"clientInfo":{"name":"e2e-opaque"}}}'
         )
         var init_resp = mcp.handle_jsonrpc(init_req, studio, assets, pool)
@@ -261,7 +262,7 @@ def test_t1_mcp_v2_protocol_tools_and_auth(tmp_root: String) raises:
         assert_true(mcp.session_authenticated)
         assert_true(mcp.initialized)
         var init_res = init_doc.object_get(init_doc.root, "result")
-        assert_equal(init_doc.text(init_doc.object_get(init_res, "protocolVersion")), MCP_PROTOCOL_VERSION)
+        assert_equal(init_doc.text(init_doc.object_get(init_res, "protocolVersion")), MCP_PROTOCOL_LATEST)
 
         var notif_resp = mcp.handle_jsonrpc('{"jsonrpc":"2.0","method":"notifications/initialized"}', studio, assets, pool)
         assert_equal(notif_resp, "")
@@ -572,7 +573,7 @@ def test_t2_mcp_v2_jsonrpc_protocol_and_auth_errors(tmp_root: String) raises:
 
         var auth_mcp = McpServerV2(workspace_root=tmp_root, auth_token="tok-123")
         var r_unauth = auth_mcp.handle_jsonrpc('{"jsonrpc":"2.0","id":6,"method":"tools/list"}', studio, assets, pool)
-        assert_true(r_unauth.find(String(JSONRPC_INVALID_REQUEST)) >= 0)
+        assert_true(r_unauth.find(String(MCP_ERR_UNAUTHORIZED)) >= 0)
         assert_false(auth_mcp.session_authenticated)
 
         var r_bad_tok = auth_mcp.handle_jsonrpc(
@@ -581,7 +582,7 @@ def test_t2_mcp_v2_jsonrpc_protocol_and_auth_errors(tmp_root: String) raises:
             assets,
             pool,
         )
-        assert_true(r_bad_tok.find(String(JSONRPC_INVALID_REQUEST)) >= 0)
+        assert_true(r_bad_tok.find(String(MCP_ERR_UNAUTHORIZED)) >= 0)
         assert_false(auth_mcp.session_authenticated)
 
         var r_unauth_notif = auth_mcp.handle_jsonrpc('{"jsonrpc":"2.0","method":"notifications/initialized"}', studio, assets, pool)
@@ -602,6 +603,10 @@ def test_t2_mcp_v2_tool_error_and_sandbox_rejection(tmp_root: String) raises:
     var pool = JobPool()
 
     try:
+        # structuredContent is only sent to clients that negotiate 2025-06-18.
+        _ = mcp.handle_jsonrpc(
+            '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}', studio, assets, pool
+        )
         var requests = List[String]()
         requests.append('{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bogus.tool","arguments":{}}}')
         requests.append('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ecs.patch_components","arguments":{"entity_id":999}}}')

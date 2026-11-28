@@ -221,16 +221,25 @@ struct InputBinding(Copyable, ImplicitlyCopyable, Movable):
 
 
 struct InputContext(Copyable, Movable):
-    """Named input mapping layer with stack priority and optional lower-context blocking."""
+    """Named input mapping layer with stack priority and optional lower-context blocking.
+
+    `strict_modifiers`: an unmodified key binding (`MOD_NONE`) only fires while Ctrl and Alt are
+    up, so `Ctrl+X` never also triggers a plain `X` action (editor-style hotkeys). Shift stays
+    tolerated. Off by default: games commonly hold Ctrl (crouch) or Alt while pressing movement keys.
+    """
     var name: String
     var priority: Int
     var blocks_lower_all: Bool
+    var strict_modifiers: Bool
     var bindings: List[InputBinding]
 
-    def __init__(out self, name: String, priority: Int = 0, blocks_lower_all: Bool = False):
+    def __init__(
+        out self, name: String, priority: Int = 0, blocks_lower_all: Bool = False, strict_modifiers: Bool = False
+    ):
         self.name = name
         self.priority = priority
         self.blocks_lower_all = blocks_lower_all
+        self.strict_modifiers = strict_modifiers
         self.bindings = List[InputBinding]()
 
     def bind_key(
@@ -561,6 +570,15 @@ struct InputMap(Resource, Copyable, Movable):
                         # Exact modifier match required when chord specifies modifiers;
                         # unmodified bindings still work unless the key itself was consumed by a chord!
                         if b.modifiers != MOD_NONE and (cur_mods & b.modifiers) != b.modifiers:
+                            continue
+                        # Strict contexts: a plain-key binding never fires under Ctrl/Alt (modifier keys
+                        # bound as actions themselves are exempt).
+                        if (
+                            ctx.strict_modifiers
+                            and b.modifiers == MOD_NONE
+                            and (cur_mods & (MOD_CTRL | MOD_ALT)) != 0
+                            and (k < _KEY_LSHIFT or k > 347)  # 340..347 = Shift/Ctrl/Alt/Super
+                        ):
                             continue
                         if input.key_down(k):
                             self.actions[ai].down = True
@@ -894,6 +912,7 @@ struct InputMap(Resource, Copyable, Movable):
             out += '{"name": ' + json_quote(c.name)
             out += ', "priority": ' + String(c.priority)
             out += ', "blocks_lower_all": ' + ("true" if c.blocks_lower_all else "false")
+            out += ', "strict_modifiers": ' + ("true" if c.strict_modifiers else "false")
             out += ', "bindings": ['
             for bi in range(len(c.bindings)):
                 if bi > 0:
@@ -946,7 +965,8 @@ struct InputMap(Resource, Copyable, Movable):
             var c_name = doc.text(doc.object_get(co, "name"), "")
             var c_pri = doc.integer(doc.object_get(co, "priority"), 0)
             var c_blk = doc.boolean(doc.object_get(co, "blocks_lower_all"), False)
-            var ctx = InputContext(c_name, c_pri, c_blk)
+            var c_strict = doc.boolean(doc.object_get(co, "strict_modifiers"), False)
+            var ctx = InputContext(c_name, c_pri, c_blk, c_strict)
             var b_arr = doc.object_get(co, "bindings")
             if b_arr >= 0:
                 for bi in range(doc.array_size(b_arr)):

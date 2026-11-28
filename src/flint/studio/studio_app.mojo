@@ -21,7 +21,7 @@ from flint.studio.source_editor import EmbeddedIde
 from flint.studio import scene_menu
 from flint.studio.autosave import discard_snapshot, recovery_directory, recovery_original, snapshot_original, snapshot_path, write_snapshot
 from std.collections import Dict
-from std.math import abs, acos, asin, cos, isfinite, isinf, isnan, max, min, sin, sqrt
+from std.math import abs, acos, asin, cos, isfinite, isinf, isnan, max, min, sin, sqrt, tan
 from std.memory import bitcast
 from flint.ai import AiPlugin, BehaviorTreeComponent, register_ai_codecs
 from flint.ai.behavior_tree import BtExecutionState
@@ -99,6 +99,7 @@ from flint.app.engine_app import (
 from flint.app.window_plugin import WindowPlugin, WindowStateResource
 from flint.core.log import state_directory
 from flint.assets.checkpoint import pack_checkpoint_lz4, unpack_checkpoint_lz4
+from flint.core.lz4 import lz4_pack, lz4_packed_raw_size, lz4_unpack
 from flint.assets.flpk_v3 import (
     ASSET_KIND_AUDIO,
     ASSET_KIND_MESH,
@@ -114,7 +115,7 @@ from flint.assets.flpk_v3 import (
 from flint.assets.glb_native import parse_native_glb
 from flint.assets.image import decode_png
 from flint.assets.jpeg import decode_image_auto
-from flint.assets.json import JsonDocument
+from flint.assets.json import JsonDocument, parse_json
 from flint.assets.json_write import json_quote
 from flint.assets.mesh_builder import MeshBuilder
 from flint.assets.model import NativeMesh, NativeModel
@@ -171,12 +172,23 @@ from flint.physics.world import (
     BODY_SHAPE_SPHERE,
     PhysicsWorld,
 )
+from flint.devtools.safe_fs import (
+    SAFE_FS_MISSING,
+    SAFE_FS_OK,
+    ConfinedPath,
+    read_confined_regular,
+    resolve_confined_path,
+    text_hash64,
+    write_confined_durable,
+)
 from flint.nav.navmesh import NavMesh
 from flint.nav.plugin import NavPlugin, NavPluginStateResource, register_nav_codecs
 from flint.platform.input import InputState
 from flint.platform.os import (
     env_value,
     file_size,
+    file_stamp,
+    remove_file,
     is_directory,
     is_symlink,
     list_directory,
@@ -185,7 +197,9 @@ from flint.platform.os import (
     read_bytes,
     real_path,
     run_process_redirected,
+    unix_time_sec,
     write_bytes,
+    write_file_durable,
 )
 from flint.procedural.arch_kit import (
     build_colonnade_arcade_bay,
@@ -238,6 +252,7 @@ from flint.scene.scene import (
     PrefabInstanceComponent,
     Scene,
     UnknownComponentsComponent,
+    duplicate_entities,
     load_flprefab_bytes,
     load_flprefab_file,
 )
@@ -269,8 +284,11 @@ from flint.studio.agent_bus import (
     AGENT_STATUS_WRITING_CODE,
     APPROVAL_AUTO,
     APPROVAL_EDITS,
+    APPROVAL_SRC_ACP_WRITE,
     APPROVAL_SRC_MCP_TOOL,
+    GHOST_TRANSFORM,
     APPROVAL_STEP,
+    ROLE_EXTERNAL_MCP,
     ROLE_GAMEPLAY_CODER,
     ROLE_LOOKDEV_ARTIST,
     ROLE_QA_PLAYTESTER,
@@ -305,6 +323,12 @@ from flint.studio.agent_theatre_3d import (
     emit_agent_viewport_3d_overlays,
     emit_agent_viewport_hud_overlays_with_font,
 )
+from flint.devtools.job_runner import JOB_SUCCEEDED, JobRunner
+from flint.devtools.problems import DIAG_ERROR as CODE_DIAG_ERROR
+from flint.devtools.problems import DIAG_SRC_BUILD as CODE_DIAG_SRC_BUILD
+from flint.devtools.problems import DIAG_WARNING as CODE_DIAG_WARNING
+from flint.devtools.problems import Diagnostic as CodeDiagnostic
+from flint.platform.os import get_time as code_build_now
 from flint.studio.code_drawer import (
     BUILD_STATUS_BUILDING,
     BUILD_STATUS_ERROR,
@@ -313,26 +337,50 @@ from flint.studio.code_drawer import (
     CODE_ACT_ACCEPT_HUNK,
     CODE_ACT_ASK_AGENT_FIX,
     CODE_ACT_BUILD_HOT_RELOAD,
+    CODE_ACT_CLOSE_TAB,
     CODE_ACT_JUMP_DIAGNOSTIC,
     CODE_ACT_OPEN_EXTERNAL_IDE,
     CODE_ACT_REJECT_ALL_DIFF,
     CODE_ACT_REJECT_HUNK,
+    CODE_ACT_RELOAD_FROM_DISK,
+    CODE_ACT_SAVE_TAB,
     CODE_MODE_DIFF_UNIFIED,
     CodeDrawer,
     CodeDrawerAction,
 )
+from flint.studio.viewport_transform import ViewportTransform
 from flint.studio.gizmo import (
     GIZMO_AXIS_NONE,
-    GIZMO_MODE_SELECT,
+    GIZMO_AXIS_VIEW,
+    GIZMO_AXIS_X,
+    GIZMO_AXIS_Y,
+    GIZMO_AXIS_Z,
     GIZMO_MODE_ROTATE,
     GIZMO_MODE_SCALE,
+    GIZMO_MODE_SELECT,
     GIZMO_MODE_TRANSLATE,
+    GIZMO_PLANE_XY,
+    GIZMO_PLANE_XZ,
+    GIZMO_PLANE_YZ,
+    GIZMO_SCALE_UNIFORM,
+    GIZMO_TARGET_PX,
     GIZMO_SPACE_LOCAL,
     GIZMO_SPACE_WORLD,
     ViewportRay,
     emit_gizmo_draw_list,
+    gizmo_rotation_delta_rad,
+    clamp_gizmo_param,
+    gizmo_drag_param_limit,
+    gizmo_scale_drag,
+    gizmo_uniform_scale_screen,
+    gizmo_world_scale,
     pick_gizmo_handle,
+    project_world_to_viewport,
+    ray_axis_closest_param,
     ray_plane_hit,
+    snap_angle_deg,
+    snap_constrained_delta,
+    snap_scalar,
 )
 from flint.ml.rgbmocap import (
     export_mocap_take_bvh,
@@ -371,6 +419,8 @@ from flint.studio.palette import (
     draw_key_chord_hud,
 )
 from flint.studio.palette_registry import (
+    PAL_CMD_OPEN_SOURCE_EDITOR,
+    studio_chord_key_label,
     PAL_CMD_AGENT_APPROVE_STEP,
     PAL_CMD_AGENT_EXIT_TIME_TRAVEL,
     PAL_CMD_AGENT_GAMEPLAY_CODER,
@@ -410,6 +460,7 @@ from flint.studio.palette_registry import (
     PAL_CMD_PIE_STOP,
     PAL_CMD_REDO,
     PAL_CMD_RELOAD_SCENE,
+    PAL_CMD_RECOVER_AUTOSAVE,
     PAL_CMD_RENAME,
     PAL_CMD_RESCAN_ASSETS,
     PAL_CMD_RESET_CAMERA,
@@ -480,6 +531,8 @@ from flint.studio.studio_panels import (
     draw_inspector_identity,
     draw_outliner_panel_v2,
     draw_studio_stats_panel,
+    outliner_row_window,
+    ascii_contains_ci,
 )
 from flint.studio.studio_workspace import (
     AgentCheckpointLog,
@@ -509,6 +562,7 @@ from flint.studio.viewport_hud import (
     HDR_ACT_WORKSPACE,
     HDR_ACT_WORKSPACE_PICKER,
     STUDIO_HEADER_BAR_H,
+    STUDIO_STATUS_BAR_H,
     StudioHeaderBar,
     VHUD_ACT_CAM_MODE,
     VHUD_ACT_NONE,
@@ -556,6 +610,7 @@ from flint.ui.context import (
     UI_FONT_BOLD,
     UI_FONT_MONO,
     UI_FONT_REGULAR,
+    utf8_drop_last_char,
     UI_KEY_BACKSPACE,
     UI_KEY_DOWN,
     UI_KEY_ENTER,
@@ -609,11 +664,31 @@ from flint.ui.flexbox_dock import (
     RectF as _RectF,
 )
 
+comptime PIVOT_BOUNDS_CENTER: Int = 0
+comptime PIVOT_ACTIVE: Int = 1
+comptime GIZMO_DRAG_SEQ_TAG: UInt64 = 0x4000000000000000
+comptime STUDIO_CONSOLE_CAP: Int = 300
+comptime STUDIO_RECENT_SCENES_CAP: Int = 10
+"""High bit marking gizmo-drag coalesce keys, so they never collide with UI-widget coalesce keys."""
 comptime COLLIDER_NONE: Int = 0
 comptime COLLIDER_SPHERE: Int = 1
 comptime COLLIDER_BOX: Int = 2
 comptime COLLIDER_CAPSULE: Int = 3
 comptime COLLIDER_STATIC_MESH: Int = 4
+
+# `spawn_card_entity` kinds (Scene menu, Quick Spawn palette, spawn cards).
+comptime STUDIO_MESH_DEFAULT_CUBE: Int = -2  # `spawn_entity` sentinel: use the unit cube mesh
+
+comptime SPAWN_CARD_EMPTY: Int = 0
+comptime SPAWN_CARD_CUBE: Int = 1
+comptime SPAWN_CARD_POINT_LIGHT: Int = 2
+comptime SPAWN_CARD_SPOT_LIGHT: Int = 3
+comptime SPAWN_CARD_CAMERA: Int = 4
+comptime SPAWN_CARD_AUDIO: Int = 5
+comptime SPAWN_CARD_SPHERE: Int = 6
+comptime SPAWN_CARD_PLANE: Int = 7
+comptime SPAWN_CARD_SUN: Int = 8
+comptime SPAWN_PLANE_SIZE_M: Float32 = 10.0
 
 comptime SHADING_PBR: Int = 0
 comptime SHADING_NPR_CEL: Int = 1
@@ -783,11 +858,13 @@ struct StudioEntityMetaComponent(SerializableComponent):
     comptime STORAGE_MODE: Int = STORAGE_TABLE
     comptime SCHEMA_NAME: StaticString = "StudioEntityMetaComponent"
     comptime SCHEMA_FOURCC: UInt32 = fourcc("SMET")
-    comptime SCHEMA_VERSION: Int = 2
+    # v2 adds `enabled`; v3 adds `visible` (the user's Visible switch, kept apart from `enabled`).
+    comptime SCHEMA_VERSION: Int = 3
 
     var name: String
     var locked: Bool
     var enabled: Bool
+    var visible: Bool
     var mesh_handle_packed: UInt64
     var material_handle_packed: UInt64
     var collider_kind: Int
@@ -808,10 +885,12 @@ struct StudioEntityMetaComponent(SerializableComponent):
         friction: Float32 = 0.55,
         bvh_slot: Int = -1,
         enabled: Bool = True,
+        visible: Bool = True,
     ):
         self.name = name
         self.locked = locked
         self.enabled = enabled
+        self.visible = visible
         self.mesh_handle_packed = mesh_handle_packed
         self.material_handle_packed = material_handle_packed
         self.collider_kind = collider_kind
@@ -831,6 +910,7 @@ struct StudioEntityMetaComponent(SerializableComponent):
         out.f32(self.friction)
         out.integer(self.bvh_slot)
         out.boolean(self.enabled)
+        out.boolean(self.visible)
 
     @staticmethod
     def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
@@ -844,9 +924,12 @@ struct StudioEntityMetaComponent(SerializableComponent):
         var fric = reader.f32()
         var bvh = reader.integer()
         var en = reader.boolean() if version >= 2 else True
+        # Pre-v3 files have no Visible flag: True, and `_sync_compat_view` takes an enabled
+        # entity's Visible from its mesh renderer (which those files did store).
+        var vis = reader.boolean() if version >= 3 else True
         if reader.failed:
             raise Error("Truncated StudioEntityMetaComponent")
-        return Self(nm, lk, mh, mat_h, ck, che, rest, fric, bvh, en)
+        return Self(nm, lk, mh, mat_h, ck, che, rest, fric, bvh, en, vis)
 
     def write_json(self) -> String:
         return (
@@ -860,6 +943,7 @@ struct StudioEntityMetaComponent(SerializableComponent):
             + ", \"friction\": " + _f32_s(self.friction)
             + ", \"bvh_slot\": " + String(self.bvh_slot)
             + ", \"enabled\": " + ("true" if self.enabled else "false")
+            + ", \"visible\": " + ("true" if self.visible else "false")
             + "}"
         )
 
@@ -875,7 +959,8 @@ struct StudioEntityMetaComponent(SerializableComponent):
         var fric = Float32(doc.number(doc.object_get(node, "friction"), 0.55))
         var bvh = doc.integer(doc.object_get(node, "bvh_slot"), -1)
         var en = doc.boolean(doc.object_get(node, "enabled"), True)
-        return Self(nm, lk, mh, mat_h, ck, che, rest, fric, bvh, en)
+        var vis = doc.boolean(doc.object_get(node, "visible"), True)  # absent in pre-v3 scenes
+        return Self(nm, lk, mh, mat_h, ck, che, rest, fric, bvh, en, vis)
 
 
 struct StudioStyleComponent(SerializableComponent, ImplicitlyCopyable):
@@ -992,6 +1077,59 @@ struct StudioStyleComponent(SerializableComponent, ImplicitlyCopyable):
         s.clearcoat = Float32(doc.number(doc.object_get(node, "clearcoat"), Float64(s.clearcoat)))
         s.clearcoat_roughness = Float32(doc.number(doc.object_get(node, "clearcoat_roughness"), Float64(s.clearcoat_roughness)))
         return s
+
+
+struct StudioEditorIdComponent(SerializableComponent, ImplicitlyCopyable):
+    """Stable editor identity for an entity (`editor_id`), saved with the scene and with undo blobs.
+
+    ECS slot indices are reused after a despawn, so a slot remembered by a deferred action (an agent
+    approval, an MCP client, a pending inspector edit) can silently point at a different entity later.
+    `editor_id` is never reused within a scene: references hold it (see `EntityRef`) and resolve it
+    back to the current slot through `FlintStudioState.slot_for_editor_id`."""
+    comptime COMPONENT_ID: UInt64 = comp_hash64("flint.studio.StudioEditorIdComponent")
+    comptime STORAGE_MODE: Int = STORAGE_TABLE
+    comptime SCHEMA_NAME: StaticString = "StudioEditorIdComponent"
+    comptime SCHEMA_FOURCC: UInt32 = fourcc("SEID")
+    comptime SCHEMA_VERSION: Int = 1
+
+    var editor_id: UInt64
+
+    def __init__(out self, editor_id: UInt64 = 0):
+        self.editor_id = editor_id
+
+    def write_bin(self, mut out: BlobWriter):
+        out.u64(self.editor_id)
+
+    @staticmethod
+    def read_bin(mut reader: BlobReader, version: Int) raises -> Self:
+        var v = reader.u64()
+        if reader.failed:
+            raise Error("Truncated StudioEditorIdComponent")
+        return Self(v)
+
+    def write_json(self) -> String:
+        return "{\"editor_id\": " + String(self.editor_id) + "}"
+
+    @staticmethod
+    def read_json(doc: JsonDocument, node: Int) raises -> Self:
+        return Self(doc.u64(doc.object_get(node, "editor_id"), 0))
+
+
+@fieldwise_init
+struct EntityRef(Copyable, ImplicitlyCopyable, Movable):
+    """A reference to an entity that survives slot reuse: the stable `editor_id` plus the slot and
+    generation it had when the reference was taken (a fast path, re-checked on resolve)."""
+    var editor_id: UInt64
+    var slot: Int
+    var generation: UInt32
+
+    @staticmethod
+    def null() -> Self:
+        return Self(UInt64(0), -1, UInt32(0))
+
+    @always_inline
+    def is_null(self) -> Bool:
+        return self.editor_id == 0 and self.slot < 0
 
 
 struct StudioEntityView(Copyable, Movable, Inspectable):
@@ -1197,6 +1335,37 @@ struct HierarchyRow(Copyable, ImplicitlyCopyable, Movable):
     var expanded: Bool
 
 
+struct HierarchyRowCache(Copyable, Movable):
+    """Flattened Outliner rows, rebuilt only when their key changes: the Studio `scene_version`
+    (spawn / despawn / reparent / rename / flag edits, undo / redo / load), the expand-collapse
+    version, the search query, and the ECS world's restore epoch / slot count / live count (a
+    safety net for out-of-band world changes)."""
+    var rows: List[HierarchyRow]
+    var valid: Bool
+    var scene_version: UInt64
+    var expand_version: UInt64
+    var restore_epoch: UInt64
+    var world_slots: Int
+    var world_live: Int
+    var query: String
+    var rebuild_count: Int
+    """How many times the rows were rebuilt (for tests and profiling)."""
+
+    def __init__(out self):
+        self.rows = List[HierarchyRow]()
+        self.valid = False
+        self.scene_version = UInt64(0)
+        self.expand_version = UInt64(0)
+        self.restore_epoch = UInt64(0)
+        self.world_slots = 0
+        self.world_live = 0
+        self.query = ""
+        self.rebuild_count = 0
+
+    def invalidate(mut self):
+        self.valid = False
+
+
 @fieldwise_init
 struct SelectedTransformSnap(Copyable, ImplicitlyCopyable, Movable):
     var entity_id: Int
@@ -1230,6 +1399,47 @@ def _copy_u64_style_epoch_dict(
 
 
 @always_inline
+def studio_signed_scale(value: Float32, fallback: Float32, snap_step: Float32 = 0.0) -> Float32:
+    """`sign(v) * max(0.01, |v|)`, optionally snapping `|v|` to `snap_step` first. Non-finite `value`
+    falls back to `fallback` (then to 1). Unlike `max(0.01, v)` it keeps negative (mirrored) scale."""
+    var v = value if isfinite(value) else fallback
+    if not isfinite(v):
+        v = Float32(1.0)
+    var sgn = Float32(-1.0) if v < Float32(0.0) else Float32(1.0)
+    var a = abs(v)
+    if isfinite(snap_step) and snap_step > Float32(1.0e-6):
+        a = max(snap_step, snap_scalar(a, snap_step))
+    return sgn * max(Float32(0.01), a)
+
+
+@always_inline
+def studio_signed_recip(s: Float32) -> Float32:
+    """Sign-preserving reciprocal guarded on `|s|` (`1/max(1e-4, s)` turned negative scale into 1e4)."""
+    if not isfinite(s):
+        return Float32(1.0)
+    var a = max(Float32(1.0e-4), abs(s))
+    return (Float32(-1.0) if s < Float32(0.0) else Float32(1.0)) / a
+
+
+def studio_wheel_dolly_factor(wheel: Float32) -> Float32:
+    """Arm-length factor for a wheel delta: `0.88^wheel`, clamped to +-10 notches; fractional deltas
+    from smooth-scrolling wheels and touchpads dolly proportionally instead of being dropped."""
+    if not isfinite(wheel):
+        return Float32(1.0)
+    var w = max(Float32(-10.0), min(Float32(10.0), wheel))
+    return Float32(0.88) ** w
+
+
+def studio_pan_world_per_px(arm: Float32, fov_y_deg: Float32, proj_h_phys: Float32) -> Float32:
+    """World units per physical pixel at distance `arm`: `arm * 2 tan(fov/2) / H`, H the height of the
+    render target the projection spans. Middle-drag pan with this factor keeps the grabbed point
+    under the cursor at any FOV, window size or UI scale."""
+    var h = max(Float32(1.0), proj_h_phys) if isfinite(proj_h_phys) else Float32(1.0)
+    var fov = fov_y_deg if isfinite(fov_y_deg) else Float32(55.0)
+    fov = max(Float32(1.0), min(Float32(179.0), fov))
+    return max(Float32(0.0), arm) * Float32(2.0) * tan(fov * Float32(3.14159265358979 / 360.0)) / h
+
+
 def _studio_mat_ref_key(aref: AssetRef) -> String:
     if aref.rel_path.byte_length() > 0:
         var norm = normalize_asset_rel_path(aref.rel_path)
@@ -1373,6 +1583,15 @@ struct EditorTransaction(Copyable, Movable):
     var tx_id: UInt64
     var agent_id: Int
     var step_id: UInt64
+    var changes_scene_path: Bool
+    """A scene load: undo / redo also switch `scene_file_path`, so a save after undoing a load writes
+    the scene the user is looking at to *its* file, never over the file that was loaded."""
+    var prev_scene_path: String
+    var next_scene_path: String
+    var prev_saved_tx_id: UInt64
+    """The save point before a load, so undoing the load knows whether the old file is clean again."""
+    var load_leaves_clean: Bool
+    """A plain load (not an autosave recovery) leaves the scene matching its file, so redo is clean."""
 
     def __init__(out self, op: Int = TX_PATCH_ENTITY, entity_id: Int = 0, label: String = "Edit"):
         self.op = op
@@ -1392,6 +1611,11 @@ struct EditorTransaction(Copyable, Movable):
         self.tx_id = UInt64(0)
         self.agent_id = 0
         self.step_id = UInt64(0)
+        self.changes_scene_path = False
+        self.prev_scene_path = String()
+        self.next_scene_path = String()
+        self.prev_saved_tx_id = UInt64(0xFFFFFFFFFFFFFFFF)
+        self.load_leaves_clean = False
 
     def __init__(out self, *, copy: Self):
         self.op = copy.op
@@ -1411,6 +1635,11 @@ struct EditorTransaction(Copyable, Movable):
         self.tx_id = copy.tx_id
         self.agent_id = copy.agent_id
         self.step_id = copy.step_id
+        self.changes_scene_path = copy.changes_scene_path
+        self.prev_scene_path = copy.prev_scene_path
+        self.next_scene_path = copy.next_scene_path
+        self.prev_saved_tx_id = copy.prev_saved_tx_id
+        self.load_leaves_clean = copy.load_leaves_clean
 
     def approx_bytes(self) -> Int:
         return len(self.before_world_blob) + len(self.after_world_blob) + 128
@@ -1460,6 +1689,7 @@ def _push_unique_free_slot(mut pool: List[Int], slot_id: Int):
 struct StudioGpuMaterials(Movable):
     """Cached GPU PBR/NPR-Cel/VFX material slot mappings per Studio entity slot."""
     var grid_mesh_id: Int
+    var cube_mesh_id: Int  # unit cube for spawned boxes; registered on first use (-1 = not yet)
     var orb_mesh_id: Int
     var torus_mesh_id: Int
     var colonnade_mesh_id: Int
@@ -1479,6 +1709,7 @@ struct StudioGpuMaterials(Movable):
 
     def __init__(out self):
         self.grid_mesh_id = 0
+        self.cube_mesh_id = -1
         self.orb_mesh_id = 0
         self.torus_mesh_id = 0
         self.colonnade_mesh_id = 0
@@ -1617,6 +1848,11 @@ def _studio_layout_path() -> String:
     return state_directory("flint") + "/studio_layout.json"
 
 
+def _studio_palette_frecency_path() -> String:
+    """Per-user Command Palette frecency table, next to the dock layout."""
+    return state_directory("flint") + "/studio_palette_frecency.txt"
+
+
 def _create_studio_dockspace() -> DockSpace:
     """Builds the default Studio v2 Edit `DockSpace` layout (`Hierarchy` left,
     `SceneViewport` center, `Inspector`/`Agents`/`CameraRig` right,
@@ -1682,7 +1918,7 @@ def _save_studio_dockspace(d: DockSpace):
     var out = List[UInt8](capacity=len(sb))
     for i in range(len(sb)):
         out.append(sb[i])
-    _ = write_bytes(path, out)
+    _ = write_file_durable(path, out)
 
 
 def _resolve_flint_launcher_path() -> String:
@@ -1748,7 +1984,6 @@ def _resolve_default_scene_path(project_root: String) -> String:
 def _create_studio_input_map() -> InputMap:
     """Declarative `InputMap` for `Flint Studio`: split `StudioEditor` (prio 10) and `StudioPlay` (prio 20)."""
     var imap = InputMap()
-    _ = imap.register_action("gizmo_select", ACTION_BOOL)
     _ = imap.register_action("gizmo_translate", ACTION_BOOL)
     _ = imap.register_action("gizmo_rotate", ACTION_BOOL)
     _ = imap.register_action("gizmo_scale", ACTION_BOOL)
@@ -1771,10 +2006,19 @@ def _create_studio_input_map() -> InputMap:
     _ = imap.register_action("pie_release_cursor", ACTION_BOOL)
     _ = imap.register_action("pie_toggle_camera", ACTION_BOOL)
     _ = imap.register_action("editor_quit", ACTION_BOOL)
+    _ = imap.register_action("editor_rename", ACTION_BOOL)
+    _ = imap.register_action("editor_select_all", ACTION_BOOL)
+    _ = imap.register_action("tool_select", ACTION_BOOL)
+    _ = imap.register_action("toggle_snap", ACTION_BOOL)
+    _ = imap.register_action("build_reload", ACTION_BOOL)
+    _ = imap.register_action("editor_save_as", ACTION_BOOL)
+    _ = imap.register_action("editor_open", ACTION_BOOL)
+    _ = imap.register_action("editor_help", ACTION_BOOL)
+    _ = imap.register_action("editor_clear_selection", ACTION_BOOL)
     _ = imap.register_action("cam_orbit", ACTION_AXIS2D)
 
-    var ctx = InputContext("StudioEditor", priority=10)
-    ctx.bind_key("gizmo_select", 81)
+    # Strict modifiers: plain-key hotkeys (W/E/R/X/F/G/Q, arrows) never fire while Ctrl or Alt is held.
+    var ctx = InputContext("StudioEditor", priority=10, strict_modifiers=True)
     ctx.bind_key("gizmo_translate", 87)                  # W
     ctx.bind_key("gizmo_rotate", 69)                     # E
     ctx.bind_key("gizmo_scale", 82)                      # R
@@ -1785,16 +2029,25 @@ def _create_studio_input_map() -> InputMap:
     ctx.bind_key("editor_redo", 90, modifiers=MOD_CTRL | MOD_SHIFT)  # Ctrl+Shift+Z
     ctx.bind_key("source_editor", 297)                   # F8
     ctx.bind_key("editor_save", 83, modifiers=MOD_CTRL)  # Ctrl+S
-    ctx.bind_key("editor_load", 79, modifiers=MOD_CTRL)  # Ctrl+O
     ctx.bind_key("editor_new", 78, modifiers=MOD_CTRL)   # Ctrl+N
     ctx.bind_key("editor_duplicate", 68, modifiers=MOD_CTRL)  # Ctrl+D
     ctx.bind_key("editor_copy", 67, modifiers=MOD_CTRL)  # Ctrl+C
     ctx.bind_key("editor_paste", 86, modifiers=MOD_CTRL) # Ctrl+V
     ctx.bind_key("editor_delete", 261)                   # Delete
+    ctx.bind_key("pie_stop", 294, modifiers=MOD_SHIFT)   # Shift+F5 (Stop: no-op in Edit, never Play)
     ctx.bind_key("pie_toggle", 294)                      # F5
     ctx.bind_key("pie_pause", 295)                       # F6
     ctx.bind_key("pie_step", 296)                        # F7
+    ctx.bind_key("editor_clear_selection", 256)          # Esc clears the selection (Edit mode only)
     ctx.bind_key("editor_quit", 81, modifiers=MOD_CTRL)  # Ctrl+Q (bare Esc never quits!)
+    ctx.bind_key("editor_rename", 291)                   # F2
+    ctx.bind_key("editor_select_all", 65, modifiers=MOD_CTRL)  # Ctrl+A
+    ctx.bind_key("tool_select", 81)                      # Q (select tool, no gizmo)
+    ctx.bind_key("toggle_snap", 71)                      # G (grid snap)
+    ctx.bind_key("build_reload", 66, modifiers=MOD_CTRL) # Ctrl+B (reload gameplay .so)
+    ctx.bind_key("editor_save_as", 83, modifiers=MOD_CTRL | MOD_SHIFT)  # Ctrl+Shift+S
+    ctx.bind_key("editor_open", 79, modifiers=MOD_CTRL)  # Ctrl+O opens the scene dialog (revert has no default key)
+    ctx.bind_key("editor_help", 290)                     # F1
     ctx.bind_key("cam_orbit", 263, scale_x=-1.0, scale_y=0.0, consume=False)  # Left
     ctx.bind_key("cam_orbit", 262, scale_x=1.0, scale_y=0.0, consume=False)   # Right
     ctx.bind_key("cam_orbit", 265, scale_x=0.0, scale_y=-1.0, consume=False)  # Up (look up)
@@ -1947,6 +2200,7 @@ def _is_internal_structural_component(name: String) -> Bool:
         or name == "Children"
         or name == "HierarchyDepth"
         or name == "StudioEntityMetaComponent"
+        or name == "StudioEditorIdComponent"
         or name == "UnknownComponentsComponent"
     )
 
@@ -2049,12 +2303,51 @@ struct FlintStudioState(Movable):
     var selected_entity_ids: List[Int]
     var selection_anchor_id: Int
     var hierarchy_expanded: Dict[Int, Bool]
+    var scene_version: UInt64
+    """Bumped on every edit that can change the Outliner rows (spawn / despawn / reparent / rename /
+    flag changes, undo / redo / load); keys `hierarchy_row_cache`."""
+    var hierarchy_expand_version: UInt64
+    var hierarchy_row_cache: HierarchyRowCache
 
     var gizmo_mode: Int
     var gizmo_local_space: Bool
     var active_gizmo_handle: Int
     var hovered_gizmo_handle: Int
     var gizmo_drag_delta_text: String
+    var viewport_xf: ViewportTransform
+    """This frame's viewport transform in physical pixels (set by the host each frame); gizmo picks,
+    drags, marquee selection and framing all project through it."""
+    var pivot_mode: Int
+    """`PIVOT_BOUNDS_CENTER` (centre of the selection's bounds) or `PIVOT_ACTIVE` (the primary entity)."""
+    var scale_snap: Float32
+    """Scale-factor step used when snapping is on (0.1 = 10%)."""
+    var gz_dragging: Bool
+    var gz_handle: Int
+    var gz_mode: Int
+    var gz_seq: UInt64
+    var gz_seq_counter: UInt64
+    var gz_start_ray: ViewportRay
+    var gz_prev_ray: ViewportRay
+    var gz_start_pivot: Vec3
+    var gz_rot: Quat
+    var gz_snaps: List[SelectedTransformSnap]
+    var gz_angle: Float32
+    """Rotation accumulated frame by frame, so one drag can turn past +-180 degrees."""
+    var gz_start_mx: Float32
+    var gz_start_my: Float32
+    var gz_last_delta: Vec3
+    """Last valid translate delta of the drag: a frame whose ray misses the axis/plane keeps it."""
+    var gz_last_sf: Vec3
+    """Last valid scale factor of the drag (same rule as `gz_last_delta`)."""
+    var gz_applied: Bool
+    """The drag has moved something. Until then a press without motion records nothing."""
+    var marquee_active: Bool
+    var viewport_hovered: Bool
+    """Set by the host each frame: the mouse is over the scene panel (wheel / middle / Alt navigation)."""
+    var marquee_x0: Float32
+    var marquee_y0: Float32
+    var marquee_x1: Float32
+    var marquee_y1: Float32
     var snap_enabled: Bool
     var grid_snap_m: Float32
     var angle_snap_deg: Float32
@@ -2108,6 +2401,7 @@ struct FlintStudioState(Movable):
     var input_map: InputMap
     var cam_target: Vec3
     var ui_edit_seq: UInt64
+    var _edit_focus_id: UInt64
     var menu: scene_menu.SceneMenu
     var source_editor: EmbeddedIde
     var scene_file_path: String
@@ -2118,14 +2412,61 @@ struct FlintStudioState(Movable):
     var asset_browser_scanned: Bool
 
     var dirty: Bool
-    var autosave_interval_sec: Float32
-    var _autosave_elapsed: Float32
     var _autosave_pending: Bool
+    """Edits since the last autosave (set by `mark_dirty(True)`, cleared by each autosave write)."""
     var quit_requested: Bool
     var confirm_modal_open: Bool
-    var confirm_modal_action: Int  # 0=none, 1=quit, 2=new_scene
+    var confirm_modal_action: Int  # 0=none, 1=quit, 2=new_scene, 3=load_scene (`pending_load_path`)
+    var pending_load_path: String
+    var file_modal_open: Bool
+    var file_modal_save_as: Bool
+    """True for File -> Save As, False for File -> Open."""
+    var file_modal_path: String
+    var recent_scenes: List[String]
+    var console_open: Bool
+    var console_log: List[String]
+    """Every toast message (newest last, capped) so a missed toast can be read again."""
+    var help_open: Bool
+    var welcome_open: Bool
+    var rename_focus_requested: Bool
+    var last_prefab_entry: String
+    var next_editor_id: UInt64
+    var autosave_interval_sec: Float32
+    """Seconds of dirty editing between autosaves (0 disables)."""
+    var _autosave_accum_sec: Float32
+    var last_autosave_path: String
+    var editor_id_slots: Dict[UInt64, Int]
+    var _saved_tx_id: UInt64
+    """Top undo entry when the scene was last saved / loaded (`_refresh_dirty_from_history`)."""
+    var mcp_replay_client: List[Int]
+    var mcp_replay_tool: List[String]
+    var mcp_replay_args: List[String]
+    var mcp_replay_step: List[UInt64]
+    var mcp_replay_editor_id: List[UInt64]
+    """Gated MCP calls the user approved, queued for the host to re-run exactly as the agent sent them
+    (connection, tool, arguments, the agent step they complete, and the entity the user saw)."""
+    var mcp_client_agents: Dict[Int, UInt32]
+    """MCP connection key -> its own agent session in the Agents panel."""
+    var flmat_pending_path: String
+    """Disk path of a .flmat whose Inspector text fields are being edited; saved once on blur, not per keystroke."""
+    var flmat_pending: FlmatAsset
+    var flmat_pending_eid: Int
+    var flmat_pending_ref: String
+    var flmat_pending_editor_id: UInt64
+    """Stable id of the entity the pending material edit is for (the slot may be reused)."""
+    var flmat_pending_stamp: Tuple[Int, Int]
+    """(size, mtime) of the .flmat when the edit began: a file changed on disk is never overwritten."""
+    var flmat_pending_touch_sec: Float32
+    """Last time the Inspector showed the pending edit; once it is gone from view the edit is saved."""
     var toasts: List[StudioToast]
-    var clipboard_entity_ids: List[Int]
+    var clipboard_editor_ids: List[UInt64]
+    """Copied entities by stable `editor_id` (slots are reused after delete / undo / load)."""
+    var _time_travel_view_blob: List[UInt8]
+    """The checkpoint time travel is showing; an edit attempted meanwhile is rolled back to it."""
+    var gz_saved_redo: List[EditorTransaction]
+    """Redo history parked while a gizmo drag runs; a cancelled (or motionless) drag gives it back."""
+    var fail_world_capture_for_test: Bool
+    """Test hook: `_capture_world_blob` fails, as a world that cannot be serialized would."""
     var show_navmesh_overlay: Bool
     var show_collider_overlay: Bool
 
@@ -2143,6 +2484,7 @@ struct FlintStudioState(Movable):
     var anim_mode: Int
     var ui_scale: Float32
     var _next_tx_id: UInt64
+    var undo_byte_budget: Int  # undo + redo history cap in bytes (default `MAX_UNDO_BLOB_BYTES`)
     var _active_tx_agent_id: Int
     var _active_tx_step_id: UInt64
     var workspace_mgr: WorkspacePresetManager
@@ -2163,10 +2505,14 @@ struct FlintStudioState(Movable):
     var code_drawer: CodeDrawer
     var mocap: MocapStudioState
     var _mocap_initialized: Bool
+    var code_build_jobs: JobRunner
+    """Async gameplay `.so` build started by Build & Reload (polled by `poll_code_build`)."""
+    var code_build_id: Int
+    var code_build_so: String
+    var code_build_deadline: Float64
     var show_grid_overlay: Bool
     var cam_ortho: Bool
     var gallery_play_hud_active: Bool
-    var entity_locked: Dict[Int, Bool]
     var _last_screen_w: Float32
     var _last_screen_h: Float32
 
@@ -2215,6 +2561,7 @@ struct FlintStudioState(Movable):
         register_ai_codecs(self.registry)
         self.registry.register[StudioEntityMetaComponent]()
         self.registry.register[StudioStyleComponent]()
+        self.registry.register[StudioEditorIdComponent]()
         self.registry.ensure_registered_in_world(self.app.world)
         self.app.startup()
         var asset_pre_sid = -1
@@ -2239,12 +2586,45 @@ struct FlintStudioState(Movable):
         self.selected_entity_ids = List[Int]()
         self.selection_anchor_id = -1
         self.hierarchy_expanded = Dict[Int, Bool]()
+        self.scene_version = UInt64(0)
+        self.hierarchy_expand_version = UInt64(0)
+        self.hierarchy_row_cache = HierarchyRowCache()
 
         self.gizmo_mode = GIZMO_MODE_TRANSLATE
         self.gizmo_local_space = False
         self.active_gizmo_handle = GIZMO_AXIS_NONE
         self.hovered_gizmo_handle = GIZMO_AXIS_NONE
         self.gizmo_drag_delta_text = String("")
+        self.viewport_xf = ViewportTransform(
+            RectF(0.0, 0.0, Float32(max(1, width)), Float32(max(1, height))),
+            Float32(max(1, width)),
+            Float32(max(1, height)),
+            Float32(1.0),
+        )
+        self.pivot_mode = PIVOT_BOUNDS_CENTER
+        self.scale_snap = Float32(0.1)
+        self.gz_dragging = False
+        self.gz_handle = GIZMO_AXIS_NONE
+        self.gz_mode = GIZMO_MODE_TRANSLATE
+        self.gz_seq = UInt64(0)
+        self.gz_seq_counter = UInt64(0)
+        self.gz_start_ray = ViewportRay()
+        self.gz_prev_ray = ViewportRay()
+        self.gz_start_pivot = Vec3()
+        self.gz_rot = Quat.identity()
+        self.gz_snaps = List[SelectedTransformSnap]()
+        self.gz_angle = Float32(0.0)
+        self.gz_start_mx = Float32(0.0)
+        self.gz_start_my = Float32(0.0)
+        self.gz_last_delta = Vec3()
+        self.gz_last_sf = Vec3(1.0, 1.0, 1.0)
+        self.gz_applied = False
+        self.marquee_active = False
+        self.viewport_hovered = False
+        self.marquee_x0 = Float32(0.0)
+        self.marquee_y0 = Float32(0.0)
+        self.marquee_x1 = Float32(0.0)
+        self.marquee_y1 = Float32(0.0)
         self.snap_enabled = True
         self.grid_snap_m = Float32(0.25)
         self.angle_snap_deg = Float32(15.0)
@@ -2301,6 +2681,7 @@ struct FlintStudioState(Movable):
         self.anim_mode = UI_ANIM_NORMAL
         self.ui_scale = Float32(1.0)
         self._next_tx_id = UInt64(1)
+        self.undo_byte_budget = MAX_UNDO_BLOB_BYTES
         self._active_tx_agent_id = 0
         self._active_tx_step_id = UInt64(0)
         self.ui_ctx.dock_style_v2 = True
@@ -2309,6 +2690,7 @@ struct FlintStudioState(Movable):
         self.header_bar = StudioHeaderBar()
         self.viewport_hud = ViewportHud()
         self.command_palette = StudioCommandPalette()
+        _ = self.command_palette.frecency.load_file(_studio_palette_frecency_path())
         self.key_chord_hud = KeyChordHud()
         self.toast_mgr = ToastManager()
         self.job_tracker = JobProgressTracker()
@@ -2324,19 +2706,26 @@ struct FlintStudioState(Movable):
         self.code_drawer = CodeDrawer()
         self.mocap = MocapStudioState()
         self._mocap_initialized = False
+        self.code_build_jobs = JobRunner()
+        self.code_build_id = -1
+        self.code_build_so = String()
+        self.code_build_deadline = 0.0
         self.show_grid_overlay = True
         self.cam_ortho = False
         self.gallery_play_hud_active = False
-        self.entity_locked = Dict[Int, Bool]()
         self._last_screen_w = Float32(max(320, width))
         self._last_screen_h = Float32(max(240, height))
         self.camera_rig = CameraRig(CAM_MODE_ORBIT_FOLLOW)
+        # Editor views must reach straight top-down / bottom-up (Top view used to stop at 85 degrees).
+        self.camera_rig.min_pitch_deg = Float32(-89.5)
+        self.camera_rig.max_pitch_deg = Float32(89.5)
         self.camera_rig.fov_deg = Float32(52.0)
         self.camera_rig.look_offset = Vec3(0.0, 0.0, 0.0)
         self._cam_dummy_world = PhysicsWorld()
         self.input_map = _create_studio_input_map()
         self.cam_target = Vec3(0.0, 0.9, 1.0)
         self.ui_edit_seq = UInt64(50000)
+        self._edit_focus_id = UInt64(0)
         self.source_editor = EmbeddedIde()
         self.menu = scene_menu.SceneMenu(project_root)
         self.project_root = project_root
@@ -2346,14 +2735,45 @@ struct FlintStudioState(Movable):
         self.asset_browser_entries = List[String]()
         self.asset_browser_scanned = False
         self.dirty = False
-        self.autosave_interval_sec = 120
-        self._autosave_elapsed = 0
         self._autosave_pending = False
         self.quit_requested = False
         self.confirm_modal_open = False
         self.confirm_modal_action = 0
+        self.pending_load_path = String("")
+        self.file_modal_open = False
+        self.file_modal_save_as = False
+        self.file_modal_path = String("")
+        self.recent_scenes = List[String]()
+        self.console_open = False
+        self.console_log = List[String]()
+        self.help_open = False
+        self.welcome_open = False
+        self.rename_focus_requested = False
+        self.last_prefab_entry = ""
+        self._saved_tx_id = UInt64(0)
+        self.next_editor_id = UInt64(1)
+        self.autosave_interval_sec = Float32(120.0)
+        self._autosave_accum_sec = Float32(0.0)
+        self.last_autosave_path = String("")
+        self.editor_id_slots = Dict[UInt64, Int]()
+        self.mcp_replay_client = List[Int]()
+        self.mcp_replay_tool = List[String]()
+        self.mcp_replay_args = List[String]()
+        self.mcp_replay_step = List[UInt64]()
+        self.mcp_replay_editor_id = List[UInt64]()
+        self.mcp_client_agents = Dict[Int, UInt32]()
+        self.flmat_pending_path = String("")
+        self.flmat_pending = FlmatAsset()
+        self.flmat_pending_eid = -1
+        self.flmat_pending_ref = String("")
+        self.flmat_pending_editor_id = UInt64(0)
+        self.flmat_pending_stamp = (-1, 0)
+        self.flmat_pending_touch_sec = Float32(0.0)
         self.toasts = List[StudioToast]()
-        self.clipboard_entity_ids = List[Int]()
+        self.clipboard_editor_ids = List[UInt64]()
+        self._time_travel_view_blob = List[UInt8]()
+        self.gz_saved_redo = List[EditorTransaction]()
+        self.fail_world_capture_for_test = False
         self.show_navmesh_overlay = True
         self.show_collider_overlay = False
 
@@ -2380,13 +2800,22 @@ struct FlintStudioState(Movable):
         var fix_init = self.app.resources.get_ptr_mut[FixedTime]()
         if fix_init:
             fix_init.value()[unsafe_offset=0].overstep_alpha = Float32(1.0)
+        # Registered once at startup so the unit cube's mesh id is identical in every session
+        # (saved scenes store renderer mesh ids; a lazy registration order would differ per session).
+        _ = self.default_cube_mesh_id()
 
     def shutdown(mut self):
         if self.hot_reload_host.is_loaded():
             _ = self.hot_reload_host.unload(self.app.world, self.app.resources, is_reload=False)
         _save_studio_dockspace(self.dock)
+        _ = self.command_palette.frecency.save_file(_studio_palette_frecency_path())
         self.menu.close()
         self.source_editor.close()
+        # The swapchain goes before the window: STAGE_SHUTDOWN closes the window (and its wl_display /
+        # xcb connection, which the driver's swapchain buffers live on) before the renderer.
+        var sc_ren = self.app.resources.get_ptr_mut[ScalableRenderer]()
+        if sc_ren and sc_ren.value()[unsafe_offset=0].uses_vulkan():
+            sc_ren.value()[unsafe_offset=0].gpu_slot[0].vk.close_swapchain()
         self.app.shutdown()
 
     # ---- Entity Resolution & Sync Helpers ----
@@ -2506,8 +2935,83 @@ struct FlintStudioState(Movable):
         self._ground_body_id = -1
         self._sync_ecs_and_physics()
 
+    def _ensure_editor_ids(mut self):
+        """Gives every live entity a unique `editor_id` and rebuilds the id -> slot map. Entities from
+        older scenes get fresh ids; a duplicated id (copied components) is reassigned on the later slot."""
+        var seen = Dict[UInt64, Int]()
+        var max_id = UInt64(0)
+        var missing = List[Int]()
+        for i in range(len(self.app.world.entities)):
+            if not self.app.world.entities[i].alive:
+                continue
+            var e = Entity(UInt32(i), self.app.world.entities[i].generation)
+            var id_opt = self.app.world.get_ptr[StudioEditorIdComponent](e)
+            if not id_opt:
+                missing.append(i)
+                continue
+            var eid_v = id_opt.value()[unsafe_offset=0].editor_id
+            if eid_v == 0 or eid_v in seen:
+                missing.append(i)
+                continue
+            seen[eid_v] = i
+            if eid_v > max_id:
+                max_id = eid_v
+        if self.next_editor_id <= max_id:
+            self.next_editor_id = max_id + 1
+        for mi in range(len(missing)):
+            var slot = missing[mi]
+            var e = Entity(UInt32(slot), self.app.world.entities[slot].generation)
+            var nid = self.next_editor_id
+            self.next_editor_id += 1
+            _ = self.app.world.insert[StudioEditorIdComponent](e, StudioEditorIdComponent(nid))
+            seen[nid] = slot
+        self.editor_id_slots = seen^
+
+    def editor_id_of(self, entity_id: Int) -> UInt64:
+        """Stable `editor_id` of a live slot, or 0."""
+        var e = self.resolve_entity(entity_id)
+        if not e.valid():
+            return UInt64(0)
+        var id_opt = self.app.world.get_ptr[StudioEditorIdComponent](e)
+        if not id_opt:
+            return UInt64(0)
+        return id_opt.value()[unsafe_offset=0].editor_id
+
+    def slot_for_editor_id(self, editor_id: UInt64) -> Int:
+        """Current slot of the entity with this `editor_id`, or -1 when it no longer exists."""
+        if editor_id == 0:
+            return -1
+        var slot = self.editor_id_slots.get(editor_id, -1)
+        if slot >= 0 and self.editor_id_of(slot) == editor_id:
+            return slot
+        # Map is stale (restore/load since the last sync): scan once.
+        for i in range(len(self.app.world.entities)):
+            if self.app.world.entities[i].alive and self.editor_id_of(i) == editor_id:
+                return i
+        return -1
+
+    def entity_ref(self, entity_id: Int) -> EntityRef:
+        var e = self.resolve_entity(entity_id)
+        if not e.valid():
+            return EntityRef.null()
+        return EntityRef(self.editor_id_of(entity_id), entity_id, e.generation)
+
+    def resolve_ref(self, r: EntityRef) -> Int:
+        """Slot the reference points at now, or -1. A slot that was reused by another entity never
+        resolves: the generation (and `editor_id`, when the ref has one) must still match."""
+        if r.editor_id != 0:
+            return self.slot_for_editor_id(r.editor_id)
+        var e = self.resolve_entity(r.slot)
+        if e.valid() and e.generation == r.generation:
+            return r.slot
+        return -1
+
     def _sync_compat_view(mut self):
+        self._ensure_editor_ids()
         var cap = len(self.app.world.entities)
+        # Any change to what the Outliner shows (slot count, alive, parent, name, flags) bumps
+        # `scene_version`, whichever path changed the world (MCP, PIE, plugins, ...).
+        var outline_changed = len(self.entities) != cap
         while len(self.entities) < cap:
             self.entities.append(StudioEntityView(len(self.entities), "Entity", alive=False))
         while len(self.entities) > cap:
@@ -2515,16 +3019,26 @@ struct FlintStudioState(Movable):
 
         for i in range(cap):
             if not self.app.world.entities[i].alive:
+                if self.entities[i].alive:
+                    outline_changed = True
                 self.entities[i].entity_id = i
                 self.entities[i].alive = False
                 self.entities[i].parent_id = -1
+                self.entities[i].visible = True  # a recycled slot never inherits a hidden flag
                 continue
 
             var e = Entity(UInt32(i), self.app.world.entities[i].generation)
             ref v = self.entities[i]
+            var new_parent = self.parent_of(i)
+            if not v.alive or v.parent_id != new_parent:
+                outline_changed = True
+            var prev_name = v.name
+            var prev_locked = v.locked
+            var prev_enabled = v.enabled
             v.entity_id = i
             v.alive = True
-            v.parent_id = self.parent_of(i)
+            v.parent_id = new_parent
+            var prev_visible = v.visible
 
             var lt_opt = self.app.world.get_ptr[LocalTransform](e)
             if lt_opt:
@@ -2550,7 +3064,7 @@ struct FlintStudioState(Movable):
                 v.has_mesh_renderer = False
                 v.mesh_id = -1
                 v.material_id = 0
-                v.visible = True
+                v.visible = prev_visible  # nothing to hide: keep the editor flag as the user set it
                 v.mesh_ref = AssetRef()
                 v.material_ref = AssetRef()
 
@@ -2587,8 +3101,12 @@ struct FlintStudioState(Movable):
                 v.name = meta.name
                 v.locked = meta.locked
                 v.enabled = meta.enabled
-                if not mr_opt:
-                    v.visible = meta.enabled
+                if not meta.enabled or not v.has_mesh_renderer:
+                    # Visible is persisted on the meta component: a disabled entity's mesh is hidden
+                    # but its own Visible switch keeps its value, and a light has no mesh to hide.
+                    # An enabled mesh draws exactly when Visible is on, so the renderer flag stands
+                    # (it is also the only record of Visible in pre-v3 scenes).
+                    v.visible = meta.visible
                 v.mesh_handle = UntypedHandle(meta.mesh_handle_packed)
                 v.material_handle = UntypedHandle(meta.material_handle_packed)
                 v.collider_kind = meta.collider_kind
@@ -2600,6 +3118,11 @@ struct FlintStudioState(Movable):
                 v.locked = False
                 v.enabled = True
                 v.collider_kind = COLLIDER_NONE
+            if (
+                v.name != prev_name or v.locked != prev_locked or v.enabled != prev_enabled
+                or v.visible != prev_visible
+            ):
+                outline_changed = True
 
             var col_opt = self.app.world.get_ptr[ColliderComponent](e)
             if col_opt:
@@ -2714,6 +3237,8 @@ struct FlintStudioState(Movable):
                 v.has_prefab = False
                 v.prefab_ref = AssetRef()
                 v.prefab_name = ""
+        if outline_changed:
+            self.bump_scene_version()
 
     def _sync_ecs_and_physics(mut self):
         self._propagate_transforms_immediate()
@@ -2724,6 +3249,10 @@ struct FlintStudioState(Movable):
         self._sync_ecs_and_physics()
 
     def _capture_world_blob(self) -> List[UInt8]:
+        """Whole-world snapshot, or an empty list when it cannot be taken: callers must then refuse the
+        edit / load rather than record an undo entry that can never be restored."""
+        if self.fail_world_capture_for_test:
+            return List[UInt8]()
         var w = BlobWriter()
         try:
             self.app.world.snapshot_blob(w)
@@ -2745,11 +3274,14 @@ struct FlintStudioState(Movable):
         if len(data) == 0:
             return False
         try:
-            var r = BlobReader(data.copy())
+            # Undo entries are stored LZ4-packed (`_pack_undo_blob`); checkpoints and captures are raw.
+            var r = BlobReader(lz4_unpack(data) if lz4_packed_raw_size(data) >= 0 else data.copy())
             self.app.world.restore_blob(r)
+            self.bump_scene_version()
             if r.failed:
                 return False
         except:
+            self.bump_scene_version()
             return False
         self.registry.ensure_registered_in_world(self.app.world)
         self.gpu_materials.clear_entity_slots()
@@ -2816,6 +3348,7 @@ struct FlintStudioState(Movable):
         self.camera_rig.pitch_deg = det_atan2(-fwd.y, horiz) * rad_to_deg
         self.camera_rig.fov_deg = self.fov_y_deg
         self.camera_rig.look_offset = Vec3(0.0, 0.0, 0.0)
+        self.camera_rig.shoulder_offset = Vec3()
         self.camera_rig.pivot_spring.value = target
         self.camera_rig.pivot_spring.velocity = Vec3()
         self.camera_rig.pivot_initialized = True
@@ -2863,7 +3396,7 @@ struct FlintStudioState(Movable):
                 0.0,
                 STUDIO_HEADER_BAR_H,
                 lw,
-                max(Float32(64.0), lh - STUDIO_HEADER_BAR_H),
+                max(Float32(64.0), lh - STUDIO_HEADER_BAR_H - STUDIO_STATUS_BAR_H),
             )
         )
         var vp = self.dock.find_panel("SceneViewport")
@@ -2955,11 +3488,47 @@ struct FlintStudioState(Movable):
 
     def set_hierarchy_expanded(mut self, entity_id: Int, expanded: Bool):
         self.hierarchy_expanded[entity_id] = expanded
+        self.hierarchy_expand_version += 1
 
     def toggle_hierarchy_expanded(mut self, entity_id: Int) -> Bool:
         var next_v = not self.is_hierarchy_expanded(entity_id)
-        self.hierarchy_expanded[entity_id] = next_v
+        self.set_hierarchy_expanded(entity_id, next_v)
         return next_v
+
+    def bump_scene_version(mut self):
+        """Marks the scene structure / names / flags as changed, so cached Outliner rows rebuild."""
+        self.scene_version += 1
+
+    def outliner_rows(mut self) -> List[HierarchyRow]:
+        """The rows the Outliner shows for its current search, served from the row cache."""
+        var q = self.outliner_state.search_query
+        return self.cached_hierarchy_rows(q)
+
+    def cached_hierarchy_rows(mut self, query: String) -> List[HierarchyRow]:
+        """`hierarchy_rows_for_query(query)`, served from `hierarchy_row_cache` while its key is unchanged."""
+        ref c = self.hierarchy_row_cache
+        var w_slots = len(self.app.world.entities)
+        if not (
+            c.valid
+            and c.scene_version == self.scene_version
+            and c.expand_version == self.hierarchy_expand_version
+            and c.restore_epoch == self.app.world.restore_epoch
+            and c.world_slots == w_slots
+            and c.world_live == self.app.world.live_entities
+            and c.query == query
+        ):
+            var rows = self.hierarchy_rows_for_query(query)
+            ref cm = self.hierarchy_row_cache
+            cm.rows = rows^
+            cm.valid = True
+            cm.scene_version = self.scene_version
+            cm.expand_version = self.hierarchy_expand_version
+            cm.restore_epoch = self.app.world.restore_epoch
+            cm.world_slots = w_slots
+            cm.world_live = self.app.world.live_entities
+            cm.query = query
+            cm.rebuild_count += 1
+        return self.hierarchy_row_cache.rows.copy()
 
     def _collect_hierarchy_dfs(
         self,
@@ -2968,7 +3537,7 @@ struct FlintStudioState(Movable):
         depth: Int,
         mut out: List[HierarchyRow],
         mut visited: List[Bool],
-        include_collapsed: Bool,
+        ignore_collapse: Bool = False,
     ):
         if entity_id < 0 or entity_id >= len(visited) or visited[entity_id] or depth >= 64:
             return
@@ -2977,24 +3546,106 @@ struct FlintStudioState(Movable):
         var has_ch = len(ch) > 0
         var exp = self.is_hierarchy_expanded(entity_id)
         out.append(HierarchyRow(entity_id, parent_id, depth, has_ch, exp))
-        if has_ch and (exp or include_collapsed):
+        if has_ch and (exp or ignore_collapse):
             for i in range(len(ch)):
-                self._collect_hierarchy_dfs(ch[i], entity_id, depth + 1, out, visited, include_collapsed)
+                self._collect_hierarchy_dfs(ch[i], entity_id, depth + 1, out, visited, ignore_collapse)
 
-    def hierarchy_visible_rows(self, include_collapsed: Bool = False) -> List[HierarchyRow]:
+    def hierarchy_key_nav(mut self, up: Bool, down: Bool, left: Bool, right: Bool) -> Bool:
+        """Arrow keys in the Hierarchy: Up/Down move the selection through the visible rows,
+        Left collapses (or jumps to the parent), Right expands (or steps into the first child)."""
+        if not (up or down or left or right):
+            return False
+        # Walk exactly the rows the Outliner shows, so a search filter is respected.
+        var rows = self.outliner_rows()
+        if len(rows) == 0:
+            return False
+        var cur = -1
+        for i in range(len(rows)):
+            if rows[i].entity_id == self.selected_entity_id:
+                cur = i
+                break
+        if cur < 0:
+            self.select_entity(rows[0].entity_id)
+            return True
+        var row = rows[cur]
+        if up and cur > 0:
+            self.select_entity(rows[cur - 1].entity_id)
+        elif down and cur + 1 < len(rows):
+            self.select_entity(rows[cur + 1].entity_id)
+        elif left:
+            if row.has_children and row.expanded:
+                self.set_hierarchy_expanded(row.entity_id, False)
+            elif row.parent_id >= 0:
+                self.select_entity(row.parent_id)
+        elif right and row.has_children:
+            if not row.expanded:
+                self.set_hierarchy_expanded(row.entity_id, True)
+            elif cur + 1 < len(rows):
+                self.select_entity(rows[cur + 1].entity_id)
+        return True
+
+    def hierarchy_visible_rows(self, ignore_collapse: Bool = False, include_collapsed: Bool = False) -> List[HierarchyRow]:
+        """Outliner rows in DFS order. `ignore_collapse` (alias `include_collapsed`) also emits the
+        children of collapsed parents (used by search)."""
         var out = List[HierarchyRow]()
+        var all_branches = ignore_collapse or include_collapsed
         var n = len(self.app.world.entities)
         if n == 0:
             return out^
         var visited = List[Bool](length=n, fill=False)
         for i in range(n):
             if self.app.world.entities[i].alive and self.parent_of(i) < 0:
-                self._collect_hierarchy_dfs(i, -1, 0, out, visited, include_collapsed)
+                self._collect_hierarchy_dfs(i, -1, 0, out, visited, all_branches)
         # Fallback for any orphan whose parent died externally (never emit children of collapsed live parents)
         for i in range(n):
             if self.app.world.entities[i].alive and not visited[i] and self.parent_of(i) < 0:
-                self._collect_hierarchy_dfs(i, -1, 0, out, visited, include_collapsed)
+                self._collect_hierarchy_dfs(i, -1, 0, out, visited, all_branches)
         return out^
+
+    def hierarchy_rows_for_query(self, query: String) -> List[HierarchyRow]:
+        """Outliner rows for a search: every entity whose name matches, including children of collapsed
+        parents (a search that skips collapsed branches hides exactly what the user is looking for)."""
+        var q = Self._ascii_lower(String(query.strip()))
+        if q.byte_length() == 0:
+            return self.hierarchy_visible_rows()
+        var all_rows = self.hierarchy_visible_rows(ignore_collapse=True)
+        var out = List[HierarchyRow]()
+        for i in range(len(all_rows)):
+            var eid = all_rows[i].entity_id
+            if eid < len(self.entities) and ascii_contains_ci(self.entities[eid].name, q):
+                out.append(all_rows[i])
+        return out^
+
+    def set_entity_locked(mut self, entity_id: Int, locked: Bool) -> Bool:
+        """Locks an entity against viewport picking, marquee and gizmo moves. Stored on the entity's
+        metadata component, so it is saved with the scene and follows the entity (never a reused slot)."""
+        var e = self.resolve_entity(entity_id)
+        if not e.valid():
+            return False
+        var m = self.app.world.get_ptr_mut[StudioEntityMetaComponent](e)
+        if not m:
+            return False
+        m.value()[unsafe_offset=0].locked = locked
+        if entity_id < len(self.entities):
+            self.entities[entity_id].locked = locked
+        self.bump_scene_version()
+        self.mark_dirty(True)
+        return True
+
+    def is_entity_locked(self, entity_id: Int) -> Bool:
+        return entity_id >= 0 and entity_id < len(self.entities) and self.is_alive_id(entity_id) and self.entities[entity_id].locked
+
+    def apply_viewport_click_pick(mut self, hit: Bool, entity_id: Int, additive: Bool) -> Bool:
+        """Viewport click result: select the hit entity; a hit on a locked entity is ignored (the
+        selection is left as it is); a miss clears the selection unless the click is additive."""
+        if hit and self.is_alive_id(entity_id):
+            if self.is_entity_locked(entity_id):
+                return False
+            self.select_entity(entity_id, multi_select=additive)
+            return True
+        if not additive:
+            self.clear_selection()
+        return False
 
     def hierarchy_display_order(self) -> List[Int]:
         var rows = self.hierarchy_visible_rows()
@@ -3009,7 +3660,10 @@ struct FlintStudioState(Movable):
         multi_select: Bool = False,
         range_select: Bool = False,
         visible_order: List[Int] = List[Int](),
+        add_only: Bool = False,
     ):
+        """`multi_select` toggles `entity_id` in the selection (Ctrl+click); with `add_only` it only
+        ever adds (Shift+click / Shift+marquee) and makes an already-selected entity the primary."""
         self._normalize_selection_from_primary()
         if not self.is_alive_id(entity_id):
             if (not multi_select) and (not range_select):
@@ -3048,7 +3702,10 @@ struct FlintStudioState(Movable):
                 if self.selected_entity_ids[i] == entity_id:
                     found_idx = i
                     break
-            if found_idx >= 0:
+            if found_idx >= 0 and add_only:
+                self.selected_entity_id = entity_id
+                self.selection_anchor_id = entity_id
+            elif found_idx >= 0:
                 var next_list = List[Int](capacity=max(0, len(self.selected_entity_ids) - 1))
                 for i in range(len(self.selected_entity_ids)):
                     if i != found_idx:
@@ -3105,32 +3762,59 @@ struct FlintStudioState(Movable):
         return top^
 
     def selection_gizmo_pivot(self) -> Tuple[Bool, Vec3]:
+        """Gizmo pivot: the centre of the selection's bounding box (not the mean of positions, which a
+        cluster of objects on one side pulls off-centre), or the primary entity with `PIVOT_ACTIVE`."""
         var ents = self.selected_entities()
         if len(ents) == 0:
             return (False, Vec3())
-        var sum_p = Vec3()
+        if self.pivot_mode == PIVOT_ACTIVE and self.is_alive_id(self.selected_entity_id):
+            var pe = self.resolve_entity(self.selected_entity_id)
+            var pgt = self.app.world.get_ptr[GlobalTransform](pe)
+            if pgt:
+                return (True, pgt.value()[unsafe_offset=0].translation)
+        var lo = Vec3(Float32(1.0e30), Float32(1.0e30), Float32(1.0e30))
+        var hi = Vec3(Float32(-1.0e30), Float32(-1.0e30), Float32(-1.0e30))
         var cnt = 0
         for i in range(len(ents)):
+            var p = Vec3()
             var gt_opt = self.app.world.get_ptr[GlobalTransform](ents[i])
             if gt_opt:
-                sum_p = sum_p + gt_opt.value()[unsafe_offset=0].translation
-                cnt += 1
+                p = gt_opt.value()[unsafe_offset=0].translation
             else:
                 var lt_opt = self.app.world.get_ptr[LocalTransform](ents[i])
-                if lt_opt:
-                    sum_p = sum_p + lt_opt.value()[unsafe_offset=0].translation
-                    cnt += 1
+                if not lt_opt:
+                    continue
+                p = lt_opt.value()[unsafe_offset=0].translation
+            lo = Vec3(min(lo.x, p.x), min(lo.y, p.y), min(lo.z, p.z))
+            hi = Vec3(max(hi.x, p.x), max(hi.y, p.y), max(hi.z, p.z))
+            cnt += 1
         if cnt == 0:
             return (False, Vec3())
-        return (True, sum_p * (Float32(1.0) / Float32(cnt)))
+        return (True, (lo + hi) * Float32(0.5))
+
+    def toggle_pivot_mode(mut self):
+        self.pivot_mode = PIVOT_ACTIVE if self.pivot_mode == PIVOT_BOUNDS_CENTER else PIVOT_BOUNDS_CENTER
+        self.push_toast("Pivot: Active Entity" if self.pivot_mode == PIVOT_ACTIVE else "Pivot: Bounds Centre", 0, 1.8)
 
     # ---- Editor UX Helpers (Dirty, Toasts, Space, Clipboard, NavBake, Spawn) ----
+
+    def _top_tx_id(self) -> UInt64:
+        return self.undo_stack[len(self.undo_stack) - 1].tx_id if len(self.undo_stack) > 0 else UInt64(0)
+
+    def _refresh_dirty_from_history(mut self):
+        """After undo / redo the scene is clean exactly when history is back at the last save or load
+        (undoing your edits back to the saved state no longer leaves a bogus unsaved-changes mark)."""
+        var clean = self._top_tx_id() == self._saved_tx_id
+        var keep_saved = self._saved_tx_id
+        self.mark_dirty(not clean)
+        self._saved_tx_id = keep_saved
 
     def mark_dirty(mut self, dirty_val: Bool = True):
         self.dirty = dirty_val
         self._autosave_pending = dirty_val
         if not dirty_val:
-            self._autosave_elapsed = 0
+            self._saved_tx_id = self._top_tx_id()
+            self._autosave_accum_sec = Float32(0.0)
         var base_title = "FLINT STUDIO v5 — AAA VISUAL EDITOR"
         var full_title = base_title + " *" if dirty_val else base_title
         self.app.config.title = full_title
@@ -3141,6 +3825,10 @@ struct FlintStudioState(Movable):
                 win_res.value()[unsafe_offset=0].windows[wi].set_title(full_title)
 
     def push_toast(mut self, message: String, severity: Int = 0, ttl_sec: Float32 = 3.0):
+        var tag = String("[error] ") if severity == 2 else (String("[warn] ") if severity == 1 else String(""))
+        self.console_log.append(tag + message)
+        while len(self.console_log) > STUDIO_CONSOLE_CAP:
+            _ = self.console_log.pop(0)
         self.toasts.append(StudioToast(message, severity, ttl_sec))
         while len(self.toasts) > 5:
             _ = self.toasts.pop(0)
@@ -3183,7 +3871,7 @@ struct FlintStudioState(Movable):
     ) -> Bool:
         var sw = screen_w if screen_w > Float32(100.0) else self._last_screen_w
         var sh = screen_h if screen_h > Float32(100.0) else self._last_screen_h
-        var dock_r = RectF(Float32(0.0), STUDIO_HEADER_BAR_H, sw, max(Float32(64.0), sh - STUDIO_HEADER_BAR_H))
+        var dock_r = RectF(Float32(0.0), STUDIO_HEADER_BAR_H, sw, max(Float32(64.0), sh - STUDIO_HEADER_BAR_H - STUDIO_STATUS_BAR_H))
         return self.workspace_mgr.apply_preset(preset_id, self.dock, dock_r)
 
     def wants_keyboard(self) -> Bool:
@@ -3319,7 +4007,11 @@ struct FlintStudioState(Movable):
 
     def open_command_palette(mut self, mode: Int = PALETTE_ALL, initial_query: String = ""):
         self.refresh_command_palette()
-        self.command_palette.open(mode, initial_query)
+        # `open()` defaults would reset the PIE gate set by `refresh_command_palette` and pin the
+        # frecency clock to 0 (no decay), so pass both explicitly.
+        self.command_palette.open(
+            mode, initial_query, pie_active=self.pie.mode != PIE_STOPPED, now_sec=unix_time_sec()
+        )
 
     def _snap_camera_direction(mut self, view_fwd: Vec3):
         var fwd = view_fwd.normalized()
@@ -3331,6 +4023,9 @@ struct FlintStudioState(Movable):
     def execute_palette_action(mut self, res: PaletteActionResult) -> Bool:
         if not res.executed:
             return False
+        # `accept_index` just recorded this use; persist it so frecency survives a crash or kill.
+        if res.frecency_key.byte_length() > 0:
+            _ = self.command_palette.frecency.save_file(_studio_palette_frecency_path())
         if res.kind == PALETTE_ITEM_ENTITY:
             if self.is_alive_id(res.action_id):
                 self.select_entity(res.action_id)
@@ -3362,17 +4057,16 @@ struct FlintStudioState(Movable):
             self.open_command_palette(PALETTE_SPAWN)
             return True
         if cmd_id == PAL_CMD_SAVE_SCENE and not in_play:
-            var ok = self.save_scene_file()
-            self.push_toast("Scene saved" if ok else "Save failed", 0 if ok else 2, 2.5)
-            return ok
+            return self.save_scene_file()  # `save_scene_file` shows its own success / failure toast
         if cmd_id == PAL_CMD_LOAD_SCENE and not in_play:
-            return self.load_scene_file()
-        if cmd_id == PAL_CMD_RECOVER_AUTOSAVE and not in_play:
-            return self.recover_autosave()
+            self.open_file_modal(False)  # "Open Scene..." (Ctrl+O); "Revert Scene to Saved" reloads
+            return True
         if cmd_id == PAL_CMD_NEW_SCENE and not in_play:
             return self.new_scene(force=False)
         if cmd_id == PAL_CMD_RELOAD_SCENE and not in_play:
-            return self.load_scene_file()
+            return self.request_load_scene()
+        if cmd_id == PAL_CMD_RECOVER_AUTOSAVE and not in_play:
+            return self.recover_autosave()
         if cmd_id == PAL_CMD_UNDO and not in_play:
             return self.undo()
         if cmd_id == PAL_CMD_REDO and not in_play:
@@ -3390,20 +4084,13 @@ struct FlintStudioState(Movable):
                 return self.despawn_entity(self.selected_entity_id, record_undo=True)
             return False
         if cmd_id == PAL_CMD_RENAME:
-            _ = WorkspacePresetManager.ensure_panel_visible(self.dock, PANEL_INSPECTOR)
-            return True
+            return self.begin_rename_selected()
         if cmd_id == PAL_CMD_COPY:
             return self.copy_selected() > 0
         if cmd_id == PAL_CMD_PASTE and not in_play:
             return len(self.paste_clipboard(record_undo=True)) > 0
         if cmd_id == PAL_CMD_SELECT_ALL:
-            self.selected_entity_ids.clear()
-            for i in range(len(self.entities)):
-                if self.entities[i].alive:
-                    self.selected_entity_ids.append(i)
-            if len(self.selected_entity_ids) > 0:
-                self.selected_entity_id = self.selected_entity_ids[0]
-                self.selection_anchor_id = self.selected_entity_id
+            self.select_all_entities()
             return True
         if cmd_id == PAL_CMD_CLEAR_SELECTION:
             self.selected_entity_ids.clear()
@@ -3498,22 +4185,13 @@ struct FlintStudioState(Movable):
             return True
 
         if cmd_id == PAL_CMD_TOGGLE_CODE_DRAWER:
-            _ = WorkspacePresetManager.ensure_panel_visible(self.dock, PANEL_CODE_DRAWER)
+            _ = self.toggle_dock_panel(PANEL_CODE_DRAWER)
+            return True
+        if cmd_id == PAL_CMD_OPEN_SOURCE_EDITOR:
+            self.source_editor.requested = True
             return True
         if cmd_id == PAL_CMD_BUILD_HOT_RELOAD:
-            var ok = self.reload_gameplay_plugin()
-            self.code_drawer.set_build_status(
-                BUILD_STATUS_OK if ok else BUILD_STATUS_ERROR,
-                self.code_drawer.build_generation + 1,
-                0 if ok else 1,
-                0,
-            )
-            self.push_toast(
-                "Reloaded gameplay .so" if ok else ("Reload .so failed: " + self.hot_reload_host.last_error),
-                0 if ok else 2,
-                2.8,
-            )
-            return ok
+            return self.start_code_build()
         if cmd_id == PAL_CMD_SHOW_DIAGNOSTICS:
             self.code_drawer.problems_open = True
             _ = WorkspacePresetManager.ensure_panel_visible(self.dock, PANEL_CODE_DRAWER)
@@ -3527,9 +4205,7 @@ struct FlintStudioState(Movable):
             self.push_toast(pr[1], 0 if pr[0] else 2, 3.2)
             return pr[0]
         if cmd_id == PAL_CMD_PACKAGE_PROFILES and not in_play:
-            var pr = self.package_project()
-            self.push_toast(pr[1], 0 if pr[0] else 2, 3.2)
-            return pr[0]
+            return self.package_project_with_profiles()
         if cmd_id == PAL_CMD_TOGGLE_NAVMESH_OVERLAY:
             self.show_navmesh_overlay = not self.show_navmesh_overlay
             var nav_res = self.app.resources.get_ptr_mut[NavPluginStateResource]()
@@ -3543,7 +4219,7 @@ struct FlintStudioState(Movable):
             self.show_grid_overlay = not self.show_grid_overlay
             return True
         if cmd_id == PAL_CMD_TOGGLE_ORTHO_CAMERA:
-            self.cam_ortho = not self.cam_ortho
+            self.toggle_ortho_camera()
             return True
         if cmd_id == PAL_CMD_TOGGLE_PERF_SPARKLINE:
             self.viewport_hud.perf_expanded = not self.viewport_hud.perf_expanded
@@ -3567,10 +4243,16 @@ struct FlintStudioState(Movable):
         if not in_play:
             if cmd_id == PAL_CMD_SPAWN_EMPTY:
                 return self.spawn_card_entity(0) >= 0
-            if cmd_id == PAL_CMD_SPAWN_CUBE or cmd_id == PAL_CMD_SPAWN_SPHERE or cmd_id == PAL_CMD_SPAWN_PLANE:
-                return self.spawn_card_entity(1) >= 0
-            if cmd_id == PAL_CMD_SPAWN_POINT_LIGHT or cmd_id == PAL_CMD_SPAWN_SUN_LIGHT:
-                return self.spawn_card_entity(2) >= 0
+            if cmd_id == PAL_CMD_SPAWN_CUBE:
+                return self.spawn_card_entity(SPAWN_CARD_CUBE) >= 0
+            if cmd_id == PAL_CMD_SPAWN_SPHERE:
+                return self.spawn_card_entity(SPAWN_CARD_SPHERE) >= 0
+            if cmd_id == PAL_CMD_SPAWN_PLANE:
+                return self.spawn_card_entity(SPAWN_CARD_PLANE) >= 0
+            if cmd_id == PAL_CMD_SPAWN_POINT_LIGHT:
+                return self.spawn_card_entity(SPAWN_CARD_POINT_LIGHT) >= 0
+            if cmd_id == PAL_CMD_SPAWN_SUN_LIGHT:
+                return self.spawn_card_entity(SPAWN_CARD_SUN) >= 0
             if cmd_id == PAL_CMD_SPAWN_SPOT_LIGHT:
                 return self.spawn_card_entity(3) >= 0
             if cmd_id == PAL_CMD_SPAWN_CAMERA:
@@ -3578,7 +4260,7 @@ struct FlintStudioState(Movable):
             if cmd_id == PAL_CMD_SPAWN_AUDIO:
                 return self.spawn_card_entity(5) >= 0
             if cmd_id == PAL_CMD_SPAWN_PHYSICS_BOX:
-                return self.spawn_entity("PhysBox_" + String(self.live_entity_count() + 1), position=Vec3(0.0, 2.0, 0.0), collider_kind=COLLIDER_BOX, mass=5.0, mesh_id=1) >= 0
+                return self.spawn_entity("PhysBox_" + String(self.live_entity_count() + 1), position=Vec3(0.0, 2.0, 0.0), collider_kind=COLLIDER_BOX, mass=5.0) >= 0
             if cmd_id == PAL_CMD_SPAWN_TRIGGER:
                 var tid = self.spawn_entity("Trigger_" + String(self.live_entity_count() + 1), position=Vec3(0.0, 1.0, 0.0), collider_kind=COLLIDER_BOX, mass=0.0, mesh_id=-1)
                 if tid >= 0:
@@ -3589,7 +4271,7 @@ struct FlintStudioState(Movable):
                     self._sync_compat_view()
                 return tid >= 0
             if cmd_id == PAL_CMD_SPAWN_PREFAB:
-                return self.spawn_card_entity(0) >= 0
+                return self.spawn_prefab_from_palette()
 
         if cmd_id == PAL_CMD_AGENT_SCENE_BUILDER:
             _ = self.apply_workspace_preset(WORKSPACE_AGENT_STUDIO)
@@ -3619,7 +4301,7 @@ struct FlintStudioState(Movable):
             if self.workspace_mgr.active_preset == WORKSPACE_AGENT_STUDIO:
                 _ = self.apply_workspace_preset(WORKSPACE_EDIT)
             else:
-                _ = WorkspacePresetManager.ensure_panel_visible(self.dock, PANEL_AGENTS)
+                _ = self.toggle_dock_panel(PANEL_AGENTS)
             return True
         if cmd_id == PAL_CMD_AGENT_TOGGLE_FOLLOW_CAM:
             self.agent_bus.follow_agent_camera = not self.agent_bus.follow_agent_camera
@@ -3895,36 +4577,60 @@ struct FlintStudioState(Movable):
             if res[0]:
                 var pa = res[1].copy()
                 if pa.source == APPROVAL_SRC_MCP_TOOL:
-                    if approved and pa.ghost.entity_id >= 0 and self.is_alive_id(pa.ghost.entity_id):
-                        var cur = self.entities[pa.ghost.entity_id].copy()
-                        var pre_raw = self._capture_world_blob()
-                        cur.translation = pa.ghost.target_pos
-                        if self.commit_node_edit(pa.ghost.entity_id, cur^, "Agent: " + pa.title):
-                            var post_raw = self._capture_world_blob()
-                            var tx_id = self.undo_stack[len(self.undo_stack) - 1].tx_id if len(self.undo_stack) > 0 else UInt64(0)
-                            _ = self.record_agent_step_checkpoint(
-                                tx_id, Int(pa.agent_id), 1, Int(pa.step_id), pre_raw, post_raw, pa.title
-                            )
-                            _ = self.agent_bus.complete_mcp_tool_step(
-                                pa.agent_id,
-                                pa.step_id,
-                                True,
-                                '{"ok":true,"approved":true}',
-                                Float32(1.0),
-                                tx_id,
-                                entity_id=pa.ghost.entity_id,
-                                world_pos=pa.ghost.target_pos,
-                                has_world_pos=True,
-                                post_world_lz4=post_raw,
-                                post_hash=self.state_hash(),
-                            )
+                    # Approving runs the agent's exact call (same tool, same arguments, same client),
+                    # re-targeted through the stable editor id at the entity the user saw. Nothing is
+                    # granted by tool name, so the approval can never wave through a different call.
+                    var target_eid = pa.ghost.editor_id if pa.ghost.editor_id != 0 else pa.target_editor_id
+                    if approved and target_eid != 0 and self.slot_for_editor_id(target_eid) < 0:
+                        self.push_toast("Approval target no longer exists", 1, 3.0)
+                        _ = self.agent_bus.complete_mcp_tool_step(
+                            pa.agent_id, pa.step_id, False, '{"ok":false,"error":"approval target no longer exists"}', Float32(0.0)
+                        )
+                    elif approved and pa.tool_name.byte_length() > 0:
+                        self.mcp_replay_client.append(pa.mcp_client_key)
+                        self.mcp_replay_tool.append(pa.tool_name)
+                        self.mcp_replay_args.append(pa.raw_payload_json)
+                        self.mcp_replay_step.append(pa.step_id)
+                        self.mcp_replay_editor_id.append(target_eid)
+                    elif approved and pa.ghost.kind == GHOST_TRANSFORM:
+                        # A preview-only approval (no tool call to replay): apply the previewed move.
+                        var ghost_slot = self.slot_for_editor_id(target_eid) if target_eid != 0 else pa.ghost.entity_id
+                        if ghost_slot >= 0 and self.is_alive_id(ghost_slot):
+                            var cur = self.entities[ghost_slot].copy()
+                            var pre_raw = self._capture_world_blob()
+                            cur.translation = pa.ghost.target_pos
+                            var prev_origin = self._active_tx_agent_id
+                            self._active_tx_agent_id = Int(pa.agent_id)
+                            var committed = self.commit_node_edit(ghost_slot, cur^, "Agent: " + pa.title)
+                            self._active_tx_agent_id = prev_origin
+                            if committed:
+                                var post_raw = self._capture_world_blob()
+                                var tx_id = self.undo_stack[len(self.undo_stack) - 1].tx_id if len(self.undo_stack) > 0 else UInt64(0)
+                                _ = self.record_agent_step_checkpoint(
+                                    tx_id, Int(pa.agent_id), 1, Int(pa.step_id), pre_raw, post_raw, pa.title
+                                )
+                                _ = self.agent_bus.complete_mcp_tool_step(
+                                    pa.agent_id,
+                                    pa.step_id,
+                                    True,
+                                    '{"ok":true,"approved":true}',
+                                    Float32(1.0),
+                                    tx_id,
+                                    entity_id=ghost_slot,
+                                    world_pos=pa.ghost.target_pos,
+                                    has_world_pos=True,
+                                    post_world_lz4=post_raw,
+                                    post_hash=self.state_hash(),
+                                )
                     _ = self.toast_mgr.push(
                         TOAST_SUCCESS if approved else TOAST_INFO,
                         ("Approved: " if approved else "Rejected: ") + pa.title,
                         "",
                     )
                 else:
-                    _ = self.agent_runtime.answer_acp_approval(pa, approved, allow_turn)
+                    _ = self.agent_runtime.answer_acp_approval(
+                        self.agent_bus, pa, approved, allow_turn, Float64(self.ui_time_sec)
+                    )
 
         elif act.kind == PANEL_ACT_FOCUS_ENTITY:
             if self.is_alive_id(act.entity_id):
@@ -3942,27 +4648,10 @@ struct FlintStudioState(Movable):
                 _ = WorkspacePresetManager.ensure_panel_visible(self.dock, PANEL_CODE_DRAWER)
 
         elif act.kind == PANEL_ACT_TIME_TRAVEL_SCRUB:
-            var live_raw = self._capture_world_blob()
-            var live_hash = self.state_hash()
-            if not self.agent_bus.time_travel_active:
-                _ = self.agent_checkpoints.save_live_snapshot(live_raw)
-            var tt = self.agent_bus.enter_time_travel(act.agent_id, act.step_index, live_raw, live_hash)
-            var si = self.agent_bus.find_session_index(act.agent_id)
-            if si >= 0 and act.step_index >= 0 and act.step_index < len(self.agent_bus.sessions[si].steps):
-                var sid = Int(self.agent_bus.sessions[si].steps[act.step_index].step_id)
-                var cp = self.agent_checkpoints.get_step_post_bytes(sid)
-                if cp[0] and len(cp[1]) > 0:
-                    _ = self._restore_world_blob(cp[1])
-                elif tt[0] and len(tt[1]) > 0:
-                    _ = self._restore_world_blob(tt[1])
+            _ = self.time_travel_scrub(act.agent_id, act.step_index)
 
         elif act.kind == PANEL_ACT_TIME_TRAVEL_EXIT:
-            var ex = self.agent_bus.exit_time_travel()
-            var live_cp = self.agent_checkpoints.restore_live_snapshot(clear_after=True)
-            if live_cp[0] and len(live_cp[1]) > 0:
-                _ = self._restore_world_blob(live_cp[1])
-            elif ex[0] and len(ex[1]) > 0:
-                _ = self._restore_world_blob(ex[1])
+            self.exit_time_travel()
 
         elif act.kind == PANEL_ACT_REVERT_STEP or act.kind == PANEL_ACT_REVERT_TURN:
             var plan = (
@@ -3970,7 +4659,22 @@ struct FlintStudioState(Movable):
                 if act.kind == PANEL_ACT_REVERT_STEP
                 else self.agent_bus.plan_revert_turn(act.agent_id, act.turn_id)
             )
-            if plan.valid:
+            var later_user_edits = self.user_edits_after_agent_steps(act.agent_id, plan.reverted_step_ids) if plan.valid else 0
+            if plan.valid and later_user_edits > 0:
+                # A revert restores a whole-world checkpoint; doing it now would silently throw away
+                # edits the user made after the agent acted. Refuse and say why instead.
+                _ = self.toast_mgr.push(
+                    TOAST_WARN,
+                    "Revert blocked",
+                    "It would discard " + String(later_user_edits) + " of your later edits. Undo those first.",
+                )
+            elif plan.valid:
+                # The revert is one undoable edit of the live world (never of a time-travel view).
+                self.exit_time_travel()
+                var rv_before = self._capture_world_blob()
+                var rv_prev_ids = self.selected_entity_ids.copy()
+                var rv_prev_primary = self.selected_entity_id
+                var rv_prev_anchor = self.selection_anchor_id
                 var restored_world = False
                 if act.kind == PANEL_ACT_REVERT_STEP:
                     var cp = self.agent_checkpoints.get_step_pre_bytes(Int(act.step_id))
@@ -3981,20 +4685,99 @@ struct FlintStudioState(Movable):
                     if cp_t[0] and len(cp_t[1]) > 0:
                         restored_world = self._restore_world_blob(cp_t[1])
                 if not restored_world and len(plan.restore_world_lz4) > 0:
-                    _ = self._restore_world_blob(plan.restore_world_lz4)
+                    restored_world = self._restore_world_blob(plan.restore_world_lz4)
+                if restored_world:
+                    # Tagged with the agent, so the revert never counts as a later *user* edit that
+                    # would block reverting the rest of the agent's work.
+                    var keep_agent = self._active_tx_agent_id
+                    self._active_tx_agent_id = Int(act.agent_id)
+                    self._record_world_tx(
+                        TX_BATCH_EDIT, -1, List[Int](), rv_before^, rv_prev_ids, rv_prev_primary, rv_prev_anchor,
+                        "Revert Agent Step" if act.kind == PANEL_ACT_REVERT_STEP else "Revert Agent Turn",
+                    )
+                    self._active_tx_agent_id = keep_agent
+                    self.mark_dirty(True)
                 for fi in range(len(plan.file_paths)):
                     if plan.file_existed[fi]:
-                        var sb = plan.file_old_texts[fi].as_bytes()
-                        var fbytes = List[UInt8](capacity=len(sb))
-                        for bi in range(len(sb)):
-                            fbytes.append(sb[bi])
-                        _ = write_bytes(plan.file_paths[fi], fbytes)
+                        var fr = self._revert_agent_file(
+                            plan.file_paths[fi], plan.file_old_texts[fi], plan.file_post_hashes[fi]
+                        )
+                        if not fr[0]:
+                            _ = self.toast_mgr.push(TOAST_WARN, "File revert refused", fr[1])
                 self.agent_bus.commit_revert_plan(plan)
                 _ = self.toast_mgr.push(
                     TOAST_SUCCESS,
                     "Reverted Agent Step" if act.kind == PANEL_ACT_REVERT_STEP else "Reverted Agent Turn",
                     "",
                 )
+
+    def time_travel_scrub(mut self, agent_id: UInt32, step_index: Int) -> Bool:
+        """Shows an agent step's checkpoint. Scrubbing is read-only: while it is active saves,
+        autosaves, undo / redo and edits are refused (`_time_travel_blocks_edit`), and the live world
+        comes back on `exit_time_travel`."""
+        var first = not self.agent_bus.time_travel_active
+        if first:
+            _ = self.commit_pending_flmat_edit()  # a half-typed material edit belongs to the live scene
+        var live_raw = self._capture_world_blob() if first else List[UInt8]()
+        if first and len(live_raw) == 0:
+            self.push_toast("Time travel unavailable: could not snapshot the scene", 2, 3.5)
+            return False
+        var live_hash = self.state_hash()
+        if first:
+            _ = self.agent_checkpoints.save_live_snapshot(live_raw)
+        var tt = self.agent_bus.enter_time_travel(agent_id, step_index, live_raw, live_hash)
+        var si = self.agent_bus.find_session_index(agent_id)
+        var shown = False
+        if si >= 0 and step_index >= 0 and step_index < len(self.agent_bus.sessions[si].steps):
+            var sid = Int(self.agent_bus.sessions[si].steps[step_index].step_id)
+            var cp = self.agent_checkpoints.get_step_post_bytes(sid)
+            if cp[0] and len(cp[1]) > 0:
+                shown = self._restore_world_blob(cp[1])
+            elif tt[0] and len(tt[1]) > 0:
+                shown = self._restore_world_blob(tt[1])
+        if shown:
+            self._time_travel_view_blob = self._capture_world_blob()
+        return shown
+
+    def exit_time_travel(mut self):
+        """Leaves time travel and puts the live world back (no-op when not time travelling)."""
+        if not self.agent_bus.time_travel_active:
+            return
+        var ex = self.agent_bus.exit_time_travel()
+        var live_cp = self.agent_checkpoints.restore_live_snapshot(clear_after=True)
+        if live_cp[0] and len(live_cp[1]) > 0:
+            _ = self._restore_world_blob(live_cp[1])
+        elif ex[0] and len(ex[1]) > 0:
+            _ = self._restore_world_blob(ex[1])
+        self._time_travel_view_blob = List[UInt8]()
+
+    def _time_travel_blocks_edit(mut self) -> Bool:
+        """True (with a toast) while time travel is showing an agent checkpoint."""
+        if not self.agent_bus.time_travel_active:
+            return False
+        self.push_toast("Time travel is read-only: exit it to edit", 1, 2.5)
+        return True
+
+    def _revert_agent_file(self, path: String, old_text: String, post_hash: UInt64) -> Tuple[Bool, String]:
+        """Puts an agent-edited file back to `old_text`, but only while the disk still holds exactly
+        what the agent's approved write left there (`post_hash`); a file someone changed since is
+        never clobbered. The path is confined to the agent workspace and written durably."""
+        var cp: ConfinedPath
+        try:
+            cp = resolve_confined_path(self.agent_runtime.workspace_root, path)
+        except e:
+            return (False, path + ": " + String(e))
+        if post_hash == 0:
+            return (False, path + ": no record of what the agent wrote")
+        var cur = read_confined_regular(cp)
+        if cur[0] != SAFE_FS_OK:
+            return (False, path + (": file is gone" if cur[0] == SAFE_FS_MISSING else ": not a regular file"))
+        if text_hash64(String(unsafe_from_utf8=cur[1])) != post_hash:
+            return (False, path + " changed after the agent wrote it")
+        var w = write_confined_durable(cp, old_text)
+        if not w[0]:
+            return (False, w[1])
+        return (True, String(""))
 
     def ingest_mcp_events(mut self, var events: List[BridgedMcpEvent]) -> Int:
         for i in range(len(events)):
@@ -4004,9 +4787,144 @@ struct FlintStudioState(Movable):
                     events[i].world_pos = self.entities[eid].translation
                     events[i].has_world_pos = True
                     events[i].half_extents = self.entities[eid].collider_half_extents
-        return self.agent_runtime.drain_mcp_events(
+        var n = self.agent_runtime.drain_mcp_events(
             self.agent_bus, events, self.toast_mgr, Float64(self.ui_time_sec)
         )
+        self._stamp_approval_editor_ids()
+        return n
+
+    def user_edits_after_agent_steps(self, agent_id: UInt32, step_ids: List[UInt64]) -> Int:
+        """How many of the user's own undo entries (origin 0) come after the earliest transaction of
+        these agent steps. Those edits would be lost by a whole-world checkpoint revert."""
+        var si = self.agent_bus.find_session_index(agent_id)
+        if si < 0:
+            return 0
+        var first_tx = UInt64(0)
+        var agent_txs = List[UInt64]()
+        for k in range(len(self.agent_bus.sessions[si].steps)):
+            ref st = self.agent_bus.sessions[si].steps[k]
+            if st.tx_id == UInt64(0):
+                continue
+            agent_txs.append(st.tx_id)  # the agent's own steps are never "user edits"
+            if st.step_id not in step_ids:
+                continue
+            if first_tx == UInt64(0) or st.tx_id < first_tx:
+                first_tx = st.tx_id
+        if first_tx == UInt64(0):
+            # Ordinary MCP / ACP steps do not record their transaction. Fall back to the undo history's
+            # origin tags: the agent's earliest entry still on the stack bounds where its work starts.
+            # This can only over-count (block a revert that was safe), never miss a user edit.
+            for i in range(len(self.undo_stack)):
+                ref tx = self.undo_stack[i]
+                if tx.agent_id == Int(agent_id) and (first_tx == UInt64(0) or tx.tx_id < first_tx):
+                    first_tx = tx.tx_id
+        if first_tx == UInt64(0):
+            return 0
+        var n = 0
+        for i in range(len(self.undo_stack)):
+            ref tx = self.undo_stack[i]
+            if tx.tx_id > first_tx and tx.agent_id == 0 and tx.tx_id not in agent_txs:
+                n += 1
+        return n
+
+    def begin_edit_interaction(mut self):
+        """Called by a panel when one of its fields changed. Starts a new undo step only when a new
+        interaction starts: a mouse drag is one interaction (the seq also moves on press/release), and
+        so is a typing session in one focused text field, so typing a name is one undo step, not one
+        per keystroke."""
+        if self.ui_ctx.mouse_down_l:
+            return
+        var f = self.ui_ctx.focused_id
+        if f != 0 and f == self._edit_focus_id:
+            return
+        self._edit_focus_id = f
+        self.ui_edit_seq += 1
+
+    def agent_for_mcp_client(mut self, client_key: Int, client_name: String, from_acp_agent: Bool = False) -> UInt32:
+        """The agent session that owns an MCP connection. A connection adopts the Studio-launched ACP
+        agent only when the host proved it comes from that agent's process tree (`from_acp_agent`, via
+        `SO_PEERCRED`); any other connection gets its own session, so approvals, gate policy and theatre
+        attribution never leak between agents. A new session starts with the approval policy of the
+        agent selected in the Agents panel (Edits when none is), never with no gate at all."""
+        var known = self.mcp_client_agents.get(client_key, UInt32(0))
+        if known != 0 and self.agent_bus.find_session_index(known) >= 0:
+            return known
+        var aid = UInt32(0)
+        var acp = self.agent_runtime.acp_agent_id
+        if from_acp_agent and acp != 0 and self.agent_bus.find_session_index(acp) >= 0:
+            var claimed = False
+            for item in self.mcp_client_agents.items():
+                if item.value == acp and item.key != client_key:
+                    claimed = True
+            if not claimed:
+                aid = acp
+        if aid == 0:
+            var nm = client_name if client_name.byte_length() > 0 and client_name != "unknown-mcp-client" else (
+                "MCP client " + String(client_key)
+            )
+            var policy = APPROVAL_EDITS
+            var sel = self.agent_bus.find_session_index(self.agent_bus.selected_agent_id)
+            if sel >= 0:
+                policy = self.agent_bus.sessions[sel].approval_policy
+            aid = self.agent_bus.create_session(ROLE_EXTERNAL_MCP, nm, policy)
+        self.mcp_client_agents[client_key] = aid
+        return aid
+
+    def release_mcp_client(mut self, client_key: Int):
+        """A connection closed: its pending approvals are rejected (there is nobody to answer), its key
+        stops claiming an agent (so Studio's ACP agent is adopted again when it reconnects), and its
+        session is removed from the Agents panel if it never did anything."""
+        var aid = self.mcp_client_agents.get(client_key, UInt32(0))
+        try:
+            if client_key in self.mcp_client_agents:
+                _ = self.mcp_client_agents.pop(client_key)
+        except:
+            pass
+        var i = len(self.agent_bus.pending_approvals) - 1
+        while i >= 0:
+            ref pa = self.agent_bus.pending_approvals[i]
+            if pa.source == APPROVAL_SRC_MCP_TOOL and pa.mcp_client_key == client_key and not pa.resolved:
+                _ = self.agent_bus.resolve_approval(pa.approval_id, False, False, "Agent disconnected")
+            i -= 1
+        if aid == 0 or aid == self.agent_runtime.acp_agent_id:
+            return
+        var si = self.agent_bus.find_session_index(aid)
+        if si >= 0 and len(self.agent_bus.sessions[si].steps) == 0:
+            _ = self.agent_bus.sessions.pop(si)
+            if self.agent_bus.selected_agent_id == aid:
+                self.agent_bus.selected_agent_id = self.agent_bus.sessions[0].agent_id if len(self.agent_bus.sessions) > 0 else UInt32(0)
+
+    def reject_all_mcp_approvals(mut self, reason: String):
+        """Rejects every queued MCP approval (used when the scene they were made against is replaced)."""
+        var i = len(self.agent_bus.pending_approvals) - 1
+        while i >= 0:
+            ref pa = self.agent_bus.pending_approvals[i]
+            if pa.source == APPROVAL_SRC_MCP_TOOL and not pa.resolved:
+                _ = self.agent_bus.resolve_approval(pa.approval_id, False, False, reason)
+            i -= 1
+        self.mcp_replay_client.clear()
+        self.mcp_replay_tool.clear()
+        self.mcp_replay_args.clear()
+        self.mcp_replay_step.clear()
+        self.mcp_replay_editor_id.clear()
+
+    def _stamp_approval_editor_ids(mut self):
+        """Pins each newly queued approval ghost to its entity's stable `editor_id`, so approving it
+        later cannot act on a different entity that reused the slot in the meantime."""
+        for i in range(len(self.agent_bus.pending_approvals)):
+            ref pa = self.agent_bus.pending_approvals[i]
+            if pa.ghost.editor_id == 0 and pa.ghost.entity_id >= 0:
+                pa.ghost.editor_id = self.editor_id_of(pa.ghost.entity_id)
+            if pa.target_editor_id == 0 and pa.source == APPROVAL_SRC_MCP_TOOL and pa.raw_payload_json.byte_length() > 0:
+                # Non-ghost calls aimed at an entity are pinned too (an explicit editor_id is kept as is).
+                var raw = List[UInt8](capacity=pa.raw_payload_json.byte_length())
+                for b in pa.raw_payload_json.as_bytes():
+                    raw.append(b)
+                var d = parse_json(raw)
+                if d.valid and d.object_get(d.root, "editor_id") < 0:
+                    var e = d.integer(d.object_get(d.root, "entity_id"), -1)
+                    if e >= 0 and self.is_alive_id(e):
+                        pa.target_editor_id = self.editor_id_of(e)
 
     def update_follow_agent_camera(mut self, dt: Float32):
         if not self.agent_bus.should_follow_camera():
@@ -4014,8 +4932,30 @@ struct FlintStudioState(Movable):
         var safe_dt = Float32(0.0) if (not isfinite(dt) or dt < Float32(0.0)) else min(dt, Float32(0.1))
         var alpha = Float32(1.0) if self.anim_mode == UI_ANIM_INSTANT else min(Float32(1.0), safe_dt * Float32(6.0))
         self.cam_target = self.cam_target + (self.agent_bus.focus_target_pos - self.cam_target) * alpha
+        # A `shoulder_offset` left by Frame Selection was solved for that frame's arm length and panel
+        # layout; after a dolly or a dock change it parks the focus target off the panel centre. The
+        # tween re-solves it every step so the target always eases onto the current panel centre.
+        self.camera_rig.shoulder_offset = self.panel_centre_shoulder_offset(self.camera_rig.spring_arm.target_length)
         self.camera_rig.update(self._cam_dummy_world, self.cam_target, safe_dt)
         self._sync_from_camera_rig()
+
+    def panel_centre_shoulder_offset(self, arm: Float32) -> Vec3:
+        """Camera-local `CameraRig.shoulder_offset` that puts the orbit pivot (at `arm` metres along the
+        optical axis) under the SceneViewport panel centre. The renderer's projection is centred on the
+        whole window, so a panel docked off-centre needs the eye shifted by `-ndc * tan(half_fov) * arm`
+        (zero when the panel is centred in the window)."""
+        var vx = self.viewport_xf
+        var tw = max(Float32(1.0), vx.target_w)
+        var th = max(Float32(1.0), vx.target_h)
+        var safe_arm = arm if (isfinite(arm) and arm > Float32(0.0)) else Float32(0.0)
+        var tan_y = tan(self.fov_y_deg * Float32(3.14159265 / 360.0))
+        var tan_x = tan_y * (tw / th)
+        var ndc_x = ((vx.panel.x + vx.panel.w * Float32(0.5)) / tw) * Float32(2.0) - Float32(1.0)
+        var ndc_y = Float32(1.0) - ((vx.panel.y + vx.panel.h * Float32(0.5)) / th) * Float32(2.0)
+        var off = Vec3(-ndc_x * tan_x * safe_arm, -ndc_y * tan_y * safe_arm, Float32(0.0))
+        if not (isfinite(off.x) and isfinite(off.y)):
+            return Vec3()
+        return off
 
     def poll_agent_runtime(mut self, dt: Float32):
         var safe_dt = Float32(0.0) if (not isfinite(dt) or dt < Float32(0.0)) else min(dt, Float32(0.1))
@@ -4111,6 +5051,30 @@ struct FlintStudioState(Movable):
             self.toasts.clear()
             self.gallery_play_hud_active = True
 
+    def text_input_request(self) -> Tuple[Bool, RectF]:
+        """Whether a Studio text field holds the keyboard (UI text fields, the command palette, the
+        agent prompt, the TurboMojo terminal) and its caret in UI pixels, for the platform IME."""
+        if self.source_editor.visible:
+            return (True, RectF(Float32(8.0), Float32(8.0), Float32(2.0), Float32(18.0)))
+        if self.command_palette.is_open:
+            return (True, self.command_palette.caret_rect)
+        if self.ui_ctx.wants_text_input():
+            return (True, self.ui_ctx.text_caret_rect)
+        if self.agent_panel.wants_keyboard():
+            return (True, RectF(Float32(0.0), Float32(0.0), Float32(2.0), Float32(18.0)))
+        return (False, RectF())
+
+    def publish_text_input_request(mut self, ui_scale: Float32):
+        """Hands `text_input_request` to the window (framebuffer pixels), which enables or disables the
+        compositor IME on its next poll."""
+        var req = self.text_input_request()
+        var s = ui_scale if (isfinite(ui_scale) and ui_scale > Float32(0.0)) else Float32(1.0)
+        var win_res = self.app.resources.get_ptr_mut[WindowStateResource]()
+        if win_res:
+            win_res.value()[unsafe_offset=0].set_text_input(
+                req[0], req[1].x * s, req[1].y * s, max(Float32(1.0), req[1].w * s), max(Float32(1.0), req[1].h * s)
+            )
+
     def release_pointer_lock(mut self):
         var win_res = self.app.resources.get_ptr_mut[WindowStateResource]()
         if win_res:
@@ -4118,8 +5082,13 @@ struct FlintStudioState(Movable):
                 win_res.value()[unsafe_offset=0].windows[wi].set_pointer_lock(False)
 
     def selection_gizmo_rotation(self) -> Quat:
-        if not self.gizmo_local_space:
+        """Gizmo axes for the current mode. Scale always uses the primary entity's own axes: a world-axis
+        scale of a rotated object is a shear the transform cannot hold, so it would scale the wrong way."""
+        if not self.gizmo_local_space and self.gizmo_mode != GIZMO_MODE_SCALE:
             return Quat.identity()
+        return self._primary_world_rotation()
+
+    def _primary_world_rotation(self) -> Quat:
         var eid = self.selected_entity_id
         if not self.is_alive_id(eid) and len(self.selected_entity_ids) > 0:
             for i in range(len(self.selected_entity_ids)):
@@ -4147,32 +5116,54 @@ struct FlintStudioState(Movable):
         self.push_toast("Gizmo: Local Space" if self.gizmo_local_space else "Gizmo: World Space", 0, 1.8)
 
     def frame_selection(mut self):
-        var piv = self.selection_gizmo_pivot()
-        if not piv[0]:
+        """Frames the selection's bounds so it fills the viewport panel and sits at the panel's centre.
+        The renderer's projection is centred on the whole window, so the camera is offset to put the
+        selection on the ray through the panel centre, at the distance that fits its bounding sphere."""
+        var b = self.selection_bounds()
+        if not b[0]:
             return
-        var target = piv[1]
-        var offset = self.cam_pos - self.cam_target
-        var dist = offset.length()
-        if not isfinite(dist) or dist < Float32(0.05):
-            offset = Vec3(Float32(-4.5), Float32(2.8), Float32(-6.0))
-        else:
-            var dir = offset * (Float32(1.0) / dist)
-            var clamped_dist = max(Float32(3.0), min(Float32(20.0), dist))
-            offset = dir * clamped_dist
-        self.cam_target = target
-        self.cam_pos = target + offset
-        self.camera_rig.look_offset = Vec3()
-        self.camera_rig.pivot_spring.value = target
-        var eye = self.cam_pos
-        var tgt = self.cam_target
-        self.look_at(eye, tgt)
+        var center = (b[1] + b[2]) * Float32(0.5)
+        var radius = max(Float32(0.3), (b[2] - b[1]).length() * Float32(0.5))
+        var fwd = self.cam_fwd
+        var flen = fwd.length()
+        if not isfinite(flen) or flen < Float32(1.0e-4):
+            fwd = Vec3(Float32(0.6), Float32(-0.37), Float32(0.71))
+        fwd = fwd.normalized()
+        # The renderer / `CameraRig` basis (right = up x fwd); `fwd x up` mirrored the panel offset.
+        var right = Vec3(0.0, 1.0, 0.0).cross(fwd)
+        if right.length_squared() < Float32(1.0e-6):
+            right = Vec3(1.0, 0.0, 0.0).cross(fwd)
+        right = right.normalized()
+        var up = fwd.cross(right).normalized()
+        var vx = self.viewport_xf
+        var tan_y = tan(self.fov_y_deg * Float32(3.14159265 / 360.0))
+        var tan_x = tan_y * (vx.target_w / max(Float32(1.0), vx.target_h))
+        # Fit the sphere inside the panel's share of the frustum (the panel may be much smaller than
+        # the window the projection covers).
+        var pan_tan_y = tan_y * (vx.panel.h / max(Float32(1.0), vx.target_h))
+        var pan_tan_x = tan_x * (vx.panel.w / max(Float32(1.0), vx.target_w))
+        var fit_tan = max(Float32(0.02), min(pan_tan_x, pan_tan_y))
+        var dist = max(Float32(1.0), min(Float32(500.0), radius * Float32(1.15) / fit_tan + radius))
+        var ndc_x = ((vx.panel.x + vx.panel.w * Float32(0.5)) / max(Float32(1.0), vx.target_w)) * Float32(2.0) - Float32(1.0)
+        var ndc_y = Float32(1.0) - ((vx.panel.y + vx.panel.h * Float32(0.5)) / max(Float32(1.0), vx.target_h)) * Float32(2.0)
+        var ray_dir = (fwd + right * (ndc_x * tan_x) + up * (ndc_y * tan_y)).normalized()
+        var eye = center - ray_dir * dist
+        # Orbit pivot = the selection centre. The panel offset (the panel centre is off the window's
+        # optical axis) lives separately in the rig's camera-local `shoulder_offset`, so orbiting turns
+        # about the selection and keeps it under the panel centre.
+        var arm = max(Float32(0.35), dist * ray_dir.dot(fwd))
+        self.look_at(center - fwd * arm, center)
+        var off = eye - (center - fwd * arm)
+        self.camera_rig.shoulder_offset = Vec3(off.dot(self.cam_right), off.dot(self.cam_up), Float32(0.0))
+        self.camera_rig.update(self._cam_dummy_world, center, Float32(0.0))
+        self._sync_from_camera_rig()
         var rps_opt = self.app.resources.get_ptr_mut[RenderPluginStateResource]()
         if rps_opt:
             ref rps = rps_opt.value()[unsafe_offset=0]
             rps.editor_camera_override = True
             rps.editor_camera = RenderCameraPacket(
                 self.cam_pos,
-                self.cam_target,
+                self.cam_pos + self.cam_fwd * Float32(10.0),
                 Vec3(0.0, 1.0, 0.0),
                 self.fov_y_deg,
                 self.near_z,
@@ -4182,22 +5173,37 @@ struct FlintStudioState(Movable):
             rps.has_editor_camera = True
 
     def copy_selected(mut self) -> Int:
+        """Copies the selection by stable `editor_id`, so a paste after a delete / undo / reload never
+        duplicates whatever entity reused the old slot."""
         self._normalize_selection_from_primary()
-        self.clipboard_entity_ids.clear()
+        self._ensure_editor_ids()
+        self.clipboard_editor_ids.clear()
         for i in range(len(self.selected_entity_ids)):
             if self.is_alive_id(self.selected_entity_ids[i]):
-                self.clipboard_entity_ids.append(self.selected_entity_ids[i])
-        if len(self.clipboard_entity_ids) == 0 and self.is_alive_id(self.selected_entity_id):
-            self.clipboard_entity_ids.append(self.selected_entity_id)
-        if len(self.clipboard_entity_ids) > 0:
-            self.push_toast("Copied " + String(len(self.clipboard_entity_ids)) + " entity(s)", 0, 1.8)
-        return len(self.clipboard_entity_ids)
+                var eid = self.editor_id_of(self.selected_entity_ids[i])
+                if eid != 0:
+                    self.clipboard_editor_ids.append(eid)
+        if len(self.clipboard_editor_ids) == 0 and self.is_alive_id(self.selected_entity_id):
+            var eid0 = self.editor_id_of(self.selected_entity_id)
+            if eid0 != 0:
+                self.clipboard_editor_ids.append(eid0)
+        if len(self.clipboard_editor_ids) > 0:
+            self.push_toast("Copied " + String(len(self.clipboard_editor_ids)) + " entity(s)", 0, 1.8)
+        return len(self.clipboard_editor_ids)
+
+    def clipboard_slots(self) -> List[Int]:
+        """Current slots of the copied entities that still exist."""
+        var out = List[Int]()
+        for i in range(len(self.clipboard_editor_ids)):
+            var slot = self.slot_for_editor_id(self.clipboard_editor_ids[i])
+            if slot >= 0 and self.is_alive_id(slot):
+                out.append(slot)
+        return out^
 
     def paste_clipboard(mut self, record_undo: Bool = True) -> List[Int]:
-        var srcs = List[Int]()
-        for i in range(len(self.clipboard_entity_ids)):
-            if self.is_alive_id(self.clipboard_entity_ids[i]):
-                srcs.append(self.clipboard_entity_ids[i])
+        if self._time_travel_blocks_edit():
+            return List[Int]()
+        var srcs = self._subtree_roots(self.clipboard_slots())
         var created = List[Int]()
         if len(srcs) == 0:
             return created^
@@ -4269,23 +5275,77 @@ struct FlintStudioState(Movable):
             sync_style_opt.value()[unsafe_offset=0].known_internal_mat_epochs.clear()
             sync_style_opt.value()[unsafe_offset=0].external_mat_reload_epochs.clear()
 
+    def commit_pending_flmat_edit(mut self) -> Bool:
+        """Saves a buffered .flmat text edit (one disk write and one undo step for the whole edit)."""
+        if self.flmat_pending_path.byte_length() == 0:
+            return False
+        var path = self.flmat_pending_path
+        var ref_path = self.flmat_pending_ref
+        var eid = (
+            self.slot_for_editor_id(self.flmat_pending_editor_id) if self.flmat_pending_editor_id != 0 else self.flmat_pending_eid
+        )
+        var asset = self.flmat_pending.copy()
+        var stamp = self.flmat_pending_stamp
+        self.flmat_pending_path = String("")
+        self.flmat_pending_ref = String("")
+        self.flmat_pending_eid = -1
+        self.flmat_pending_editor_id = UInt64(0)
+        self.flmat_pending_stamp = (-1, 0)
+        var now_stamp = file_stamp(path)
+        if stamp[0] >= 0 and (now_stamp[0] != stamp[0] or now_stamp[1] != stamp[1]):
+            self.push_toast("Material changed on disk; your unsaved edit to it was not written", 1, 4.0)
+            return False
+        _ = save_flmat_file(path, asset)
+        if eid >= 0 and self.is_alive_id(eid):
+            _ = self._assign_flmat_to_entity(eid, ref_path)
+        return True
+
+    def flush_stale_flmat_edit(mut self):
+        """Saves a pending material edit the Inspector no longer shows (deselected, collapsed, closed)."""
+        if self.flmat_pending_path.byte_length() > 0 and self.ui_time_sec - self.flmat_pending_touch_sec > Float32(0.3):
+            _ = self.commit_pending_flmat_edit()
+
+    def request_load_scene(mut self, path: String = "", force: Bool = False) -> Bool:
+        """Interactive scene load: asks Save / Discard / Cancel first when the current scene is dirty,
+        because `load_scene_file` replaces the world (the load itself is one undo step)."""
+        if not force and self.dirty:
+            self.pending_load_path = path
+            self.confirm_modal_open = True
+            self.confirm_modal_action = 3
+            return False
+        return self.load_scene_file(path)
+
     def new_scene(mut self, force: Bool = False) -> Bool:
+        """Empties the world into an *untitled* scene (the first save asks where, so it can never
+        overwrite the level that was open). New is one undoable step, like a load: undo brings the old
+        scene, its file path and its saved / unsaved state back."""
+        _ = self.commit_pending_flmat_edit()
         if not force and self.dirty:
             self.confirm_modal_open = True
             self.confirm_modal_action = 2
             return False
-        if self.dirty:
-            discard_snapshot(self.project_root, self.scene_file_path)
+        self.exit_time_travel()
         if self.pie.mode != PIE_STOPPED:
             self._abort_pie_session()
+        var before_blob = self._capture_world_blob()
+        if len(before_blob) == 0:
+            self.push_toast("New scene refused: the current scene could not be snapshotted for undo", 2, 4.0)
+            return False
+        var prev_ids = self.selected_entity_ids.copy()
+        var prev_primary = self.selected_entity_id
+        var prev_anchor = self.selection_anchor_id
+        var prev_scene_path = self.scene_file_path
+        var prev_saved = self._saved_tx_id
+        if self.dirty:
+            self.discard_autosave()  # the user chose Discard for this scene's unsaved work
         for i in range(len(self.app.world.entities)):
             if self.app.world.entities[i].alive:
                 var e = Entity(UInt32(i), self.app.world.entities[i].generation)
                 _ = self.app.world.despawn(e)
-        self.undo_stack.clear()
-        self.redo_stack.clear()
-        self.clipboard_entity_ids.clear()
+        self.bump_scene_version()
+        self.clipboard_editor_ids.clear()
         self.clear_selection()
+        self.reject_all_mcp_approvals("Scene changed before approval")
         self.gpu_materials.clear_entity_slots()
         self._pie_frame_updated = False
         self._int_edit_wid = UInt64(0)
@@ -4295,12 +5355,26 @@ struct FlintStudioState(Movable):
         self._last_preview_anim_time = Float32(0.0)
         self._clear_render_and_resolver_scene_caches()
         self._reset_physics_world_and_sync()
+        self.scene_file_path = String("")
+        self.discard_autosave()  # a stale untitled autosave must not be offered for this new scene
+        var top_before = self._top_tx_id()
+        self._record_world_tx(
+            TX_BATCH_EDIT, -1, List[Int](), before_blob^, prev_ids, prev_primary, prev_anchor, "New Scene"
+        )
+        if self._top_tx_id() != top_before:
+            ref top = self.undo_stack[len(self.undo_stack) - 1]
+            top.changes_scene_path = True
+            top.prev_scene_path = prev_scene_path
+            top.next_scene_path = String("")
+            top.prev_saved_tx_id = prev_saved
+            top.load_leaves_clean = True
         self.mark_dirty(False)
         self.push_toast("New scene created", 0, 2.5)
         return True
 
     def request_quit(mut self) -> Bool:
         """Returns True if quit was deferred by an unsaved-changes modal; False if clean to quit immediately."""
+        _ = self.commit_pending_flmat_edit()  # a half-typed material path is still the user's edit
         if self.dirty:
             self.confirm_modal_open = True
             self.confirm_modal_action = 1
@@ -4376,23 +5450,52 @@ struct FlintStudioState(Movable):
         var prev_anchor = self.selection_anchor_id
 
         var label: String
-        if card_idx == 1:
+        if card_idx == SPAWN_CARD_CUBE:
             label = "Cube"
-        elif card_idx == 2:
+        elif card_idx == SPAWN_CARD_POINT_LIGHT:
             label = "PointLight"
-        elif card_idx == 3:
+        elif card_idx == SPAWN_CARD_SPOT_LIGHT:
             label = "SpotLight"
-        elif card_idx == 4:
+        elif card_idx == SPAWN_CARD_CAMERA:
             label = "Camera"
-        elif card_idx == 5:
+        elif card_idx == SPAWN_CARD_AUDIO:
             label = "AudioEmitter"
+        elif card_idx == SPAWN_CARD_SPHERE:
+            label = "Sphere"
+        elif card_idx == SPAWN_CARD_PLANE:
+            label = "Plane"
+        elif card_idx == SPAWN_CARD_SUN:
+            label = "Sun"
         else:
             label = "Empty"
 
         var e = self.app.world.spawn_empty()
+        self.bump_scene_version()
         var eid = Int(e.index)
-        var pos = Vec3(0.0, 1.0, 0.0) if card_idx != 1 else Vec3(0.0, 0.5, 0.0)
-        var lt = LocalTransform(pos, Quat.identity(), Vec3(1.0, 1.0, 1.0))
+        var pos = Vec3(0.0, 1.0, 0.0)
+        var rot = Quat.identity()
+        var scl = Vec3(1.0, 1.0, 1.0)
+        var col_kind = COLLIDER_NONE
+        var col_he = Vec3(0.5, 0.5, 0.5)
+        if card_idx == SPAWN_CARD_CUBE:
+            pos = Vec3(0.0, 0.5, 0.0)
+            col_kind = COLLIDER_BOX
+        elif card_idx == SPAWN_CARD_SPHERE:
+            # The shared SubD orb primitive (radius 0.88) scaled to a 0.5 m radius sphere.
+            pos = Vec3(0.0, 0.5, 0.0)
+            var k = Float32(0.5) / Float32(0.88)
+            scl = Vec3(k, k, k)
+            col_kind = COLLIDER_SPHERE
+        elif card_idx == SPAWN_CARD_PLANE:
+            # The reference-grid primitive (36 m span) scaled to a SPAWN_PLANE_SIZE_M square floor.
+            pos = Vec3(0.0, 0.0, 0.0)
+            var k = SPAWN_PLANE_SIZE_M / Float32(36.0)
+            scl = Vec3(k, 1.0, k)
+            col_kind = COLLIDER_BOX
+            col_he = Vec3(SPAWN_PLANE_SIZE_M * Float32(0.5), Float32(0.02), SPAWN_PLANE_SIZE_M * Float32(0.5))
+        elif card_idx == SPAWN_CARD_SUN:
+            pos = Vec3(0.0, 6.0, 0.0)
+        var lt = LocalTransform(pos, rot, scl)
         var gt = GlobalTransform.from_local(lt)
         _ = self.app.world.insert[LocalTransform](e, lt)
         _ = self.app.world.insert[GlobalTransform](e, gt.copy())
@@ -4401,13 +5504,28 @@ struct FlintStudioState(Movable):
             e,
             StudioEntityMetaComponent(
                 name=label + "_" + String(eid),
-                collider_kind=COLLIDER_BOX if card_idx == 1 else COLLIDER_NONE,
-                collider_half_extents=Vec3(0.5, 0.5, 0.5),
+                collider_kind=col_kind,
+                collider_half_extents=col_he,
             ),
         )
         _ = self.app.world.insert[StudioStyleComponent](e, StudioStyleComponent())
-        if card_idx == 1:
-            _ = self.app.world.insert[MeshRendererComponent](e, MeshRendererComponent(0, -1, True, True))
+        if card_idx == SPAWN_CARD_SPHERE or card_idx == SPAWN_CARD_PLANE:
+            var sphere = card_idx == SPAWN_CARD_SPHERE
+            # Logical showcase ids (1 = orb, 2 = grid) until the GPU primitives are registered.
+            var mesh_id = 1 if sphere else 2
+            if self.gpu_materials.uploaded:
+                mesh_id = self.gpu_materials.orb_mesh_id if sphere else self.gpu_materials.grid_mesh_id
+            _ = self.app.world.insert[MeshRendererComponent](e, MeshRendererComponent(mesh_id, -1, True, True))
+            var tint = Vec3(0.82, 0.84, 0.88) if sphere else Vec3(0.42, 0.45, 0.50)
+            _ = self.app.world.insert[MaterialOverrideComponent](
+                e, MaterialOverrideComponent(-1, tint, Float32(0.38) if sphere else Float32(0.7), Float32(0.10) if sphere else Float32(0.02), Vec3(), True)
+            )
+            self._apply_collider_and_rb(e, col_kind, col_he, Float32(0.0), Float32(0.32), Float32(0.55), Vec3(), Vec3())
+        elif card_idx == SPAWN_CARD_SUN:
+            # A directional sun: the render plugin takes the sun from the first enabled EnvironmentComponent.
+            _ = self.app.world.insert[EnvironmentComponent](e, EnvironmentComponent())
+        if card_idx == SPAWN_CARD_CUBE:
+            _ = self.app.world.insert[MeshRendererComponent](e, MeshRendererComponent(self.default_cube_mesh_id(), -1, True, True))
             _ = self.app.world.insert[MaterialOverrideComponent](
                 e, MaterialOverrideComponent(-1, Vec3(0.82, 0.84, 0.88), Float32(0.38), Float32(0.10), Vec3(), True)
             )
@@ -4445,15 +5563,85 @@ struct FlintStudioState(Movable):
         self.push_toast("Spawned " + label, 0, 2.0)
         return eid
 
+    def spawn_prefab_from_palette(mut self) -> Bool:
+        """Quick Spawn "Prefab": instantiates the last-used `.flprefab`, else opens the asset palette
+        filtered to prefabs so the user picks one."""
+        if self.last_prefab_entry.byte_length() > 0:
+            for i in range(len(self.asset_browser_entries)):
+                if self.asset_browser_entries[i] == self.last_prefab_entry:
+                    var last = self.last_prefab_entry
+                    return self.activate_asset_entry(last) >= 0
+        var any_prefab = False
+        for i in range(len(self.asset_browser_entries)):
+            if Self._ascii_lower(self.asset_browser_entries[i]).endswith(".flprefab"):
+                any_prefab = True
+                break
+        if not any_prefab:
+            self.push_toast("No .flprefab assets in this project", 1, 2.5)
+            return False
+        self.open_command_palette(PALETTE_ALL, "#.flprefab")
+        return True
+
+    def package_project_with_profiles(mut self) -> Bool:
+        """Runs `tools/flint.sh studio --build-profiles` in the project (Build menu and palette)."""
+        var launcher = _resolve_flint_launcher_path()
+        var proj = self.project_root if self.project_root.byte_length() > 0 else env_value("FLINT_STUDIO_PROJECT")
+        if launcher.byte_length() == 0 or proj.byte_length() == 0:
+            self.push_toast("Could not locate tools/flint.sh or project", 2, 3.5)
+            return False
+        _ = make_dirs(proj + "/build")
+        var args = List[String]()
+        args.append("/bin/bash")
+        args.append(launcher)
+        args.append("studio")
+        args.append("--build-profiles")
+        var rc = run_process_redirected(args, cwd=proj, log_path=proj + "/build/package.log")
+        var ok = rc == Int32(0)
+        self.push_toast("Profile package complete" if ok else "Profile package failed (see build/package.log)", 0 if ok else 2, 3.5)
+        return ok
+
+    def dock_panel_shown(self, panel_name: String) -> Bool:
+        """True when `panel_name` is the active tab of a non-collapsed dock node."""
+        var info = self.dock.find_panel(panel_name)
+        if info[0] < 0 or info[0] >= len(self.dock.nodes):
+            return False
+        return info[2] and not self.dock.is_node_collapsed(info[0])
+
+    def toggle_dock_panel(mut self, panel_name: String) -> Bool:
+        """Shows `panel_name`, or hides it when it is already showing (switches its tab group back to
+        a sibling tab, or collapses a single-tab group). Returns whether the panel is now shown."""
+        if not self.dock_panel_shown(panel_name):
+            _ = WorkspacePresetManager.ensure_panel_visible(self.dock, panel_name)
+            return self.dock_panel_shown(panel_name)
+        var nid = self.dock.find_panel(panel_name)[0]
+        if self.dock.nodes[nid].kind != DOCK_TABS:
+            return True
+        var sibling = String("")
+        for t in range(len(self.dock.nodes[nid].tabs)):
+            if self.dock.nodes[nid].tabs[t] != panel_name:
+                sibling = self.dock.nodes[nid].tabs[t]
+                break
+        if sibling.byte_length() > 0:
+            _ = self.dock.activate_tab(sibling)
+        else:
+            _ = self.dock.toggle_node_collapsed(nid)
+        return False
+
     # ---- Editor Input ----
 
     def handle_command_menu(mut self, inp: InputState, width: Int, height: Int) -> Bool:
         if self.ui_ctx.modal_depth > 0 or self.ui_ctx.had_modal_prev_frame or self.command_palette.is_open:
             self.menu.bar.group = -1
+            self.flush_menu_message()
             return False
         self.menu.poll()
+        self.flush_menu_message()  # tool launch / exit status from `SceneMenu.poll`
+        # The menu bar is drawn into the scaled `ui_ctx` list, so lay it out and hit-test it in logical pixels.
+        var ui_s = self.effective_ui_scale()
+        var lw = Float32(width) / ui_s
+        var lh = Float32(height) / ui_s
         self.dock.solve_layout(
-            RectF(0.0, STUDIO_HEADER_BAR_H, Float32(width), max(Float32(64.0), Float32(height) - STUDIO_HEADER_BAR_H))
+            RectF(0.0, STUDIO_HEADER_BAR_H, lw, max(Float32(64.0), lh - STUDIO_HEADER_BAR_H - STUDIO_STATUS_BAR_H))
         )
         var panel = self.dock.find_panel("Toolbar")
         var has_toolbar = panel[0] >= 0 and panel[2]
@@ -4466,20 +5654,27 @@ struct FlintStudioState(Movable):
             bar.x = 4
             bar.y = 0
             bar.height = Int(STUDIO_HEADER_BAR_H)
-        bar.screen_w = width
-        bar.screen_h = height
+        bar.screen_w = Int(lw)
+        bar.screen_h = Int(lh)
         var in_play = self.pie.mode != PIE_STOPPED
         bar.groups[0].items[0].enabled = not in_play
         bar.groups[0].items[1].enabled = not in_play
         bar.groups[0].items[2].enabled = not in_play
-        bar.groups[0].items[3].enabled = not in_play
+        # Open, Save As and Recover do nothing during Play: show them disabled.
+        for fi in range(3, len(bar.groups[0].items)):
+            bar.groups[0].items[fi].enabled = not in_play
         bar.groups[1].items[0].enabled = (not in_play) and Bool(self.undo_stack)
         bar.groups[1].items[1].enabled = (not in_play) and Bool(self.redo_stack)
         bar.groups[1].items[2].enabled = (not in_play) and self.selected_count() > 0
         bar.groups[1].items[3].enabled = (not in_play) and self.selected_count() > 0
+        if len(bar.groups[1].items) > 5:
+            bar.groups[1].items[4].enabled = not in_play  # Select all
+            bar.groups[1].items[5].enabled = (not in_play) and self.selected_count() == 1  # Rename
         bar.groups[2].items[3].title = "Disable grid snapping" if self.snap_enabled else "Enable grid snapping"
         bar.groups[2].items[4].title = "Gizmo: Local Space" if self.gizmo_local_space else "Gizmo: World Space"
         bar.groups[2].items[5].enabled = self.selected_count() > 0
+        if len(bar.groups[2].items) > 6:
+            bar.groups[2].items[6].title = "Pivot: Active Entity" if self.pivot_mode == PIVOT_ACTIVE else "Pivot: Bounds Centre"
         bar.groups[3].items[0].title = "Resume simulation" if self.pie.mode==PIE_PAUSED else "Play scene"
         bar.groups[3].items[0].enabled = self.pie.mode!=PIE_PLAYING
         bar.groups[3].items[1].enabled = self.pie.mode==PIE_PLAYING
@@ -4504,17 +5699,38 @@ struct FlintStudioState(Movable):
             bar.groups[7].items[1].enabled = can_pkg
         if not has_toolbar and bar.group < 0:
             return False
-        var action = bar.input(inp,Int(inp.last_mouse_x),Int(inp.last_mouse_y))
+        var action = bar.input(inp, Int(inp.last_mouse_x / ui_s), Int(inp.last_mouse_y / ui_s))
         if action==scene_menu.SAVE and not in_play:
-            var ok = self.save_scene_file()
-            self.menu.message = "Scene saved" if ok else "Could not save scene"
+            _ = self.save_scene_file()  # toasts its own result
         elif action==scene_menu.LOAD and not in_play:
-            var ok = self.load_scene_file()
-            self.menu.message = "Scene loaded" if ok else "Could not load scene"
-        elif action==scene_menu.RECOVER_AUTOSAVE and not in_play:
-            _ = self.recover_autosave()
+            # "Revert to saved": load failures toast inside `load_scene_file`.
+            if self.request_load_scene():
+                self.menu.message = "Reverted to the saved scene"
         elif action==scene_menu.NEW_SCENE and not in_play:
             _ = self.new_scene(force=False)
+        elif action==scene_menu.OPEN_SCENE and not in_play:
+            self.open_file_modal(False)
+        elif action==scene_menu.SAVE_AS and not in_play:
+            self.open_file_modal(True)
+        elif action==scene_menu.RECOVER_AUTOSAVE and not in_play:
+            if self.autosave_available():
+                _ = self.recover_autosave()
+            else:
+                self.push_toast("No autosave newer than the scene file", 0, 2.5)
+        elif action==scene_menu.SELECT_ALL and not in_play:
+            self.select_all_entities()
+        elif action==scene_menu.RENAME and not in_play:
+            _ = self.begin_rename_selected()
+        elif action==scene_menu.PIVOT_MODE:
+            self.toggle_pivot_mode()
+        elif action==scene_menu.WINDOW_RESET_LAYOUT:
+            self.reset_layout()
+        elif action==scene_menu.WINDOW_CONSOLE:
+            self.console_open = True
+        elif action==scene_menu.HELP_SHORTCUTS:
+            self.help_open = True
+        elif action==scene_menu.HELP_PALETTE:
+            self.open_command_palette(PALETTE_ALL)
         elif action==scene_menu.UNDO and not in_play:
             _ = self.undo()
         elif action==scene_menu.REDO and not in_play:
@@ -4588,30 +5804,23 @@ struct FlintStudioState(Movable):
         elif action == scene_menu.PACKAGE and not in_play:
             var pkg_res = self.package_project()
             if pkg_res[0]:
-                self.menu.message = "Packaged -> " + pkg_res[1]
                 self.push_toast("Packaged -> " + pkg_res[1], 0, 3.0)
             else:
-                self.menu.message = pkg_res[1]
                 self.push_toast(pkg_res[1], 2, 4.0)
         elif action == scene_menu.PACKAGE_PROFILES and not in_play:
-            var launcher = _resolve_flint_launcher_path()
-            var proj = self.project_root if self.project_root.byte_length() > 0 else env_value("FLINT_STUDIO_PROJECT")
-            if launcher.byte_length() == 0 or proj.byte_length() == 0:
-                var msg = String("Could not locate tools/flint.sh or project")
-                self.menu.message = msg
-                self.push_toast(msg, 2, 3.5)
-            else:
-                _ = make_dirs(proj + "/build")
-                var args = List[String]()
-                args.append("/bin/bash")
-                args.append(launcher)
-                args.append("studio")
-                args.append("--build-profiles")
-                var rc = run_process_redirected(args, cwd=proj, log_path=proj + "/build/package.log")
-                var msg = String("Profile package complete") if rc == Int32(0) else String("Profile package failed (see build/package.log)")
-                self.menu.message = msg
-                self.push_toast(msg, 0 if rc == Int32(0) else 2, 3.5)
+            _ = self.package_project_with_profiles()
+        self.flush_menu_message()
         return action>=0
+
+    def flush_menu_message(mut self):
+        """Shows `SceneMenu.message` (menu actions, tool launches and exits) as a toast + console line."""
+        if self.menu.message.byte_length() == 0:
+            return
+        var msg = self.menu.message
+        self.menu.message = ""
+        var low = Self._ascii_lower(msg)
+        var sev = 2 if (low.find("could not") >= 0 or low.find("failed") >= 0 or low.find("error") >= 0) else 0
+        self.push_toast(msg, sev, 3.0)
 
     def process_editor_input(mut self, input: InputState, dt: Float32) -> Bool:
         """Evaluates `InputMap` editor hotkeys (`W/E/R/X/F`, `Ctrl+Z`, `Ctrl+Shift+Z`/`Ctrl+Y`, `F5-F7`, `Ctrl+Q` quit)
@@ -4632,20 +5841,29 @@ struct FlintStudioState(Movable):
                     self.open_command_palette(PALETTE_ALL)
                 return True
             if self.command_palette.is_open:
-                if input.key_pressed(UI_KEY_BACKSPACE) and self.command_palette.raw_query.byte_length() > 0:
-                    var nq = String(self.command_palette.raw_query[byte=0 : self.command_palette.raw_query.byte_length() - 1])
+                if input.key_pressed_or_repeat(UI_KEY_BACKSPACE) and self.command_palette.raw_query.byte_length() > 0:
+                    var nq = utf8_drop_last_char(self.command_palette.raw_query)
                     self.command_palette.set_query(nq)
                 elif input.text_input_utf8.byte_length() > 0:
-                    var q_acc = self.command_palette.raw_query
+                    # Any UTF-8 text (accents, AltGr symbols, CJK); only ASCII control bytes are dropped,
+                    # which keeps multi-byte sequences whole.
+                    var q_bytes = List[UInt8]()
                     for b in input.text_input_utf8.as_bytes():
-                        if b >= 32 and b < 127:
-                            var ch_b = List[UInt8](capacity=1)
-                            ch_b.append(b)
-                            q_acc += String(unsafe_from_utf8=ch_b)
-                    self.command_palette.set_query(q_acc)
+                        if b >= 32 and b != 127:
+                            q_bytes.append(b)
+                    if len(q_bytes) > 0:
+                        self.command_palette.set_query(self.command_palette.raw_query + String(unsafe_from_utf8=q_bytes))
+                if input.ime_commit.byte_length() > 0:
+                    var c_bytes = List[UInt8]()
+                    for b in input.ime_commit.as_bytes():
+                        if b >= 32 and b != 127:
+                            c_bytes.append(b)
+                    if len(c_bytes) > 0:
+                        self.command_palette.set_query(self.command_palette.raw_query + String(unsafe_from_utf8=c_bytes))
+                self.command_palette.ime_preedit = input.ime_preedit if input.ime_active else String("")
                 var pal_act = self.command_palette.handle_key(
-                    key_up=input.key_pressed(UI_KEY_UP),
-                    key_down=input.key_pressed(UI_KEY_DOWN),
+                    key_up=input.key_pressed_or_repeat(UI_KEY_UP),
+                    key_down=input.key_pressed_or_repeat(UI_KEY_DOWN),
                     key_tab=input.key_pressed(UI_KEY_TAB),
                     key_shift=shift_down,
                     key_enter=input.key_pressed(UI_KEY_ENTER),
@@ -4676,6 +5894,19 @@ struct FlintStudioState(Movable):
         )
         var in_play = self.pie.mode != PIE_STOPPED
 
+        # An armed key chord (`Alt+A ...`) owns the next key press: it resolves to a palette command
+        # (or cancels on Esc / an unknown key) and is swallowed so it never also fires a hotkey.
+        if self.key_chord_hud.active:
+            if kbd_captured:
+                self.key_chord_hud.cancel()
+            else:
+                var chord_key = studio_chord_key_label(input)
+                if chord_key.byte_length() > 0:
+                    var chord_cmd = self.key_chord_hud.resolve_key(chord_key)
+                    if chord_cmd >= 0:
+                        _ = self.execute_palette_command(chord_cmd)
+                    return True
+
         if not kbd_captured:
             if alt_down and input.key_pressed(65):  # Alt+A: Toggle Agent Mission Control
                 _ = self.execute_palette_command(PAL_CMD_AGENT_TOGGLE_PANEL)
@@ -4690,6 +5921,9 @@ struct FlintStudioState(Movable):
             elif shift_down and not ctrl_down and not alt_down and not in_play and input.key_pressed(65):  # Shift+A: Quick Spawn
                 self.open_command_palette(PALETTE_SPAWN)
                 return True
+            elif ctrl_down and shift_down and not alt_down and input.key_pressed(61):  # Ctrl + '+' (Shift+= on US)
+                self.set_ui_scale(self.ui_scale + Float32(0.25))
+                self.push_toast("UI Scale: " + String(Int(self.ui_scale * Float32(100.0) + Float32(0.5))) + "%", 0, 1.8)
             elif ctrl_down and not shift_down and not alt_down:
                 if input.key_pressed(61) or input.key_pressed(334):  # Ctrl + = / + : UI Zoom In
                     self.set_ui_scale(self.ui_scale + Float32(0.25))
@@ -4710,8 +5944,6 @@ struct FlintStudioState(Movable):
                     _ = self.apply_workspace_preset(WORKSPACE_LOOKDEV)
                 elif input.key_pressed(53):
                     _ = self.apply_workspace_preset(WORKSPACE_PLAY)
-            elif input.key_pressed(UI_KEY_ESCAPE) and self.key_chord_hud.active:
-                self.key_chord_hud.cancel()
 
         if not kbd_captured:
             if in_play:
@@ -4761,12 +5993,36 @@ struct FlintStudioState(Movable):
                 if self.input_map.just_pressed("editor_save"):
                     _ = self.save_scene_file()
                 if self.input_map.just_pressed("editor_load"):
-                    _ = self.load_scene_file()
+                    _ = self.request_load_scene()
                 if self.input_map.just_pressed("editor_new"):
                     _ = self.new_scene(force=False)
+                if self.input_map.just_pressed("editor_save_as"):
+                    self.open_file_modal(True)
+                if self.input_map.just_pressed("editor_open"):
+                    self.open_file_modal(False)
+                if self.input_map.just_pressed("editor_help"):
+                    self.help_open = True
+                if self.input_map.just_pressed("editor_rename"):
+                    _ = self.begin_rename_selected()
+                if self.input_map.just_pressed("editor_select_all"):
+                    self.select_all_entities()
+                # Esc in Edit clears the selection, unless it is cancelling a gizmo drag or marquee.
+                if (
+                    self.input_map.just_pressed("editor_clear_selection")
+                    and not self.gz_dragging
+                    and not self.marquee_active
+                    and self.selected_count() > 0
+                ):
+                    self.clear_selection()
+                if self.input_map.just_pressed("build_reload"):
+                    var ok_so = self.reload_gameplay_plugin()
+                    if ok_so:
+                        self.push_toast("Reloaded gameplay .so", 0, 2.0)
+                    else:
+                        self.push_toast("Reload failed: " + self.hot_reload_host.last_error, 2, 4.0)
                 if self.input_map.just_pressed("editor_copy") and self.selected_count() > 0:
                     _ = self.copy_selected()
-                if self.input_map.just_pressed("editor_paste") and len(self.clipboard_entity_ids) > 0:
+                if self.input_map.just_pressed("editor_paste") and len(self.clipboard_editor_ids) > 0:
                     _ = self.paste_clipboard(record_undo=True)
                 if self.input_map.just_pressed("editor_duplicate") and self.selected_count() > 0:
                     if len(self.selected_entity_ids) > 1:
@@ -4789,6 +6045,18 @@ struct FlintStudioState(Movable):
                 if self.input_map.just_pressed("pie_step"):
                     _ = self.pie_step(1, Float32(1.0 / 60.0))
 
+        # Arrow keys drive the Hierarchy while the pointer is over it (they orbit the camera elsewhere).
+        var hier_hover = False
+        if not kbd_captured and not in_play:
+            var h_info = self.dock.find_panel("Hierarchy")
+            if h_info[0] >= 0 and h_info[2] and h_info[3].contains(_lmx, _lmy):
+                hier_hover = True
+                _ = self.hierarchy_key_nav(
+                    input.key_pressed(UI_KEY_UP),
+                    input.key_pressed(UI_KEY_DOWN),
+                    input.key_pressed(263),
+                    input.key_pressed(262),
+                )
         var editor_cam_controllable = (self.pie.mode != PIE_PLAYING) or self.pie_camera_ejected
         if (
             not editor_cam_controllable
@@ -4798,21 +6066,25 @@ struct FlintStudioState(Movable):
             or not input.mouse_down(1)
         ):
             self._rmb_fly_active = False
-        elif not self._rmb_fly_active and input.mouse_pressed(1) and not mouse_captured:
-            self._rmb_fly_active = True
+        elif not self._rmb_fly_active and input.mouse_pressed(1) and not mouse_captured and not alt_down:
+            self._rmb_fly_active = True  # Alt+RMB is dolly, not fly
         var rmb_fly = self._rmb_fly_active
         if not rmb_fly and not kbd_captured and not in_play:
-            if self.input_map.just_pressed("gizmo_select"):
-                _ = self.execute_palette_command(PAL_CMD_TOOL_SELECT)
             if self.input_map.just_pressed("gizmo_translate"):
                 self.gizmo_mode = GIZMO_MODE_TRANSLATE
             if self.input_map.just_pressed("gizmo_rotate"):
                 self.gizmo_mode = GIZMO_MODE_ROTATE
             if self.input_map.just_pressed("gizmo_scale"):
                 self.gizmo_mode = GIZMO_MODE_SCALE
+            if self.input_map.just_pressed("tool_select"):
+                _ = self.execute_palette_command(PAL_CMD_TOOL_SELECT)  # also drops the active handle
+            if self.input_map.just_pressed("toggle_snap"):
+                self.snap_enabled = not self.snap_enabled
+                self.push_toast("Grid snap on" if self.snap_enabled else "Grid snap off", 0, 1.2)
 
         if editor_cam_controllable:
-            var orb = self.input_map.axis_2d("cam_orbit") if not kbd_captured else (Float32(0.0), Float32(0.0))
+            var arrows_free = not (kbd_captured or hier_hover or self.arrows_drive_nudge())
+            var orb = self.input_map.axis_2d("cam_orbit") if arrows_free else (Float32(0.0), Float32(0.0))
             var dyaw = orb[0] * Float32(80.0) * dt
             var dpitch = orb[1] * Float32(65.0) * dt
             var fly_move = Vec3()
@@ -4831,8 +6103,37 @@ struct FlintStudioState(Movable):
                 self.update_camera(dt, dyaw, dpitch, fly_move_local=fly_move, fly_speed=Float32(8.5))
                 self.cam_target = self.cam_pos + self.cam_fwd * self.camera_rig.spring_arm.target_length
                 self.camera_rig.pivot_spring.value = self.cam_target
+                self.camera_rig.shoulder_offset = Vec3()  # the pivot is re-derived from the eye
             else:
                 self.camera_rig.mode = CAM_MODE_ORBIT_FOLLOW
+                # Mouse navigation over the viewport: wheel dolly, middle-drag pan, Alt+left orbit,
+                # Alt+right dolly (the DCC conventions; right-drag stays fly mode).
+                if self.viewport_hovered and not mouse_captured:
+                    var arm = max(Float32(0.35), self.camera_rig.spring_arm.target_length)
+                    var wheel = input.mouse_wheel()
+                    var dolly = Float32(1.0)
+                    if wheel != Float32(0.0) and isfinite(wheel):
+                        # Smooth (touchpad / hi-res) wheels report fractional notches: 0.88 per notch.
+                        dolly = studio_wheel_dolly_factor(wheel)
+                    if alt_down and input.mouse_down(1):
+                        dolly *= max(Float32(0.5), min(Float32(2.0), Float32(1.0) + input.mouse_delta_y() * Float32(0.01)))
+                    if dolly != Float32(1.0):
+                        var new_arm = max(Float32(0.35), min(Float32(800.0), arm * dolly))
+                        self.camera_rig.spring_arm.target_length = new_arm
+                        self.camera_rig.spring_arm.current_length.value = new_arm
+                        self.agent_bus.notify_user_camera_input()
+                    if input.mouse_down(2):
+                        # World units per physical pixel at the pivot, so the pivot tracks the cursor.
+                        var k_pan = studio_pan_world_per_px(arm, self.fov_y_deg, self.viewport_xf.proj_phys_h())
+                        var pan = (self.cam_right * (-input.mouse_delta_x()) + self.cam_up * input.mouse_delta_y()) * k_pan
+                        if isfinite(pan.x) and isfinite(pan.y) and isfinite(pan.z):
+                            self.cam_target = self.cam_target + pan
+                            self.camera_rig.pivot_spring.value = self.cam_target
+                            self.camera_rig.pivot_spring.velocity = Vec3()
+                            self.agent_bus.notify_user_camera_input()
+                    if alt_down and input.mouse_down(0):
+                        dyaw += input.mouse_delta_x() * Float32(0.25)
+                        dpitch += input.mouse_delta_y() * Float32(0.25)
                 self.update_camera(dt, dyaw, dpitch)
         return True
 
@@ -4928,33 +6229,35 @@ struct FlintStudioState(Movable):
         out.end()
 
     def deserialize(mut self, mut input: BlobReader) raises:
+        # Read and validate the whole checkpoint into locals first; editor state is only assigned once
+        # the blob is known to be complete (a truncated blob used to leave selection/clock/gravity from
+        # the checkpoint paired with the old world).
         _ = input.enter(STUDIO_CHECKPOINT_FOURCC, 1)
-        self.selected_entity_id = input.integer()
+        var sel_primary = input.integer()
         var n_sel = Int(input.u32())
-        self.selected_entity_ids.clear()
         var rem_sel = max(0, input.limit() - input.offset)
         if input.failed or n_sel < 0 or n_sel > rem_sel // 8:
             input.failed = True
             input.leave()
             raise Error("Failed to read Studio checkpoint blob")
-        self.selected_entity_ids.reserve(n_sel)
+        var sel_ids = List[Int](capacity=n_sel)
         for _ in range(n_sel):
-            self.selected_entity_ids.append(input.integer())
-        self.selection_anchor_id = input.integer()
-        self.sim_tick = input.integer()
-        self.gravity = input.vec3()
-        self.ground_plane_y = input.f32()
-        self.has_ground_plane = input.boolean()
-        self._ground_body_id = input.integer()
-        self.stepped_clock.raw_time_sec = input.f32()
-        self.stepped_clock.stepped_time_sec = input.f32()
-        self.stepped_clock.step_hz = input.f32()
-        self.stepped_clock.hitstop_remaining_sec = input.f32()
-        self.stepped_clock.pose_changed_this_tick = input.boolean()
-        self.preview_impact_blend = input.f32()
-        self.preview_impact_invert = input.boolean()
-        self.preview_shockwave_active = input.boolean()
-        self.preview_shockwave_radius = input.f32()
+            sel_ids.append(input.integer())
+        var sel_anchor = input.integer()
+        var r_sim_tick = input.integer()
+        var r_gravity = input.vec3()
+        var r_ground_y = input.f32()
+        var r_has_ground = input.boolean()
+        var r_ground_body = input.integer()
+        var r_raw_time = input.f32()
+        var r_stepped_time = input.f32()
+        var r_step_hz = input.f32()
+        var r_hitstop = input.f32()
+        var r_pose_changed = input.boolean()
+        var r_impact_blend = input.f32()
+        var r_impact_invert = input.boolean()
+        var r_shock_active = input.boolean()
+        var r_shock_radius = input.f32()
 
         var w_bytes = _read_blob_bytes(input)
         var p_bytes = _read_blob_bytes(input)
@@ -4974,9 +6277,28 @@ struct FlintStudioState(Movable):
         if input.failed:
             raise Error("Failed to read Studio checkpoint blob")
 
+        self.selected_entity_id = sel_primary
+        self.selected_entity_ids = sel_ids^
+        self.selection_anchor_id = sel_anchor
+        self.sim_tick = r_sim_tick
+        self.gravity = r_gravity
+        self.ground_plane_y = r_ground_y
+        self.has_ground_plane = r_has_ground
+        self._ground_body_id = r_ground_body
+        self.stepped_clock.raw_time_sec = r_raw_time
+        self.stepped_clock.stepped_time_sec = r_stepped_time
+        self.stepped_clock.step_hz = r_step_hz
+        self.stepped_clock.hitstop_remaining_sec = r_hitstop
+        self.stepped_clock.pose_changed_this_tick = r_pose_changed
+        self.preview_impact_blend = r_impact_blend
+        self.preview_impact_invert = r_impact_invert
+        self.preview_shockwave_active = r_shock_active
+        self.preview_shockwave_radius = r_shock_radius
+
         if len(w_bytes) > 0:
             var wr = BlobReader(w_bytes^)
             self.app.world.restore_blob(wr)
+            self.bump_scene_version()
             self.registry.ensure_registered_in_world(self.app.world)
 
         if len(p_bytes) > 0:
@@ -5029,6 +6351,9 @@ struct FlintStudioState(Movable):
         var ae_hash = AudioEmitterComponent.COMPONENT_ID
         var prev_gt_hash = PrevGlobalTransform.COMPONENT_ID
         var gt_hash = GlobalTransform.COMPONENT_ID
+        # Editor identity is metadata, not scene state: ids are assigned lazily (load, restore, sync),
+        # and that must not change the hash PIE and replay checks compare.
+        var edid_hash = StudioEditorIdComponent.COMPONENT_ID
 
         for slot in range(len(ents)):
             var e = ents[slot]
@@ -5044,7 +6369,7 @@ struct FlintStudioState(Movable):
             for ci in range(len(sorted_codecs)):
                 var cidx = sorted_codecs[ci]
                 var chash = self.registry.entries[cidx].component_hash
-                if chash == prev_gt_hash or (has_local_tf and chash == gt_hash):
+                if chash == prev_gt_hash or chash == edid_hash or (has_local_tf and chash == gt_hash):
                     continue
                 if not self.registry.has_on_entity(cidx, self.app.world, e):
                     continue
@@ -5182,54 +6507,280 @@ struct FlintStudioState(Movable):
             target = self.project_root + "/" + path
         return target
 
+    def recent_scenes_path(self) -> String:
+        var root = self.project_root if self.project_root.byte_length() > 0 else String(".")
+        return root + "/.flint/recent_scenes.txt"
+
+    def load_recent_scenes(mut self):
+        """Reads `<project>/.flint/recent_scenes.txt` (one path per line, newest first)."""
+        self.recent_scenes.clear()
+        var raw = read_bytes(self.recent_scenes_path())
+        var line = List[UInt8]()
+        for i in range(len(raw) + 1):
+            if i == len(raw) or raw[i] == 10:
+                if len(line) > 0 and len(self.recent_scenes) < STUDIO_RECENT_SCENES_CAP:
+                    self.recent_scenes.append(String(unsafe_from_utf8=line))
+                line.clear()
+            elif raw[i] != 13:
+                line.append(raw[i])
+
+    def note_recent_scene(mut self, path: String):
+        """Moves `path` to the front of the recent-scenes list and writes the list back."""
+        if path.byte_length() == 0:
+            return
+        var out_list = List[String]()
+        out_list.append(path)
+        for i in range(len(self.recent_scenes)):
+            if self.recent_scenes[i] != path and len(out_list) < STUDIO_RECENT_SCENES_CAP:
+                out_list.append(self.recent_scenes[i])
+        self.recent_scenes = out_list^
+        if self.project_root.byte_length() == 0:
+            return  # no project: keep the list in memory, never write into whatever the cwd is
+        var buf = List[UInt8]()
+        for i in range(len(self.recent_scenes)):
+            for b in self.recent_scenes[i].as_bytes():
+                buf.append(b)
+            buf.append(10)
+        var dst = self.recent_scenes_path()
+        _ = make_dirs(parent_directory(dst))
+        _ = write_file_durable(dst, buf)
+
+    def open_file_modal(mut self, save_as: Bool):
+        self.file_modal_open = True
+        self.file_modal_save_as = save_as
+        self.file_modal_path = self.scene_file_path
+        self.load_recent_scenes()
+
+    def submit_file_modal(mut self) -> Bool:
+        """Runs the Open / Save As the file dialog was opened for; keeps the dialog open on failure."""
+        var path = self.file_modal_path
+        if path.byte_length() == 0:
+            self.push_toast("Enter a scene path", 1, 2.5)
+            return False
+        if self.file_modal_save_as:
+            if not (path.endswith(".flscn") or path.endswith(".flscnb") or path.endswith(".flscene")):
+                path += ".flscnb"
+            var ok = self.save_scene_file(path)
+            if ok:
+                self.file_modal_open = False
+                self.push_toast("Saved " + self.scene_file_path, 0, 2.5)
+            return ok
+        self.file_modal_open = False
+        var ok = self.request_load_scene(path)
+        if not ok and not self.confirm_modal_open:
+            self.file_modal_open = True  # the load failed: let the user fix the path
+        return ok
+
+    def reset_layout(mut self):
+        self.workspace_mgr.reset_preset(WORKSPACE_EDIT)
+        _ = self.apply_workspace_preset(WORKSPACE_EDIT)
+        self.push_toast("Layout reset", 0, 1.8)
+
+    def select_all_entities(mut self):
+        self.selected_entity_ids.clear()
+        for i in range(len(self.entities)):
+            if self.entities[i].alive and not self.is_entity_locked(i):
+                self.selected_entity_ids.append(i)
+        if len(self.selected_entity_ids) > 0:
+            self.selected_entity_id = self.selected_entity_ids[0]
+            self.selection_anchor_id = self.selected_entity_id
+
+    def welcome_marker_path(self) -> String:
+        var root = self.project_root if self.project_root.byte_length() > 0 else String(".")
+        return root + "/.flint/welcome_seen"
+
+    def maybe_show_welcome(mut self):
+        """First run in a project shows the Welcome dialog once (interactive sessions only)."""
+        if file_size(self.welcome_marker_path()) < 0:
+            self.welcome_open = True
+
+    def dismiss_welcome(mut self):
+        self.welcome_open = False
+        var dst = self.welcome_marker_path()
+        _ = make_dirs(parent_directory(dst))
+        var one = List[UInt8]()
+        one.append(49)
+        _ = write_bytes(dst, one)
+
+    def begin_rename_selected(mut self) -> Bool:
+        """F2 / Rename: focuses the Inspector name field. Only one entity can be renamed at a time; a
+        multi-selection (whose Inspector shows bulk edits, no name field) gets a hint instead of a
+        focus request nobody would consume."""
+        if self.selected_count() > 1:
+            self.rename_focus_requested = False
+            self.push_toast("Rename works on one entity: select just one", 1, 2.2)
+            return False
+        if not self.is_alive_id(self.selected_entity_id):
+            self.rename_focus_requested = False
+            return False
+        _ = WorkspacePresetManager.ensure_panel_visible(self.dock, PANEL_INSPECTOR)
+        self.rename_focus_requested = True
+        return True
+
+    def autosave_source_path(self) -> String:
+        """The full path the autosave belongs to: the resolved scene path, or "" while untitled."""
+        if self.scene_file_path.byte_length() == 0:
+            return String("")
+        return self._resolve_scene_io_path(self.scene_file_path)
+
+    def autosave_path(self) -> String:
+        """Where this scene's autosave lives, inside `<project>/.flint/autosave/` (never the user's file).
+        A titled scene uses `flint.studio.autosave.snapshot_path` (keyed by the full scene path, so
+        `a/level.flscn` and `b/level.flscn` never share one autosave, with an `.origin` sidecar that
+        lets `recovery_original` find it from another scene after a crash); an untitled scene uses
+        `untitled-<hash>.autosave.flscnb`."""
+        var src = self.autosave_source_path()
+        if src.byte_length() > 0:
+            return snapshot_path(self.project_root, src)
+        var key = List[UInt8](capacity=src.byte_length())
+        for c in src.as_bytes():
+            key.append(c)
+        var h = fnv64(key)
+        var digits = String("0123456789abcdef").as_bytes()
+        var hex = List[UInt8](capacity=16)
+        for k in range(16):
+            hex.append(digits[Int((h >> UInt64(60 - 4 * k)) & UInt64(15))])
+        return recovery_directory(self.project_root) + "/untitled-" + String(unsafe_from_utf8=hex) + ".autosave.flscnb"
+
+    @staticmethod
+    def _wrap_autosave(source: String, payload: List[UInt8]) -> List[UInt8]:
+        """Autosave file: `FLAS`, u32 LE length + the scene path it belongs to, then the `.flscnb` bytes."""
+        var sb = source.as_bytes()
+        var out = List[UInt8](capacity=8 + len(sb) + len(payload))
+        for c in String("FLAS").as_bytes():
+            out.append(c)
+        var n = UInt32(len(sb))
+        for k in range(4):
+            out.append(UInt8((n >> UInt32(8 * k)) & UInt32(255)))
+        for c in sb:
+            out.append(c)
+        for k in range(len(payload)):
+            out.append(payload[k])
+        return out^
+
+    @staticmethod
+    def _unwrap_autosave(raw: List[UInt8]) -> Tuple[Bool, String, List[UInt8]]:
+        """(valid, source scene path, `.flscnb` bytes) of an autosave file."""
+        if len(raw) < 8 or raw[0] != 70 or raw[1] != 76 or raw[2] != 65 or raw[3] != 83:  # "FLAS"
+            return (False, String(""), List[UInt8]())
+        var n = Int(raw[4]) | (Int(raw[5]) << 8) | (Int(raw[6]) << 16) | (Int(raw[7]) << 24)
+        if n < 0 or 8 + n > len(raw):
+            return (False, String(""), List[UInt8]())
+        var src = String(unsafe_from_utf8=raw[8 : 8 + n])
+        var payload = List[UInt8](capacity=len(raw) - 8 - n)
+        for k in range(8 + n, len(raw)):
+            payload.append(raw[k])
+        return (True, src^, payload^)
+
+    def autosave_available(self) -> Bool:
+        """True when an autosave of *this* scene path, newer than the scene file, exists (offered for
+        recovery at startup and after a load)."""
+        var p = self.autosave_path()
+        var a = file_stamp(p)
+        if a[0] <= 0:
+            return False
+        var un = Self._unwrap_autosave(read_bytes(p))
+        if not un[0] or un[1] != self.autosave_source_path():
+            return False
+        if self.scene_file_path.byte_length() == 0:
+            return True
+        var f = file_stamp(self.autosave_source_path())
+        return f[0] < 0 or a[1] > f[1]
+
+    def discard_autosave(mut self):
+        var src = self.autosave_source_path()
+        if src.byte_length() > 0:
+            discard_snapshot(self.project_root, src)  # the autosave and its `.origin` sidecar
+            return
+        var p = self.autosave_path()
+        if file_size(p) > 0:
+            _ = remove_file(p)
+
     def write_autosave(mut self) -> Bool:
-        if not self.dirty or self.pie.mode != PIE_STOPPED:
+        """Writes the current world to `autosave_path()` without touching `scene_file_path` or the dirty
+        flag, so a crash loses at most one autosave interval of work. The write is durable (tmp + fsync
+        + rename) and the file records which scene path it belongs to."""
+        var target = self.autosave_path()
+        var parent = parent_directory(target)
+        if parent.byte_length() > 0 and parent != ".":
+            _ = make_dirs(parent)
+        var payload = self.scene.save_flscnb_bytes(self.app.world, self.registry)
+        if len(payload) == 0:
             return False
-        var packed = self.scene.save_flscnb_bytes(self.app.world, self.registry)
-        if not write_snapshot(self.project_root, self.scene_file_path, packed):
-            self.push_toast("Could not write scene autosave", 1, 4)
+        var src = self.autosave_source_path()
+        var wrapped = Self._wrap_autosave(src, payload)
+        if src.byte_length() > 0:
+            # Publishes the `.origin` identity first, then the snapshot (both durable).
+            if not write_snapshot(self.project_root, src, wrapped):
+                return False
+        elif not write_file_durable(target, wrapped):
             return False
+        self.last_autosave_path = target
         self._autosave_pending = False
         return True
 
     def tick_autosave(mut self, dt: Float32) -> Bool:
-        if self.autosave_interval_sec <= 0 or not self._autosave_pending or self.pie.mode != PIE_STOPPED:
+        """Call once per frame. Autosaves after `autosave_interval_sec` of dirty, stopped (not Play) time.
+        Play pauses the timer (the world is the Play world then); it does not reset it."""
+        self.flush_stale_flmat_edit()
+        if self.autosave_interval_sec <= Float32(0.0) or not self.dirty:
+            self._autosave_accum_sec = Float32(0.0)
             return False
-        if isfinite(dt) and dt > 0:
-            self._autosave_elapsed += dt
-        if self._autosave_elapsed < self.autosave_interval_sec:
+        if self.pie.mode != PIE_STOPPED or self.agent_bus.time_travel_active:
+            return False  # Play / time travel show a world that is not the user's scene
+        if not self._autosave_pending:
+            return False  # nothing changed since the last autosave: it is still current
+        if isfinite(dt) and dt > Float32(0.0):
+            self._autosave_accum_sec += min(dt, Float32(1.0))
+        if self._autosave_accum_sec < self.autosave_interval_sec:
             return False
-        self._autosave_elapsed = 0
+        self._autosave_accum_sec = Float32(0.0)
         return self.write_autosave()
 
     def recover_autosave(mut self) -> Bool:
-        var original = recovery_original(self.project_root, self.scene_file_path)
-        return self._recover_original(original)
-
-    def _recover_original(mut self, original: String) -> Bool:
+        """Brings back the autosave as one undoable step. The scene keeps its own file path and stays
+        dirty, so the recovered work is saved to the real scene file (and quitting still prompts)."""
         if self.pie.mode != PIE_STOPPED:
             return False
-        if not original:
-            self.push_toast("No recoverable scene autosave found", 0, 3)
+        var p = self.autosave_path()
+        if file_size(p) > 0:
+            return self.load_scene_file(p, recovery=True)
+        # Nothing for this scene: offer the newest recoverable scene of the project (a crash while
+        # editing another level). The work comes back under that scene's own path, still dirty.
+        var current = self.autosave_source_path()
+        var original = recovery_original(self.project_root, current)
+        if original.byte_length() == 0 or original == current:
+            self.push_toast("No autosave found", 1, 3.0)
             return False
-        var same_document = original == self.scene_file_path
-        if self.dirty and not same_document and not self.write_autosave():
+        if self.dirty and not self.write_autosave():
+            self.push_toast("Recover refused: the current scene's unsaved work could not be autosaved", 2, 4.0)
             return False
-        var before = self._capture_world_blob() if same_document else List[UInt8]()
-        if self.dirty and same_document and not before:
-            return False
-        var prev_ids = self.selected_entity_ids.copy()
-        var prev_primary = self.selected_entity_id
-        var prev_anchor = self.selection_anchor_id
-        if not self.load_scene_file(snapshot_path(self.project_root, original), recovered_original=original):
-            return False
-        if same_document and before:
-            self._record_world_tx(TX_BATCH_EDIT, -1, List[Int](), before^, prev_ids, prev_primary, prev_anchor, "Recover autosave")
-            self._autosave_pending = False
-        return True
+        return self.load_scene_file(snapshot_path(self.project_root, original), recovered_original=original)
+
+    def _untitled_save_suggestion(self) -> String:
+        """A Save As default for an untitled scene that names no existing file."""
+        var root = self.project_root if self.project_root.byte_length() > 0 else String(".")
+        var base = root + "/scenes/untitled"
+        var cand = base + ".flscnb"
+        var n = 2
+        while file_size(cand) >= 0 and n < 1000:
+            cand = base + "-" + String(n) + ".flscnb"
+            n += 1
+        return cand
 
     def save_scene_file(mut self, path: String = "") -> Bool:
         """Saves the Studio scene via `Scene.save_flscnb_file` (`.flscnb`/`.flscene`) or `Scene.save_flscn_file` (`.flscn`)."""
+        _ = self.commit_pending_flmat_edit()
+        if self.agent_bus.time_travel_active:
+            # The world on screen is an agent checkpoint being scrubbed, not the user's scene.
+            self.push_toast("Exit time travel before saving", 1, 3.0)
+            return False
+        if path.byte_length() == 0 and self.scene_file_path.byte_length() == 0:
+            # Untitled (File > New): the first save asks where, never overwriting another level.
+            self.open_file_modal(True)
+            self.file_modal_path = self._untitled_save_suggestion()
+            self.push_toast("Choose where to save the new scene", 0, 3.0)
+            return False
         var target = self._resolve_scene_io_path(path)
         if target.byte_length() == 0:
             self.push_toast("Save failed: empty path", 2, 3.0)
@@ -5247,10 +6798,13 @@ struct FlintStudioState(Movable):
             ok = self.scene.save_flscnb_file(target, self.app.world, self.registry)
         if not ok:
             self.push_toast("Failed to save scene", 2, 3.5)
-            return False
-        discard_snapshot(self.project_root, self.scene_file_path)
+            return False  # the old file and any autosave are left untouched
+        if self.scene_file_path.byte_length() == 0:
+            self.discard_autosave()  # an untitled scene's autosave is superseded by its first real file
         self.scene_file_path = target
+        self.note_recent_scene(target)
         self.mark_dirty(False)
+        self.discard_autosave()  # the real file is now newer than any autosave
         self.push_toast("Saved " + target, 0, 2.5)
         return True
 
@@ -5393,11 +6947,29 @@ struct FlintStudioState(Movable):
             return b == UInt8(123)  # '{'
         return False
 
-    def load_scene_file(mut self, path: String = "", recovered_original: String = "") -> Bool:
-        """Loads a `.flscn`, `.flscnb`, or `.flscene` file into `app.world` and syncs transforms/physics."""
-        var target = path if recovered_original else self._resolve_scene_io_path(path)
-        if not recovered_original and target.startswith(recovery_directory(self.project_root) + "/") and target.endswith(".autosave.flscnb"):
-            return self._recover_original(snapshot_original(self.project_root, target))
+    def load_scene_file(mut self, path: String = "", recovery: Bool = False, recovered_original: String = "") -> Bool:
+        """Loads a `.flscn`, `.flscnb`, or `.flscene` file into `app.world` and syncs transforms/physics.
+        `recovery` (autosave restore) keeps the current scene path and leaves the scene dirty.
+        `recovered_original` restores the autosave at `path` that belongs to *another* scene: the
+        scene switches to that path (one undoable step) and stays dirty. Opening an autosave file
+        directly recovers it under the scene it was taken from."""
+        _ = self.commit_pending_flmat_edit()  # before the entity it belongs to is replaced
+        var target = path if recovered_original.byte_length() > 0 else self._resolve_scene_io_path(path)
+        if (
+            not recovery
+            and recovered_original.byte_length() == 0
+            and target.startswith(recovery_directory(self.project_root) + "/")
+            and target.endswith(".autosave.flscnb")
+        ):
+            var hdr = Self._unwrap_autosave(read_bytes(target))
+            if not hdr[0]:
+                self.push_toast("Not a Flint Studio autosave: " + target, 2, 3.5)
+                return False
+            if hdr[1].byte_length() == 0 or hdr[1] == self.autosave_source_path():
+                return self.load_scene_file(target, recovery=True)
+            return self.load_scene_file(target, recovered_original=hdr[1])
+        var is_recovery = recovery or recovered_original.byte_length() > 0
+        var expect_src = recovered_original if recovered_original.byte_length() > 0 else self.autosave_source_path()
         if target.byte_length() == 0:
             self.push_toast("Load failed: empty path", 2, 3.0)
             return False
@@ -5405,22 +6977,77 @@ struct FlintStudioState(Movable):
         if len(raw) == 0:
             self.push_toast("Load failed: " + target, 2, 3.5)
             return False
+        if is_recovery:
+            # An autosave carries the scene path it was taken from: never restore another scene's work.
+            var un = Self._unwrap_autosave(raw)
+            if not un[0] or un[1] != expect_src:
+                self.push_toast("Autosave does not belong to this scene", 2, 3.5)
+                return False
+            raw = un[2].copy()
+        # Time travel shows an agent checkpoint; the load (and its undo entry) starts from the live scene.
+        self.exit_time_travel()
+        var is_json = target.endswith(".flscn") or Self._raw_starts_with_json_object(raw)
+        var pie_world_unknown = False
+        if self.pie.mode != PIE_STOPPED:
+            # A file that does not parse must leave Play running untouched: test-parse it into a
+            # scratch world before stopping anything.
+            var probe = World()
+            self.registry.ensure_registered_in_world(probe)
+            try:
+                if is_json:
+                    _ = self.scene.load_flscn_bytes(probe, self.registry, raw, clear_existing=True)
+                else:
+                    _ = self.scene.load_flscnb_bytes(probe, self.registry, raw, clear_existing=True)
+            except:
+                self.push_toast("Failed to parse " + target, 2, 3.5)
+                return False
+            # Back to the edit world first, so the load (and its undo entry) starts from the scene the
+            # user was editing, not from a mid-simulation Play world.
+            var restored = True
+            try:
+                _ = self.pie_stop()
+            except:
+                # Either a restore-hash mismatch (the edit world is back) or the checkpoint failed to
+                # deserialize (mode is still Play, the world may be the Play world).
+                restored = self.pie.mode == PIE_STOPPED
+            if self.pie.mode != PIE_STOPPED:
+                self._abort_pie_session()
+            pie_world_unknown = not restored
+        # Scene load is an undoable command: the world before the load is kept as its undo state,
+        # instead of the old behaviour of wiping the user's whole undo/redo history.
+        var before_blob = self._capture_world_blob()
+        if len(before_blob) == 0 and not pie_world_unknown:
+            # Without a snapshot a failed parse could not put the scene back, and the load could not be undone.
+            self.push_toast("Load refused: the current scene could not be snapshotted", 2, 4.0)
+            return False
+        var prev_ids = self.selected_entity_ids.copy()
+        var prev_primary = self.selected_entity_id
+        var prev_anchor = self.selection_anchor_id
         try:
-            if target.endswith(".flscn") or Self._raw_starts_with_json_object(raw):
+            if is_json:
                 _ = self.scene.load_flscn_bytes(self.app.world, self.registry, raw, clear_existing=True)
             else:
                 _ = self.scene.load_flscnb_bytes(self.app.world, self.registry, raw, clear_existing=True)
         except:
+            # `clear_existing` may have emptied the world before the parse failed: put the scene back.
+            if len(before_blob) > 0:
+                _ = self._restore_world_blob(before_blob)
+            self._sync_ecs_and_physics()
             self.push_toast("Failed to parse " + target, 2, 3.5)
             return False
-        if self.pie.mode != PIE_STOPPED:
-            self._abort_pie_session()
-        self.undo_stack.clear()
-        self.redo_stack.clear()
         self.clear_selection()
+        self.clipboard_editor_ids.clear()  # copied ids belonged to the old scene
         if len(self.app.world.entities) > 0 and self.app.world.entities[0].alive:
             self.select_entity(0)
-        self.scene_file_path = recovered_original if recovered_original else target
+        var prev_scene_path = self.scene_file_path
+        if recovered_original.byte_length() > 0:
+            self.scene_file_path = recovered_original  # another scene's crash work: reopen that scene
+            self.note_recent_scene(recovered_original)
+        elif not is_recovery:
+            self.scene_file_path = target
+            self.note_recent_scene(target)
+        # Approvals were queued against the old scene; its editor ids mean other entities now.
+        self.reject_all_mcp_approvals("Scene changed before approval")
         self.gpu_materials.clear_entity_slots()
         self._pie_frame_updated = False
         self._int_edit_wid = UInt64(0)
@@ -5441,12 +7068,35 @@ struct FlintStudioState(Movable):
         if self._has_default_showcase_entities():
             upload_default_studio_gpu_assets(self)
         self._reset_physics_world_and_sync()
-        self.mark_dirty(Bool(recovered_original))
-        if recovered_original:
-            self._autosave_pending = False
-            self.push_toast("Recovered unsaved edits for " + recovered_original, 0, 4.0)
+        if pie_world_unknown:
+            # The pre-load world is a broken Play restore, not the user's scene: do not offer it as undo.
+            self.push_toast("Play could not be restored; this load cannot be undone", 1, 4.0)
+        elif len(before_blob) > 0:
+            var top_before = self._top_tx_id()
+            var prev_saved = self._saved_tx_id
+            self._record_world_tx(
+                TX_BATCH_EDIT, -1, List[Int](), before_blob^, prev_ids, prev_primary, prev_anchor,
+                ("Recover autosave" if is_recovery else "Load " + target),
+            )
+            if self._top_tx_id() != top_before:
+                ref top = self.undo_stack[len(self.undo_stack) - 1]
+                top.changes_scene_path = True
+                top.prev_scene_path = prev_scene_path
+                top.next_scene_path = self.scene_file_path
+                top.prev_saved_tx_id = prev_saved
+                top.load_leaves_clean = not is_recovery
+        if is_recovery:
+            self.mark_dirty(True)
+            self._autosave_pending = False  # the recovered autosave is already the latest snapshot
+            if recovered_original.byte_length() > 0:
+                self.push_toast("Recovered unsaved edits for " + recovered_original + ". Save to keep them", 0, 4.0)
+            else:
+                self.push_toast("Recovered autosave. Save to keep it in " + self.scene_file_path, 0, 4.0)
         else:
+            self.mark_dirty(False)
             self.push_toast("Loaded " + target, 0, 2.5)
+            if self.autosave_available():
+                self.push_toast("This scene has a newer autosave: File > Recover Autosave brings it back", 1, 6.0)
         return True
 
     @staticmethod
@@ -5753,10 +7403,8 @@ struct FlintStudioState(Movable):
 
     def _compute_viewport_drop_pos(self, px: Float32, py: Float32, vp: RectF) -> Vec3:
         if vp.w > Float32(1.0) and vp.h > Float32(1.0) and vp.contains(px, py):
-            var ray = ViewportRay.from_screen(
-                px, py, vp.x, vp.y, vp.w, vp.h,
-                self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg,
-            )
+            var vxf = ViewportTransform.from_logical(vp, self._last_screen_w, self._last_screen_h, Float32(1.0))
+            var ray = vxf.ray_logical(px, py, self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg)
             var hit = self.raycast_scene(ray.origin, ray.dir, Float32(250.0))
             if hit.hit:
                 return hit.point
@@ -5838,7 +7486,7 @@ struct FlintStudioState(Movable):
 
         if lower.endswith(".flscn") or lower.endswith(".flscnb") or lower.endswith(".flscene"):
             if not from_drop:
-                _ = self.load_scene_file(full_path)
+                _ = self.request_load_scene(full_path)
             return -1
 
         if lower.endswith(".glb"):
@@ -5869,6 +7517,7 @@ struct FlintStudioState(Movable):
             var prev_anchor = self.selection_anchor_id
 
             var e = self.app.world.spawn_empty()
+            self.bump_scene_version()
             var eid = Int(e.index)
             var lt = LocalTransform(drop_pos, Quat.identity(), Vec3(1.0, 1.0, 1.0))
             var gt = GlobalTransform.from_local(lt)
@@ -5970,6 +7619,7 @@ struct FlintStudioState(Movable):
                 if si == 0 and not self.app.world.has[PrefabInstanceComponent](se):
                     _ = self.app.world.insert[PrefabInstanceComponent](se, PrefabInstanceComponent(pf.name, pf_ref.copy(), 0))
             var root_eid = Int(spawned[0].index)
+            self.last_prefab_entry = entry_rel
             self.select_entity(root_eid)
             self._sync_ecs_and_physics()
             self._record_world_tx(
@@ -6053,6 +7703,7 @@ struct FlintStudioState(Movable):
                         au_p.value()[].auto_play_pending = True
                     _ = self.commit_ecs_edit(target_entity_id, "Assign Audio " + base_name, before_blob^)
                     return target_entity_id
+            var top_before_spawn = self._top_tx_id()
             var eid = self.spawn_card_entity(5)
             var e = self.resolve_entity(eid)
             if e.valid():
@@ -6066,8 +7717,10 @@ struct FlintStudioState(Movable):
                     au_p.value()[].playing = True
                     au_p.value()[].auto_play_pending = True
                 self._sync_ecs_and_physics()
-                if len(self.undo_stack) > 0:
-                    self.undo_stack[len(self.undo_stack) - 1].after_world_blob = self._capture_world_blob()
+                # Fold the emitter setup into the spawn's own undo entry, and only if the spawn made one
+                # (during Play it does not, and the top entry is then an unrelated user edit).
+                if self._top_tx_id() != top_before_spawn and len(self.undo_stack) > 0:
+                    self.undo_stack[len(self.undo_stack) - 1].after_world_blob = Self._pack_undo_blob(self._capture_world_blob())
             return eid
 
         if lower.endswith(".flrig"):
@@ -6105,6 +7758,7 @@ struct FlintStudioState(Movable):
                 var prev_primary = self.selected_entity_id
                 var prev_anchor = self.selection_anchor_id
                 var e = self.app.world.spawn_empty()
+                self.bump_scene_version()
                 var eid = Int(e.index)
                 var lt = LocalTransform(drop_pos, Quat.identity(), Vec3(1.0, 1.0, 1.0))
                 var gt = GlobalTransform.from_local(lt)
@@ -6172,7 +7826,20 @@ struct FlintStudioState(Movable):
 
     # ---- Reversible Coalesced Transaction Stack ----
 
+    @staticmethod
+    def _pack_undo_blob(var raw: List[UInt8]) -> List[UInt8]:
+        """Undo keeps two world blobs per step; LZ4-packing them (with an integrity hash) cuts undo memory
+        several-fold. Already-packed and tiny blobs are kept as they are."""
+        if len(raw) < 1024 or lz4_packed_raw_size(raw) >= 0:
+            return raw^
+        var packed = lz4_pack(raw)
+        if len(packed) >= len(raw):
+            return raw^
+        return packed^
+
     def _push_undo(mut self, var tx: EditorTransaction):
+        tx.before_world_blob = Self._pack_undo_blob(tx.before_world_blob^)
+        tx.after_world_blob = Self._pack_undo_blob(tx.after_world_blob^)
         if tx.tx_id == UInt64(0):
             tx.tx_id = self._next_tx_id
             self._next_tx_id += UInt64(1)
@@ -6181,26 +7848,60 @@ struct FlintStudioState(Movable):
         if tx.step_id == UInt64(0) and self._active_tx_step_id != UInt64(0):
             tx.step_id = self._active_tx_step_id
         self.undo_stack.append(tx^)
-        if len(self.undo_stack) > MAX_UNDO_STACK:
-            var excess = len(self.undo_stack) - MAX_UNDO_STACK
-            var trimmed = List[EditorTransaction](capacity=MAX_UNDO_STACK)
-            for i in range(excess, len(self.undo_stack)):
-                trimmed.append(self.undo_stack[i].copy())
-            self.undo_stack = trimmed^
+        self._enforce_undo_budget()
 
-        var total_bytes = 0
+    def undo_history_bytes(self) -> Int:
+        """Approximate bytes held by undo *and* redo history."""
+        var total = 0
         for i in range(len(self.undo_stack)):
-            total_bytes += self.undo_stack[i].approx_bytes()
-        if total_bytes > MAX_UNDO_BLOB_BYTES and len(self.undo_stack) > 32:
-            var drop_n = 0
-            while total_bytes > MAX_UNDO_BLOB_BYTES and len(self.undo_stack) - drop_n > 32:
-                total_bytes -= self.undo_stack[drop_n].approx_bytes()
-                drop_n += 1
-            if drop_n > 0:
-                var trimmed_b = List[EditorTransaction](capacity=len(self.undo_stack) - drop_n)
-                for i in range(drop_n, len(self.undo_stack)):
-                    trimmed_b.append(self.undo_stack[i].copy())
-                self.undo_stack = trimmed_b^
+            total += self.undo_stack[i].approx_bytes()
+        for i in range(len(self.redo_stack)):
+            total += self.redo_stack[i].approx_bytes()
+        return total
+
+    @staticmethod
+    def _drop_front(mut stack: List[EditorTransaction], n: Int):
+        """Removes the `n` oldest entries in place: entries are moved down (swapped), never deep-copied."""
+        if n <= 0:
+            return
+        var count = len(stack)
+        for i in range(n, count):
+            stack.swap_elements(i - n, i)
+        for _ in range(min(n, count)):
+            _ = stack.pop()
+
+    def set_undo_byte_budget(mut self, budget_bytes: Int):
+        """Sets the undo + redo byte cap (default `MAX_UNDO_BLOB_BYTES`) and enforces it right away."""
+        self.undo_byte_budget = max(0, budget_bytes)
+        self._enforce_undo_budget()
+
+    def _enforce_undo_budget(mut self):
+        """Keeps history within `MAX_UNDO_STACK` entries and `undo_byte_budget` (undo + redo), evicting
+        the oldest undo entries first, then the furthest redo entries. The newest undo entry is always
+        kept. When the saved state's entry is evicted, the save point moves to wherever it is still
+        reachable (the bottom of the stack), or becomes unreachable so undo never fakes a clean scene."""
+        var total = self.undo_history_bytes()
+        var n = len(self.undo_stack)
+        var drop = 0
+        while n - drop > 1 and (n - drop > MAX_UNDO_STACK or total > self.undo_byte_budget):
+            total -= self.undo_stack[drop].approx_bytes()
+            drop += 1
+        if drop > 0:
+            var last_dropped = self.undo_stack[drop - 1].tx_id
+            var saved_dropped = self._saved_tx_id == UInt64(0)
+            for k in range(drop):
+                if self.undo_stack[k].tx_id == self._saved_tx_id:
+                    saved_dropped = True
+            if self._saved_tx_id == last_dropped:
+                self._saved_tx_id = UInt64(0)  # the empty-undo state *is* the saved one now
+            elif saved_dropped:
+                self._saved_tx_id = UInt64(0xFFFFFFFFFFFFFFFF)
+            Self._drop_front(self.undo_stack, drop)
+        var rdrop = 0
+        while rdrop < len(self.redo_stack) and total > self.undo_byte_budget:
+            total -= self.redo_stack[rdrop].approx_bytes()
+            rdrop += 1
+        Self._drop_front(self.redo_stack, rdrop)
 
     def _record_world_tx(
         mut self,
@@ -6214,6 +7915,20 @@ struct FlintStudioState(Movable):
         label: String,
         coalesce_key: UInt64 = 0,
     ):
+        self._ensure_editor_ids()  # new entities get their id before the after-blob is captured
+        if self.pie.mode != PIE_STOPPED:
+            # Play-In-Editor edits are thrown away by `pie_stop` (it restores the pre-play world), so
+            # they must not enter undo/redo: an entry here would replay a mid-simulation world after Stop.
+            return
+        if self.agent_bus.time_travel_active:
+            # Time travel is read-only: roll the attempted edit back to the checkpoint being shown.
+            if len(before_blob) > 0:
+                _ = self._restore_world_blob(before_blob)
+            elif len(self._time_travel_view_blob) > 0:
+                var view = self._time_travel_view_blob.copy()
+                _ = self._restore_world_blob(view)
+            self.push_toast("Time travel is read-only: exit it to edit", 1, 2.5)
+            return
         var after_blob = self._capture_world_blob()
         var sync_tx_opt = self.app.resources.get_ptr[StudioFlmatStyleSyncResource]()
         var ext_snap = (
@@ -6223,14 +7938,27 @@ struct FlintStudioState(Movable):
         )
         if coalesce_key != 0 and len(self.undo_stack) > 0 and len(self.redo_stack) == 0:
             ref top = self.undo_stack[len(self.undo_stack) - 1]
-            if top.op == op and top.entity_id == primary_id and top.coalesce_key == coalesce_key:
-                top.after_world_blob = after_blob^
+            if top.op == op and top.entity_id == primary_id and top.coalesce_key == coalesce_key and len(after_blob) > 0:
+                top.after_world_blob = Self._pack_undo_blob(after_blob^)
                 top.next_selected_id = self.selected_entity_id
                 top.next_selected_ids = self.selected_entity_ids.copy()
                 top.next_anchor_id = self.selection_anchor_id
                 top.external_mat_reload_epochs = ext_snap^
+                if top.tx_id == self._saved_tx_id:
+                    self._saved_tx_id = UInt64(0xFFFFFFFFFFFFFFFF)  # the saved entry now holds newer edits
+                self._enforce_undo_budget()  # the replaced after-blob can be larger than the old one
                 self.mark_dirty(True)
                 return
+
+        if len(before_blob) == 0 or len(after_blob) == 0:
+            # Never record an entry that cannot be restored: undo would fail on it forever.
+            if len(before_blob) > 0:
+                _ = self._restore_world_blob(before_blob)  # refuse the edit: put the scene back
+                self.push_toast(label + " refused: the scene could not be snapshotted for undo", 2, 4.0)
+            else:
+                self.push_toast(label + " cannot be undone: the scene could not be snapshotted", 2, 4.0)
+                self.mark_dirty(True)
+            return
 
         var tx = EditorTransaction(op, primary_id, label)
         tx.affected_ids = affected^
@@ -6345,6 +8073,25 @@ struct FlintStudioState(Movable):
             if self.app.world.has[RigidBodyComponent](e):
                 _ = self.app.world.remove[RigidBodyComponent](e)
 
+    def default_cube_mesh_id(mut self) -> Int:
+        """The renderer id of the unit cube used for spawned boxes, registered on first use.
+        Mesh 0 is the reference grid once the showcase meshes are uploaded, so boxes must not
+        default to it (a "Cube" used to render as a flat 36 m grid, or as nothing on Tier 0)."""
+        if self.gpu_materials.cube_mesh_id >= 0:
+            return self.gpu_materials.cube_mesh_id
+        var rend_opt = self.app.resources.get_ptr_mut[ScalableRenderer]()
+        if not rend_opt:
+            return 0
+        ref renderer = rend_opt.value()[unsafe_offset=0]
+        # Spawned boxes always carry a MaterialOverride, so the mesh's own material is only a
+        # fallback: reuse material 0 when there is one, never allocate another slot.
+        var mat_id = 0 if len(renderer.materials) > 0 else -1  # -1: renderer default material
+        var mid = renderer.register_mesh(build_studio_unit_cube_mesh(), mat_id, build_lods=False)
+        if mid < 0:
+            return 0
+        self.gpu_materials.cube_mesh_id = mid
+        return mid
+
     def spawn_entity(
         mut self,
         name: String,
@@ -6357,16 +8104,18 @@ struct FlintStudioState(Movable):
         base_color: Vec3 = Vec3(0.82, 0.84, 0.88),
         roughness: Float32 = 0.38,
         metallic: Float32 = 0.10,
-        mesh_id: Int = 0,
+        mesh_id: Int = STUDIO_MESH_DEFAULT_CUBE,
         parent_id: Int = -1,
         record_undo: Bool = True,
     ) -> Int:
+        var resolved_mesh = self.default_cube_mesh_id() if mesh_id == STUDIO_MESH_DEFAULT_CUBE else mesh_id
         var before_blob = self._capture_world_blob() if record_undo else List[UInt8]()
         var prev_ids = self.selected_entity_ids.copy()
         var prev_primary = self.selected_entity_id
         var prev_anchor = self.selection_anchor_id
 
         var e = self.app.world.spawn_empty()
+        self.bump_scene_version()
         var eid = Int(e.index)
         var safe_pos = Vec3(
             position.x if isfinite(position.x) else Float32(0.0),
@@ -6388,7 +8137,7 @@ struct FlintStudioState(Movable):
         _ = self.app.world.insert[LocalTransform](e, lt)
         _ = self.app.world.insert[GlobalTransform](e, gt.copy())
         _ = self.app.world.insert[PrevGlobalTransform](e, PrevGlobalTransform(gt^))
-        _ = self.app.world.insert[MeshRendererComponent](e, MeshRendererComponent(mesh_id, -1, True, True))
+        _ = self.app.world.insert[MeshRendererComponent](e, MeshRendererComponent(resolved_mesh, -1, True, True))
         var safe_r = roughness if isfinite(roughness) else Float32(0.38)
         var safe_m = metallic if isfinite(metallic) else Float32(0.10)
         var clamp_r = max(Float32(0.04), min(Float32(1.0), safe_r))
@@ -6430,132 +8179,86 @@ struct FlintStudioState(Movable):
             )
         return eid
 
+    def _subtree_slots(self, root_id: Int) -> List[Int]:
+        """`root_id` and all its live descendants, parents before children."""
+        var out = List[Int]()
+        if not self.is_alive_id(root_id):
+            return out^
+        out.append(root_id)
+        var k = 0
+        while k < len(out) and len(out) <= len(self.app.world.entities):
+            var ch = self.children_of(out[k])
+            for ci in range(len(ch)):
+                if self.is_alive_id(ch[ci]) and ch[ci] not in out:
+                    out.append(ch[ci])
+            k += 1
+        return out^
+
+    def _subtree_roots(self, ids: List[Int]) -> List[Int]:
+        """The entries of `ids` none of whose ancestors are also in `ids` (each duplicates its own subtree,
+        so a selected child of a selected parent is copied once, with its parent)."""
+        var out = List[Int]()
+        for i in range(len(ids)):
+            var id = ids[i]
+            if not self.is_alive_id(id) or id in out:
+                continue
+            var covered = False
+            var p = self.parent_of(id)
+            var guard = 0
+            while p >= 0 and guard <= len(self.app.world.entities):
+                if p in ids:
+                    covered = True
+                    break
+                p = self.parent_of(p)
+                guard += 1
+            if not covered:
+                out.append(id)
+        return out^
+
     def _duplicate_entity_raw(mut self, src_id: Int) -> Int:
-        var src_e = self.resolve_entity(src_id)
-        if not src_e.valid():
+        """Duplicates `src_id` and its whole subtree with every registered component (the registry's
+        binary codecs, so new component types need no change here) plus unknown components. Parent
+        links and entity references inside the subtree point at the copies; runtime handles (physics
+        bodies, trigger ids, BVH slots, playing sounds, editor ids) are reset. Returns the copy's slot."""
+        var slots = self._subtree_slots(src_id)
+        if len(slots) == 0:
             return -1
-        var lt = self.app.world.get[LocalTransform](src_e) if self.app.world.has[LocalTransform](src_e) else LocalTransform()
-        lt.translation = lt.translation + Vec3(Float32(0.5), Float32(0.0), Float32(0.0))
-        var has_mr = self.app.world.has[MeshRendererComponent](src_e)
-        var mr = MeshRendererComponent()
-        if has_mr:
-            var mr_p = self.app.world.get_ptr[MeshRendererComponent](src_e)
-            if mr_p:
-                mr = mr_p.value()[].copy()
-        var has_mo = self.app.world.has[MaterialOverrideComponent](src_e)
-        var mo = MaterialOverrideComponent()
-        if has_mo:
-            var mo_p = self.app.world.get_ptr[MaterialOverrideComponent](src_e)
-            if mo_p:
-                mo = mo_p.value()[].copy()
-        var meta = StudioEntityMetaComponent()
-        var meta_opt = self.app.world.get_ptr[StudioEntityMetaComponent](src_e)
-        if meta_opt:
-            ref m = meta_opt.value()[unsafe_offset=0]
-            meta = StudioEntityMetaComponent(
-                m.name + "_Copy",
-                m.locked,
-                m.mesh_handle_packed,
-                m.material_handle_packed,
-                m.collider_kind,
-                m.collider_half_extents,
-                m.restitution,
-                m.friction,
-                -1,
-                m.enabled,
+        var srcs = List[Entity](capacity=len(slots))
+        for i in range(len(slots)):
+            srcs.append(self.resolve_entity(slots[i]))
+        var copies = duplicate_entities(self.app.world, self.registry, srcs)
+        if len(copies) != len(srcs):
+            self.push_toast("Duplicate failed: a component could not be copied", 2, 3.5)
+            return -1
+        for k in range(len(copies)):
+            var ce = copies[k]
+            _ = self.app.world.remove[StudioEditorIdComponent](ce)  # a fresh id below, never the source's
+            var meta_opt = self.app.world.get_ptr_mut[StudioEntityMetaComponent](ce)
+            if meta_opt:
+                meta_opt.value()[unsafe_offset=0].bvh_slot = -1
+                if k == 0:
+                    meta_opt.value()[unsafe_offset=0].name = meta_opt.value()[unsafe_offset=0].name + "_Copy"
+            var col_opt = self.app.world.get_ptr_mut[ColliderComponent](ce)
+            if col_opt:
+                col_opt.value()[unsafe_offset=0].trigger_id = -1
+            var rb_opt = self.app.world.get_ptr_mut[RigidBodyComponent](ce)
+            if rb_opt:
+                rb_opt.value()[unsafe_offset=0].body_id = -1
+            var ae_opt = self.app.world.get_ptr_mut[AudioEmitterComponent](ce)
+            if ae_opt:
+                ae_opt.value()[unsafe_offset=0].handle = SoundHandle()
+        var root = copies[0]
+        var lt_opt = self.app.world.get_ptr_mut[LocalTransform](root)
+        if lt_opt:
+            lt_opt.value()[unsafe_offset=0].translation = (
+                lt_opt.value()[unsafe_offset=0].translation + Vec3(Float32(0.5), Float32(0.0), Float32(0.0))
             )
-        var style = self.app.world.get[StudioStyleComponent](src_e) if self.app.world.has[StudioStyleComponent](src_e) else StudioStyleComponent()
-        var par_id = self.parent_of(src_id)
-
-        var new_e = self.app.world.spawn_empty()
-        var new_id = Int(new_e.index)
-        var gt = GlobalTransform.from_local(lt)
-        _ = self.app.world.insert[LocalTransform](new_e, lt)
-        _ = self.app.world.insert[GlobalTransform](new_e, gt.copy())
-        _ = self.app.world.insert[PrevGlobalTransform](new_e, PrevGlobalTransform(gt^))
-        if has_mr:
-            _ = self.app.world.insert[MeshRendererComponent](new_e, mr^)
-        if has_mo:
-            _ = self.app.world.insert[MaterialOverrideComponent](new_e, mo^)
-        _ = self.app.world.insert[StudioEntityMetaComponent](new_e, meta^)
-        _ = self.app.world.insert[StudioStyleComponent](new_e, style)
-
-        var pl_opt = self.app.world.get_ptr[PointLightComponent](src_e)
-        if pl_opt:
-            _ = self.app.world.insert[PointLightComponent](new_e, pl_opt.value()[unsafe_offset=0])
-        var sl_opt = self.app.world.get_ptr[SpotLightComponent](src_e)
-        if sl_opt:
-            _ = self.app.world.insert[SpotLightComponent](new_e, sl_opt.value()[unsafe_offset=0])
-        var cam_opt = self.app.world.get_ptr[CameraComponent](src_e)
-        if cam_opt:
-            _ = self.app.world.insert[CameraComponent](new_e, cam_opt.value()[unsafe_offset=0])
-        var ae_opt = self.app.world.get_ptr[AudioEmitterComponent](src_e)
-        if ae_opt:
-            var ae_copy = ae_opt.value()[unsafe_offset=0].copy()
-            ae_copy.handle = SoundHandle()
-            _ = self.app.world.insert[AudioEmitterComponent](new_e, ae_copy^)
-        var rig_opt = self.app.world.get_ptr[RigComponent](src_e)
-        if rig_opt:
-            _ = self.app.world.insert[RigComponent](new_e, rig_opt.value()[unsafe_offset=0].copy())
-        var sk_opt = self.app.world.get_ptr[SkeletonComponent](src_e)
-        if sk_opt:
-            _ = self.app.world.insert[SkeletonComponent](new_e, sk_opt.value()[unsafe_offset=0].copy())
-        var ac_opt = self.app.world.get_ptr[AnimatorComponent](src_e)
-        if ac_opt:
-            _ = self.app.world.insert[AnimatorComponent](new_e, ac_opt.value()[unsafe_offset=0].copy())
-        var bs_opt = self.app.world.get_ptr[BoneSocketComponent](src_e)
-        if bs_opt:
-            _ = self.app.world.insert[BoneSocketComponent](new_e, bs_opt.value()[unsafe_offset=0].copy())
-        var pf_opt = self.app.world.get_ptr[PrefabInstanceComponent](src_e)
-        if pf_opt:
-            _ = self.app.world.insert[PrefabInstanceComponent](new_e, pf_opt.value()[unsafe_offset=0].copy())
-        var bt_opt = self.app.world.get_ptr[BehaviorTreeComponent](src_e)
-        if bt_opt:
-            _ = self.app.world.insert[BehaviorTreeComponent](new_e, bt_opt.value()[unsafe_offset=0].copy())
-        var unk_opt = self.app.world.get_ptr[UnknownComponentsComponent](src_e)
-        if unk_opt:
-            _ = self.app.world.insert[UnknownComponentsComponent](new_e, unk_opt.value()[unsafe_offset=0].copy())
-
-        for ci in range(len(self.registry.entries)):
-            if not self.registry.entries[ci].is_pod:
-                continue
-            var sidx = self.registry.entries[ci].pod_schema_idx
-            if sidx < 0 or sidx >= len(self.registry.pod_schemas):
-                continue
-            var bsz = self.registry.pod_schemas[sidx].byte_size
-            var chash = self.registry.entries[ci].component_hash
-            var tid = self.app.world.find_component_by_hash(chash)
-            if tid < 0 or not self.app.world.has_by_type_id(src_e, tid):
-                continue
-            var sptr = self.app.world.get_raw_ptr(src_e, tid)
-            var pod_buf = List[UInt8](length=max(0, bsz), fill=0)
-            if bsz > 0 and sptr != 0:
-                var sp = Pointer[UInt8, ImmutAnyOrigin](unsafe_from_address=sptr)
-                for bi in range(bsz):
-                    pod_buf[bi] = sp[unsafe_offset=bi]
-            _ = self.app.world.insert_raw_pod_bytes(new_e, tid, Span(pod_buf))
-
-        var col_opt = self.app.world.get_ptr[ColliderComponent](src_e)
-        if col_opt:
-            ref sc = col_opt.value()[unsafe_offset=0]
-            var nc = ColliderComponent(
-                sc.shape, sc.radius, sc.half_height, sc.half_extents, sc.local_offset, sc.local_rot, sc.is_trigger, sc.filter, -1
-            )
-            nc.points = sc.points.copy()
-            _ = self.app.world.insert[ColliderComponent](new_e, nc^)
-
-        var rb_opt = self.app.world.get_ptr[RigidBodyComponent](src_e)
-        if rb_opt:
-            var nrb = rb_opt.value()[unsafe_offset=0]
-            nrb.body_id = -1
-            _ = self.app.world.insert[RigidBodyComponent](new_e, nrb)
-
-        if par_id >= 0:
-            var pe = self.resolve_entity(par_id)
-            if pe.valid():
-                _ = set_parent(self.app.world, new_e, pe)
-
-        return new_id
+        else:
+            var lt = LocalTransform()
+            lt.translation = Vec3(Float32(0.5), Float32(0.0), Float32(0.0))
+            _ = self.app.world.insert[LocalTransform](root, lt)
+        self._ensure_editor_ids()
+        return Int(root.index)
 
     def duplicate_entity(mut self, entity_id: Int, record_undo: Bool = True) -> Int:
         """Duplicates an existing live entity as a single Undo/Redo transaction."""
@@ -6584,10 +8287,9 @@ struct FlintStudioState(Movable):
     def duplicate_selected(mut self, record_undo: Bool = True) -> List[Int]:
         """Duplicates all currently selected entities in a single atomic transaction."""
         self._normalize_selection_from_primary()
-        var srcs = List[Int]()
-        for i in range(len(self.selected_entity_ids)):
-            if self.is_alive_id(self.selected_entity_ids[i]):
-                srcs.append(self.selected_entity_ids[i])
+        if self._time_travel_blocks_edit():
+            return List[Int]()
+        var srcs = self._subtree_roots(self.selected_entity_ids)
         var created = List[Int]()
         if len(srcs) == 0:
             return created^
@@ -6628,14 +8330,19 @@ struct FlintStudioState(Movable):
         var e = self.resolve_entity(entity_id)
         if not e.valid():
             return False
-        # Detach live children and parent BEFORE World.despawn(e) so no dangling Children/Parent links remain!
+        # Detach live children and parent BEFORE World.despawn(e) so no dangling Children/Parent links remain.
+        # Children move up to the deleted entity's parent and keep their world transform (they used to
+        # snap to their parent-relative LocalTransform interpreted as world space).
+        var grand_parent = self.parent_of(entity_id)
         var ch = self.children_of(entity_id)
         for ci in range(len(ch)):
             var ce = self.resolve_entity(ch[ci])
             if ce.valid():
-                _ = clear_parent(self.app.world, ce)
+                if not self._reparent_entity_raw(ch[ci], grand_parent, True):
+                    _ = clear_parent(self.app.world, ce)
         _ = clear_parent(self.app.world, e)
         _ = self.app.world.despawn(e)
+        self.bump_scene_version()
         self.gpu_materials.invalidate_entity(entity_id)
         return True
 
@@ -6751,6 +8458,7 @@ struct FlintStudioState(Movable):
         else:
             var parent_e = self.resolve_entity(new_parent_id)
             ok = set_parent(self.app.world, child_e, parent_e)
+        self.bump_scene_version()
         if not ok:
             return False
 
@@ -6872,6 +8580,7 @@ struct FlintStudioState(Movable):
         var e = self.resolve_entity(entity_id)
         if not e.valid():
             return False
+        self.bump_scene_version()  # name / parent / visible / enabled / locked may all change here
 
         var cur_par = self.parent_of(entity_id)
         if updated.parent_id != cur_par:
@@ -6902,20 +8611,17 @@ struct FlintStudioState(Movable):
             updated.scale.y if isfinite(updated.scale.y) else Float32(1.0),
             updated.scale.z if isfinite(updated.scale.z) else Float32(1.0),
         )
-        var prev_vis = self.entities[entity_id].visible if (entity_id >= 0 and entity_id < len(self.entities)) else True
-        var prev_en = self.entities[entity_id].enabled if (entity_id >= 0 and entity_id < len(self.entities)) else True
         var prev_trig = self.entities[entity_id].is_trigger if (entity_id >= 0 and entity_id < len(self.entities)) else False
+        # `enabled` (gameplay/colliders, on the meta component) and `visible` (editor visibility) are
+        # independent; the mesh only draws when the entity is both.
         var eff_en = updated.enabled
-        if updated.enabled != prev_en:
-            eff_en = updated.enabled
-        elif updated.visible != prev_vis:
-            eff_en = updated.visible
+        var eff_vis = updated.visible and updated.enabled
 
         _ = self.app.world.insert[LocalTransform](
             e, LocalTransform(safe_tr, safe_rot, safe_scl)
         )
         if self.app.world.has[MeshRendererComponent](e) or updated.mesh_id >= 0:
-            var new_mr = MeshRendererComponent(updated.mesh_id, updated.material_id, True, eff_en)
+            var new_mr = MeshRendererComponent(updated.mesh_id, updated.material_id, True, eff_vis)
             var old_mr = self.app.world.get_ptr[MeshRendererComponent](e)
             if old_mr:
                 new_mr.mesh_ref = old_mr.value()[].mesh_ref.copy()
@@ -6977,6 +8683,7 @@ struct FlintStudioState(Movable):
                 updated.friction,
                 bvh_s,
                 eff_en,
+                updated.visible,
             ),
         )
 
@@ -7192,7 +8899,7 @@ struct FlintStudioState(Movable):
         var out = List[UInt8](capacity=len(sb))
         for i in range(len(sb)):
             out.append(sb[i])
-        var ok = write_bytes(target, out)
+        var ok = write_file_durable(target, out)
         if ok:
             self.push_toast("Saved InputMap", 0, 2.0)
         else:
@@ -7211,6 +8918,10 @@ struct FlintStudioState(Movable):
         var json_text = String(unsafe_from_utf8=raw)
         var ok = self.input_map.load_json(json_text)
         if ok:
+            # Files saved before `strict_modifiers` existed load as lenient; the editor layer is always strict.
+            for ci in range(len(self.input_map.contexts)):
+                if self.input_map.contexts[ci].name == "StudioEditor":
+                    self.input_map.contexts[ci].strict_modifiers = True
             self.cancel_input_rebind()
             self.push_toast("Loaded InputMap", 0, 2.0)
         else:
@@ -7252,14 +8963,324 @@ struct FlintStudioState(Movable):
                 return False
         return self.commit_node_edit(entity_id, v^, "Patch " + field_name, coalesce_key)
 
+    # ---- Viewport gizmo drag controller (host feeds mouse in physical pixels) ----
+
+    def gizmo_pick(self, mx: Float32, my: Float32) -> Int:
+        """The gizmo handle under the mouse, using this frame's `viewport_xf`."""
+        var piv = self.selection_gizmo_pivot()
+        if not piv[0] or self.pie.mode != PIE_STOPPED or self.gizmo_mode == GIZMO_MODE_SELECT:
+            return GIZMO_AXIS_NONE
+        var vx = self.viewport_xf
+        var s = vx.ui_scale
+        return pick_gizmo_handle(
+            mx, my, piv[1], self.gizmo_mode, Float32(0.0), Float32(0.0), vx.proj_phys_w(), vx.proj_phys_h(),
+            self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg,
+            target_px=GIZMO_TARGET_PX * s, gizmo_rot=self.selection_gizmo_rotation(), px_scale=s,
+        )
+
+    def gizmo_try_begin(mut self, mx: Float32, my: Float32) -> Bool:
+        """Starts a gizmo drag if the press hit a handle. The drag is one undo step (coalesced) and can be
+        cancelled with `gizmo_drag_cancel`, which puts every selected object back where it started."""
+        var h = self.gizmo_pick(mx, my)
+        if h == GIZMO_AXIS_NONE:
+            return False
+        var piv = self.selection_gizmo_pivot()
+        self.gz_dragging = True
+        self.gz_handle = h
+        self.gz_mode = self.gizmo_mode
+        self.gz_seq_counter += 1
+        self.gz_seq = GIZMO_DRAG_SEQ_TAG | self.gz_seq_counter
+        self.gz_start_ray = self.viewport_xf.ray_phys(mx, my, self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg)
+        self.gz_prev_ray = self.gz_start_ray
+        self.gz_start_pivot = piv[1]
+        self.gz_rot = self.selection_gizmo_rotation()
+        self.gz_snaps = self.capture_selected_transforms()
+        self.gz_angle = Float32(0.0)
+        self.gz_start_mx = mx
+        self.gz_start_my = my
+        self.gz_last_delta = Vec3()
+        self.gz_last_sf = Vec3(1.0, 1.0, 1.0)
+        self.gz_applied = False
+        self.active_gizmo_handle = h
+        # The drag's first update would clear redo; park it so a cancelled drag can give it back.
+        self.gz_saved_redo.clear()
+        swap(self.gz_saved_redo, self.redo_stack)
+        return True
+
+    def gizmo_drag_update(mut self, mx: Float32, my: Float32) -> Bool:
+        if not self.gz_dragging or len(self.gz_snaps) == 0:
+            return False
+        if self.gizmo_mode != self.gz_mode or self.pie.mode != PIE_STOPPED:
+            # Switching W/E/R (or entering Play) mid-drag abandons the drag instead of mixing modes.
+            self.gizmo_drag_cancel()
+            return False
+        if not self.gz_applied and mx == self.gz_start_mx and my == self.gz_start_my:
+            return False  # a press without motion changes nothing: no undo entry, no dirty flag
+        var snaps = self.gz_snaps.copy()
+        var vx = self.viewport_xf
+        var cur = vx.ray_phys(mx, my, self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg)
+        var piv = self.gz_start_pivot
+        var rot = self.gz_rot
+        var h = self.gz_handle
+        var wscale = gizmo_world_scale(piv, self.cam_pos, self.cam_fwd, self.fov_y_deg, Int(vx.proj_phys_h()), GIZMO_TARGET_PX * vx.ui_scale)
+        var lim = gizmo_drag_param_limit(wscale)
+        if self.gz_mode == GIZMO_MODE_TRANSLATE:
+            # A frame whose ray misses the axis / plane (parallel, or behind the camera) keeps the last
+            # valid delta instead of snapping the selection back to its start pose.
+            var delta_p = self.gz_last_delta
+            if h == GIZMO_AXIS_X or h == GIZMO_AXIS_Y or h == GIZMO_AXIS_Z:
+                var ax = rot.rotate(Vec3(1, 0, 0) if h == GIZMO_AXIS_X else (Vec3(0, 1, 0) if h == GIZMO_AXIS_Y else Vec3(0, 0, 1)))
+                var t0 = ray_axis_closest_param(self.gz_start_ray, piv, ax)
+                var t1 = ray_axis_closest_param(cur, piv, ax)
+                if t0[0] and t1[0]:
+                    delta_p = ax * (clamp_gizmo_param(t1[1], lim) - clamp_gizmo_param(t0[1], lim))
+            elif h == GIZMO_PLANE_XY or h == GIZMO_PLANE_XZ or h == GIZMO_PLANE_YZ:
+                var pn = rot.rotate(Vec3(0, 0, 1) if h == GIZMO_PLANE_XY else (Vec3(0, 1, 0) if h == GIZMO_PLANE_XZ else Vec3(1, 0, 0)))
+                var p0 = ray_plane_hit(self.gz_start_ray, piv, pn)
+                var p1 = ray_plane_hit(cur, piv, pn)
+                if p0[0] and p1[0]:
+                    var o0 = p0[1] - piv
+                    var o1 = p1[1] - piv
+                    var l0 = o0.length()
+                    var l1 = o1.length()
+                    if l0 > lim:
+                        o0 = o0 * (lim / l0)
+                    if l1 > lim:
+                        o1 = o1 * (lim / l1)
+                    delta_p = o1 - o0
+            self.gz_last_delta = delta_p
+            if self.snap_enabled:
+                delta_p = snap_constrained_delta(piv, delta_p, h, self.grid_snap_m, rot)
+            if not self.gz_applied and delta_p.length_squared() == Float32(0.0):
+                return False
+            self.gz_applied = True
+            return self.apply_gizmo_drag_selected(
+                snaps, piv, delta_p, Quat.identity(), Vec3(1.0, 1.0, 1.0), GIZMO_MODE_TRANSLATE,
+                coalesce_key=self.gz_seq, gizmo_rot=rot,
+            )
+        if self.gz_mode == GIZMO_MODE_ROTATE:
+            var rax: Vec3
+            if h == GIZMO_AXIS_VIEW:
+                rax = self.cam_fwd * Float32(-1.0)
+            else:
+                rax = rot.rotate(Vec3(1, 0, 0) if h == GIZMO_AXIS_X else (Vec3(0, 1, 0) if h == GIZMO_AXIS_Y else Vec3(0, 0, 1)))
+            # Accumulate frame-to-frame deltas: a single start-to-current angle wraps at +-180 degrees.
+            self.gz_angle += gizmo_rotation_delta_rad(self.gz_prev_ray, cur, piv, rax, self.cam_fwd, wscale)
+            self.gz_prev_ray = cur
+            var drad = self.gz_angle
+            if self.snap_enabled:
+                drad = snap_angle_deg(drad, self.angle_snap_deg)
+            if not self.gz_applied and drad == Float32(0.0):
+                return False
+            self.gz_applied = True
+            var hs = sin(drad * Float32(0.5))
+            var dq = Quat(rax.x * hs, rax.y * hs, rax.z * hs, cos(drad * Float32(0.5)))
+            return self.apply_gizmo_drag_selected(
+                snaps, piv, Vec3(), dq, Vec3(1.0, 1.0, 1.0), GIZMO_MODE_ROTATE,
+                coalesce_key=self.gz_seq, gizmo_rot=rot,
+            )
+        # Scale
+        var sf = self.gz_last_sf
+        if h == GIZMO_SCALE_UNIFORM:
+            var c = project_world_to_viewport(
+                piv, Float32(0.0), Float32(0.0), vx.proj_phys_w(), vx.proj_phys_h(),
+                self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg,
+            )
+            if c[3]:
+                var f = gizmo_uniform_scale_screen(self.gz_start_mx, self.gz_start_my, mx, my, c[0], c[1])
+                sf = Vec3(f, f, f)
+        else:
+            var sax = rot.rotate(Vec3(1, 0, 0) if h == GIZMO_AXIS_X else (Vec3(0, 1, 0) if h == GIZMO_AXIS_Y else Vec3(0, 0, 1)))
+            var v0 = ray_axis_closest_param(self.gz_start_ray, piv, sax)
+            var v1 = ray_axis_closest_param(cur, piv, sax)
+            if v0[0] and v1[0]:
+                sf = gizmo_scale_drag(
+                    self.gz_start_ray, cur, piv, h, wscale, self.cam_fwd, self.cam_right, Vec3(1.0, 1.0, 1.0),
+                    gizmo_rot=rot, max_param=lim,
+                )
+        self.gz_last_sf = sf
+        if not self.gz_applied and sf.x == Float32(1.0) and sf.y == Float32(1.0) and sf.z == Float32(1.0):
+            return False
+        self.gz_applied = True
+        # Snap the resulting local scale (not the drag factor), so a 1.3-scale object snaps to the grid.
+        var ssnap = self.scale_snap if self.snap_enabled else Float32(0.0)
+        return self.apply_gizmo_drag_selected(
+            snaps, piv, Vec3(), Quat.identity(), sf, GIZMO_MODE_SCALE, coalesce_key=self.gz_seq, gizmo_rot=rot,
+            scale_snap=ssnap,
+        )
+
+    def gizmo_drag_cancel(mut self):
+        """Esc / right-click / mode switch during a drag: everything goes back to where it was and the
+        drag leaves no undo entry behind."""
+        if not self.gz_dragging:
+            return
+        var restored = False
+        var had_tx = False
+        if len(self.undo_stack) > 0 and len(self.redo_stack) == 0:
+            ref top = self.undo_stack[len(self.undo_stack) - 1]
+            if top.coalesce_key == self.gz_seq and top.op == TX_BATCH_EDIT:
+                had_tx = True
+                var tx = self.undo_stack.pop()
+                restored = self._restore_world_blob(tx.before_world_blob, tx.external_mat_reload_epochs)
+                if not restored:
+                    self.undo_stack.append(tx^)
+                else:
+                    self._restore_selection(tx.prev_selected_ids, tx.prev_selected_id, tx.prev_anchor_id)
+                    self._refresh_dirty_from_history()
+        if not restored and self.gz_applied and len(self.gz_snaps) > 0:
+            # Nothing coalesced (no motion yet, or Play swallowed the entry): re-apply the start pose.
+            var start_snaps = self.gz_snaps.copy()
+            var start_piv = self.gz_start_pivot
+            _ = self.apply_gizmo_drag_selected(
+                start_snaps, start_piv, Vec3(), Quat.identity(), Vec3(1.0, 1.0, 1.0), GIZMO_MODE_TRANSLATE,
+                coalesce_key=self.gz_seq,
+            )
+            if (
+                not had_tx
+                and len(self.undo_stack) > 0
+                and self.undo_stack[len(self.undo_stack) - 1].coalesce_key == self.gz_seq
+            ):
+                _ = self.undo_stack.pop()  # the start pose re-applied is no edit: leave no entry
+                self._refresh_dirty_from_history()
+        if restored or not had_tx:
+            # The drag left no entry behind: the redo history it parked is valid again.
+            swap(self.gz_saved_redo, self.redo_stack)
+        self.gz_saved_redo.clear()
+        self._end_gizmo_drag_state()
+
+    def gizmo_drag_end(mut self):
+        if self.gz_dragging and len(self.redo_stack) == 0:
+            var moved = (
+                len(self.undo_stack) > 0
+                and self.undo_stack[len(self.undo_stack) - 1].coalesce_key == self.gz_seq
+            )
+            if not moved:
+                swap(self.gz_saved_redo, self.redo_stack)  # a click without motion keeps redo
+        self.gz_saved_redo.clear()
+        self._end_gizmo_drag_state()
+
+    def _end_gizmo_drag_state(mut self):
+        self.gz_dragging = False
+        self.gz_handle = GIZMO_AXIS_NONE
+        self.gz_snaps.clear()
+        self.gz_applied = False
+        self.active_gizmo_handle = GIZMO_AXIS_NONE
+
+    # ---- Marquee selection, nudging and framing ----
+
+    def entities_in_screen_rect(self, x0: Float32, y0: Float32, x1: Float32, y1: Float32) -> List[Int]:
+        """Entities whose origin projects inside the rect (physical pixels) and inside the viewport panel."""
+        var out = List[Int]()
+        var vx = self.viewport_xf
+        var pnl = vx.panel_phys()
+        var lx = max(min(x0, x1), pnl.x)
+        var hx = min(max(x0, x1), pnl.x + pnl.w)
+        var ly = max(min(y0, y1), pnl.y)
+        var hy = min(max(y0, y1), pnl.y + pnl.h)
+        if hx <= lx or hy <= ly:
+            return out^
+        for i in range(len(self.entities)):
+            if not self.is_alive_id(i) or self.entities[i].locked or not self.entities[i].visible:
+                continue  # locked and hidden entities cannot be marquee-selected
+            var p = self.entities[i].translation
+            var gt = self.app.world.get_ptr[GlobalTransform](self.resolve_entity(i))
+            if gt:
+                p = gt.value()[unsafe_offset=0].translation
+            var sp = project_world_to_viewport(
+                p, Float32(0.0), Float32(0.0), vx.proj_phys_w(), vx.proj_phys_h(),
+                self.cam_pos, self.cam_fwd, self.cam_right, self.cam_up, self.fov_y_deg,
+            )
+            if sp[3] and sp[0] >= lx and sp[0] <= hx and sp[1] >= ly and sp[1] <= hy:
+                out.append(i)
+        return out^
+
+    def marquee_select(
+        mut self, x0: Float32, y0: Float32, x1: Float32, y1: Float32, additive: Bool, toggle: Bool = False
+    ) -> Int:
+        """Box select. Plain replaces the selection, `additive` (Shift) adds every hit, `toggle` (Ctrl)
+        flips each hit in or out."""
+        var hits = self.entities_in_screen_rect(x0, y0, x1, y1)
+        if not additive and not toggle:
+            self.clear_selection()
+        for k in range(len(hits)):
+            self.select_entity(hits[k], multi_select=True, add_only=not toggle)
+        return len(hits)
+
+    def click_select(mut self, entity_id: Int, hit: Bool, additive: Bool, toggle: Bool):
+        """Viewport click: plain replaces (or clears on a miss), Shift (`additive`) adds, Ctrl (`toggle`)
+        flips the clicked entity. A modified click on empty space keeps the selection."""
+        if hit and self.is_alive_id(entity_id):
+            self.select_entity(entity_id, multi_select=additive or toggle, add_only=additive and not toggle)
+        elif not (additive or toggle):
+            self.clear_selection()
+
+    def arrows_drive_nudge(self) -> Bool:
+        """The arrow keys have one owner: they nudge the selection while the pointer is over the viewport
+        and something is selected, and orbit the camera otherwise."""
+        return (
+            self.viewport_hovered
+            and self.selected_count() > 0
+            and not self.gz_dragging
+            and self.pie.mode == PIE_STOPPED
+            and not self.wants_keyboard()
+        )
+
+    def nudge_selection(mut self, dir_x: Int, dir_y: Int, dir_z: Int) -> Bool:
+        """Arrow-key nudge by one grid step. X/Z follow the camera's heading (snapped to the nearest
+        world axis) so "left" on screen moves left; PageUp/PageDown move along world Y."""
+        var snaps = self.capture_selected_transforms()
+        if len(snaps) == 0:
+            return False
+        var step = self.grid_snap_m if self.grid_snap_m > Float32(1.0e-4) else Float32(0.25)
+        var right = Vec3(self.cam_right.x, 0.0, self.cam_right.z)
+        var fwd = Vec3(self.cam_fwd.x, 0.0, self.cam_fwd.z)
+        var one = Float32(1.0)
+        var zero = Float32(0.0)
+        var r_ax = Vec3(one if right.x >= zero else -one, zero, zero) if abs(right.x) >= abs(right.z) else Vec3(zero, zero, one if right.z >= zero else -one)
+        var f_ax = Vec3(one if fwd.x >= zero else -one, zero, zero) if abs(fwd.x) > abs(fwd.z) else Vec3(zero, zero, one if fwd.z >= zero else -one)
+        var d = (r_ax * Float32(dir_x) + Vec3(0.0, Float32(dir_y), 0.0) + f_ax * Float32(dir_z)) * step
+        var piv = self.selection_gizmo_pivot()
+        return self.apply_gizmo_drag_selected(snaps, piv[1], d, Quat.identity(), Vec3(1.0, 1.0, 1.0), GIZMO_MODE_TRANSLATE)
+
+    def selection_bounds(self) -> Tuple[Bool, Vec3, Vec3]:
+        """World AABB of the selection from each entity's position and scaled collider extents."""
+        var lo = Vec3(Float32(1.0e30), Float32(1.0e30), Float32(1.0e30))
+        var hi = Vec3(Float32(-1.0e30), Float32(-1.0e30), Float32(-1.0e30))
+        var any = False
+        var ids = self.selected_entity_ids.copy()
+        if len(ids) == 0 and self.is_alive_id(self.selected_entity_id):
+            ids.append(self.selected_entity_id)
+        for k in range(len(ids)):
+            var i = ids[k]
+            if not self.is_alive_id(i):
+                continue
+            var p = self.entities[i].translation
+            var gt = self.app.world.get_ptr[GlobalTransform](self.resolve_entity(i))
+            if gt:
+                p = gt.value()[unsafe_offset=0].translation
+            var he = self.entities[i].collider_half_extents
+            var sc = self.entities[i].scale
+            var ext = Vec3(abs(he.x * sc.x), abs(he.y * sc.y), abs(he.z * sc.z))
+            var r = max(Float32(0.25), max(ext.x, max(ext.y, ext.z)))
+            lo = Vec3(min(lo.x, p.x - r), min(lo.y, p.y - r), min(lo.z, p.z - r))
+            hi = Vec3(max(hi.x, p.x + r), max(hi.y, p.y + r), max(hi.z, p.z + r))
+            any = True
+        return (any, lo, hi)
+
+    def toggle_ortho_camera(mut self):
+        """The renderer has no orthographic path yet: say so instead of flipping a flag that changes
+        nothing on screen."""
+        self.cam_ortho = False
+        self.push_toast("Orthographic view is not supported by the renderer yet", 1, 3.0)
+
     def capture_selected_transforms(self) -> List[SelectedTransformSnap]:
         var top_ids = self._top_level_selected_ids()
         var snaps = List[SelectedTransformSnap](capacity=len(top_ids))
         for i in range(len(top_ids)):
             var eid = top_ids[i]
             var e = self.resolve_entity(eid)
-            if not e.valid():
-                continue
+            if not e.valid() or self.is_entity_locked(eid):
+                continue  # locked entities never move with the gizmo or nudges
             var lt = self.app.world.get[LocalTransform](e) if self.app.world.has[LocalTransform](e) else LocalTransform()
             var gt = self.app.world.get[GlobalTransform](e) if self.app.world.has[GlobalTransform](e) else GlobalTransform.from_local(lt)
             snaps.append(
@@ -7285,9 +9306,14 @@ struct FlintStudioState(Movable):
         scale_factor: Vec3,
         mode: Int,
         coalesce_key: UInt64 = 0,
+        gizmo_rot: Quat = Quat.identity(),
+        scale_snap: Float32 = 0.0,
     ) -> Bool:
+        """`scale_snap > 0` snaps each scaled axis's resulting local scale to that step (sign kept)."""
         if len(snaps) == 0:
             return False
+        var g_rot = gizmo_rot.normalized() if gizmo_rot.length_squared() > Float32(1.0e-8) else Quat.identity()
+        var g_inv = g_rot.conjugate()
 
         var primary_id = self.selected_entity_id if self.selected_entity_id >= 0 else snaps[0].entity_id
         var can_coalesce = (
@@ -7333,11 +9359,19 @@ struct FlintStudioState(Movable):
                 var lx = sn.local_scl.x * sx_f
                 var ly = sn.local_scl.y * sy_f
                 var lz = sn.local_scl.z * sz_f
+                # Sign-preserving clamp: a mirrored (negative-scale) object stays mirrored.
                 target_local_scl = Vec3(
-                    max(Float32(0.01), lx) if isfinite(lx) else max(Float32(0.01), sn.local_scl.x),
-                    max(Float32(0.01), ly) if isfinite(ly) else max(Float32(0.01), sn.local_scl.y),
-                    max(Float32(0.01), lz) if isfinite(lz) else max(Float32(0.01), sn.local_scl.z),
+                    studio_signed_scale(lx, sn.local_scl.x, scale_snap if sx_f != Float32(1.0) else Float32(0.0)),
+                    studio_signed_scale(ly, sn.local_scl.y, scale_snap if sy_f != Float32(1.0) else Float32(0.0)),
+                    studio_signed_scale(lz, sn.local_scl.z, scale_snap if sz_f != Float32(1.0) else Float32(0.0)),
                 )
+                if len(snaps) > 1 and isfinite(pivot.x) and isfinite(pivot.y) and isfinite(pivot.z):
+                    # A multi-selection scales as a group: positions spread from the pivot along the
+                    # gizmo axes, instead of every object growing in place.
+                    var rel_g = g_inv.rotate(sn.world_pos - pivot)
+                    var moved = pivot + g_rot.rotate(Vec3(rel_g.x * sx_f, rel_g.y * sy_f, rel_g.z * sz_f))
+                    if isfinite(moved.x) and isfinite(moved.y) and isfinite(moved.z):
+                        target_w_pos = moved
 
             var new_lt = LocalTransform(target_w_pos, target_w_rot, target_local_scl)
             if sn.parent_id >= 0:
@@ -7553,6 +9587,8 @@ struct FlintStudioState(Movable):
     def undo(mut self) -> Bool:
         if self.pie.mode != PIE_STOPPED or len(self.undo_stack) == 0:
             return False
+        if self._time_travel_blocks_edit():
+            return False
         self._int_edit_wid = UInt64(0)
         self._int_edit_entity_id = -1
         self._int_edit_buf = ""
@@ -7561,12 +9597,17 @@ struct FlintStudioState(Movable):
             self.undo_stack.append(tx^)
             return False
         self._restore_selection(tx.prev_selected_ids, tx.prev_selected_id, tx.prev_anchor_id)
+        if tx.changes_scene_path:
+            self.scene_file_path = tx.prev_scene_path
+            self._saved_tx_id = tx.prev_saved_tx_id  # clean again only if it was clean before the load
         self.redo_stack.append(tx^)
-        self.mark_dirty(True)
+        self._refresh_dirty_from_history()
         return True
 
     def redo(mut self) -> Bool:
         if self.pie.mode != PIE_STOPPED or len(self.redo_stack) == 0:
+            return False
+        if self._time_travel_blocks_edit():
             return False
         self._int_edit_wid = UInt64(0)
         self._int_edit_entity_id = -1
@@ -7576,8 +9617,21 @@ struct FlintStudioState(Movable):
             self.redo_stack.append(tx^)
             return False
         self._restore_selection(tx.next_selected_ids, tx.next_selected_id, tx.next_anchor_id)
+        var redo_clean = tx.changes_scene_path and tx.load_leaves_clean
+        if tx.changes_scene_path:
+            self.scene_file_path = tx.next_scene_path
+        # Redo keeps the entry's original origin: whoever triggers the redo, it is still the edit of
+        # whoever made it (an agent's MCP redo must not relabel the user's work as the agent's).
+        var keep_agent = self._active_tx_agent_id
+        var keep_step = self._active_tx_step_id
+        self._active_tx_agent_id = 0
+        self._active_tx_step_id = UInt64(0)
         self._push_undo(tx^)
-        self.mark_dirty(True)
+        self._active_tx_agent_id = keep_agent
+        self._active_tx_step_id = keep_step
+        if redo_clean:
+            self._saved_tx_id = self._top_tx_id()  # re-applying a load matches the loaded file again
+        self._refresh_dirty_from_history()
         return True
 
     # ---- Deterministic `PhysicsWorld` Step, Editor Frame Render & Analytical/Physics Raycast ----
@@ -7949,6 +10003,8 @@ struct FlintStudioState(Movable):
                 ref gpu = renderer.gpu_slot[0]
                 if font_slot < 0:
                     font_slot = gpu.ui_font_atlas_slot
+                    # `emit_studio_ui_draw_list` only reads this font until `ui_ctx.font` is set, so copy the
+                    # multi-MB SdfFont (atlas, glyph/kerning tables, TTF source) once instead of every frame.
                     if not self.ui_ctx.font.valid:
                         font_copy = gpu.ui_font.copy()
 
@@ -8467,6 +10523,7 @@ struct FlintStudioState(Movable):
             return True
         self.pie_camera_ejected = False
         self._reset_pie_trigger_buffer()
+        self._ensure_editor_ids()  # the Play checkpoint carries every id, so Stop restores the same ones
         self.pie.pre_play_hash = self.state_hash()
         var srv_entry = self.app.resources.get_ptr[AssetServer]()
         self._pie_entry_hot_reloads = (
@@ -8607,17 +10664,20 @@ struct FlintStudioState(Movable):
             self.pie.mode = PIE_STOPPED
             self.pie.checkpoint_lz4.clear()
             return False
+        var play_end_hash = self.state_hash()
         var reader = unpack_checkpoint_lz4(self.pie.checkpoint_lz4)
         self.deserialize(reader)
         self.gpu_materials.clear_entity_slots()
+        if play_end_hash != self.pie.pre_play_hash:
+            self.push_toast("Stopped: changes made during Play were discarded", 0, 2.5)
         self.pie.mode = PIE_STOPPED
         self.pie.checkpoint_lz4.clear()
         self.scene.has_pie_snapshot = False
         self.scene.pie_snapshot.clear()
+        # Hash the restored world now, but raise on a mismatch only after the material-style and asset
+        # epochs are restored too: raising here used to skip them, leaving PIE-era bindings in Edit mode.
         var restored_hash = self.state_hash()
         self.pie.last_restore_verified = restored_hash == self.pie.pre_play_hash
-        if not self.pie.last_restore_verified:
-            raise Error("PIE LZ4 world restore hash mismatch")
         var style_sync_opt = self.app.resources.get_ptr_mut[StudioFlmatStyleSyncResource]()
         if style_sync_opt:
             style_sync_opt.value()[unsafe_offset=0].synced_entity_epochs = _copy_u64_style_epoch_dict(
@@ -8638,6 +10698,8 @@ struct FlintStudioState(Movable):
             self._sync_compat_view()
         self._pie_entry_hot_reloads = 0
         self._pie_entry_style_epochs.clear()
+        if not self.pie.last_restore_verified:
+            raise Error("PIE LZ4 world restore hash mismatch")
         return True
 
     def _resolve_default_gameplay_so_path(self) -> String:
@@ -8693,6 +10755,120 @@ struct FlintStudioState(Movable):
             self.push_toast("Reload .so failed: no gameplay .so configured", 2, 3.0)
             return False
         return self.load_gameplay_plugin(target)
+
+    # ---- Code Drawer: Build & Reload, diagnostic jumps ----
+
+    def _code_build_compiler(self, root: String) -> String:
+        """Same toolchain resolution as MCP `code.build_hot_reload`: `FLINT_MOJO_BIN`, then the
+        project's / engine's pixi env, then `mojo` on PATH."""
+        var compiler = env_value("FLINT_MOJO_BIN")
+        if compiler.byte_length() > 0:
+            return compiler
+        var ws_mojo = root + "/.pixi/envs/default/bin/mojo"
+        if file_size(ws_mojo) > 0:
+            return ws_mojo
+        if file_size(".pixi/envs/default/bin/mojo") > 0:
+            return String(".pixi/envs/default/bin/mojo")
+        return String("mojo")
+
+    def start_code_build(mut self) -> Bool:
+        """Build & Reload: starts the async `mojo build --emit shared-lib` of the project's
+        `src/gameplay.mojo` into `build/gameplay.so`. `poll_code_build` (every frame) feeds the
+        compiler diagnostics into the Code Drawer and hot-reloads only on success."""
+        if self.code_build_id >= 0:
+            self.push_toast("A gameplay build is already running", 1, 2.0)
+            return False
+        var root = self.project_root if self.project_root.byte_length() > 0 else String(".")
+        while root.byte_length() > 1 and root.endswith("/"):
+            var trimmed = String(root[byte=0 : root.byte_length() - 1])
+            root = trimmed^
+        var entry = root + "/src/gameplay.mojo"
+        if file_size(entry) <= 0:
+            self.code_drawer.set_build_status(BUILD_STATUS_ERROR, self.code_drawer.build_generation, 1, 0, "No gameplay.mojo")
+            self.push_toast("Build failed: " + entry + " not found", 2, 3.0)
+            return False
+        var so = root + "/build/gameplay.so"
+        _ = make_dirs(root + "/build")
+        var inc = List[String]()
+        inc.append(root + "/src")
+        if is_directory("src") and real_path("src")[1] != real_path(root + "/src")[1]:
+            inc.append("src")
+        var jid = self.code_build_jobs.start_gameplay_so_build(
+            root, entry, so, inc, compiler=self._code_build_compiler(root), opt_flag="-O1", werror=True
+        )
+        if jid < 0:
+            self.code_drawer.set_build_status(BUILD_STATUS_ERROR, self.code_drawer.build_generation, 1, 0, "Build start failed")
+            self.push_toast("Build failed: could not start mojo", 2, 3.0)
+            return False
+        self.code_build_id = jid
+        self.code_build_so = so
+        self.code_build_deadline = code_build_now() + 300.0
+        self.code_drawer.set_build_status(BUILD_STATUS_BUILDING, self.code_drawer.build_generation)
+        return True
+
+    def poll_code_build(mut self) -> Bool:
+        """Advances a running Build & Reload. Returns True on the frame the build finished."""
+        if self.code_build_id < 0:
+            return False
+        _ = self.code_build_jobs.poll_all()
+        var idx = self.code_build_jobs.find_index(self.code_build_id)
+        if idx >= 0 and self.code_build_jobs.jobs[idx].is_running():
+            if code_build_now() < self.code_build_deadline:
+                return False
+            _ = self.code_build_jobs.cancel(self.code_build_id)
+            self.code_build_id = -1
+            self.code_build_jobs = JobRunner()
+            self.code_drawer.set_build_status(BUILD_STATUS_ERROR, self.code_drawer.build_generation, 1, 0, "Build timed out")
+            self.push_toast("Gameplay build timed out", 2, 3.0)
+            return True
+        var ok = idx >= 0 and self.code_build_jobs.jobs[idx].state == JOB_SUCCEEDED
+        var diags = self.code_build_jobs.jobs[idx].diagnostics.copy() if idx >= 0 else List[CodeDiagnostic]()
+        var output = self.code_build_jobs.jobs[idx].output_text() if idx >= 0 else String("")
+        self.code_build_id = -1
+        self.code_build_jobs = JobRunner()
+        self.code_drawer.problems.replace_source(CODE_DIAG_SRC_BUILD, diags)
+        var errs = 0
+        var warns = 0
+        var first_err = String()
+        for k in range(len(diags)):
+            if diags[k].severity == CODE_DIAG_ERROR:
+                errs += 1
+                if first_err.byte_length() == 0:
+                    first_err = self._basename(diags[k].path) + ":" + String(diags[k].line) + " " + diags[k].message
+            elif diags[k].severity == CODE_DIAG_WARNING:
+                warns += 1
+        var gen = self.code_drawer.build_generation
+        if not ok:
+            self.code_drawer.set_build_status(BUILD_STATUS_ERROR, gen, max(1, errs), warns)
+            self.code_drawer.problems_open = True
+            var detail = first_err
+            if detail.byte_length() == 0:
+                detail = String(output.strip()) if output.byte_length() < 160 else String("see Problems")
+            self.push_toast("Build failed: " + detail, 2, 4.0)
+            return True
+        var so_path = self.code_build_so
+        if self.load_gameplay_plugin(so_path):
+            self.code_drawer.set_build_status(BUILD_STATUS_OK, self.hot_reload_host.reload_generation, 0, warns)
+        else:
+            self.code_drawer.set_build_status(BUILD_STATUS_ERROR, gen, 1, warns, "Reload failed")
+        return True
+
+    def open_code_location(mut self, path: String, line: Int = 1) -> Bool:
+        """Opens `path` (compiler paths are absolute and used as-is; relative paths resolve
+        against the project) in the Code Drawer at `line`, reusing an already-open tab.
+        Shows an error toast when the file cannot be read."""
+        var ti = self.code_drawer.find_tab(path)
+        if ti < 0 and not path.startswith("/"):
+            ti = self.code_drawer.find_tab(self._resolve_asset_disk_path(path))
+        if ti >= 0:
+            self.code_drawer.active_tab = ti
+            self.code_drawer.jump_to_line(line)
+            return True
+        var disk = path if path.startswith("/") else self._resolve_asset_disk_path(path)
+        if self.code_drawer.open_file(disk, line) < 0:
+            self.push_toast("Cannot open " + path + ": " + self.code_drawer.last_error, 2, 3.0)
+            return False
+        return True
 
     # ---- `PhysicsWorld` + Static BVH Scene Raycast ----
 
@@ -8752,11 +10928,7 @@ struct FlintStudioState(Movable):
                 w_rot = gt_opt.value()[unsafe_offset=0].rotation
                 w_scl = gt_opt.value()[unsafe_offset=0].scale
             var inv_q = w_rot.conjugate()
-            var inv_s = Vec3(
-                Float32(1.0) / max(Float32(1.0e-4), w_scl.x),
-                Float32(1.0) / max(Float32(1.0e-4), w_scl.y),
-                Float32(1.0) / max(Float32(1.0e-4), w_scl.z),
-            )
+            var inv_s = Vec3(studio_signed_recip(w_scl.x), studio_signed_recip(w_scl.y), studio_signed_recip(w_scl.z))
             var loc_o_raw = inv_q.rotate(origin - w_pos)
             var loc_o = Vec3(loc_o_raw.x * inv_s.x, loc_o_raw.y * inv_s.y, loc_o_raw.z * inv_s.z)
             var loc_d_raw = inv_q.rotate(dir)
@@ -8772,7 +10944,9 @@ struct FlintStudioState(Movable):
                         best.entity_id = i
                         best.distance = world_t
                         best.point = origin + dir * world_t
-                        best.normal = w_rot.rotate(bhit.normal).normalized()
+                        # Normals transform by the inverse transpose: divide by the (signed) scale.
+                        var n_l = Vec3(bhit.normal.x * inv_s.x, bhit.normal.y * inv_s.y, bhit.normal.z * inv_s.z)
+                        best.normal = w_rot.rotate(n_l).normalized()
 
         if self.has_ground_plane and abs(dir.y) > Float32(1.0e-6):
             var tg = (self.ground_plane_y - origin.y) / dir.y
@@ -8853,6 +11027,33 @@ def _make_beveled_unit_box_mesh() -> NativeMesh:
         var i3 = mb.add_vertex(c - u * Float32(0.5) + v * Float32(0.5), n, 0.0, 0.0)
         mb.add_tri(i0, i1, i2)
         mb.add_tri(i0, i2, i3)
+    return mb^.finish()
+
+
+def build_studio_unit_cube_mesh() -> NativeMesh:
+    """A 1 m unit cube centred on the origin (24 vertices, flat per-face normals), so an
+    entity's scale is its size and the default 0.5 m box collider matches it."""
+    var mb = MeshBuilder(base_color=0xFFFFFFFF, roughness=0.38, metallic=0.10)
+    var normals = List[Vec3]()
+    normals.append(Vec3(1.0, 0.0, 0.0))
+    normals.append(Vec3(-1.0, 0.0, 0.0))
+    normals.append(Vec3(0.0, 1.0, 0.0))
+    normals.append(Vec3(0.0, -1.0, 0.0))
+    normals.append(Vec3(0.0, 0.0, 1.0))
+    normals.append(Vec3(0.0, 0.0, -1.0))
+    for fi in range(6):
+        var n = normals[fi]
+        var u = Vec3(0.0, 0.0, 1.0) if abs(n.x) > Float32(0.5) else Vec3(1.0, 0.0, 0.0)
+        var v = n.cross(u)  # u x v == n, so (q1 - q0) x (q2 - q0) faces outward
+        var c = n * Float32(0.5)
+        var hu = u * Float32(0.5)
+        var hv = v * Float32(0.5)
+        var q0 = mb.add_vertex(c - hu - hv, n, 0.0, 0.0)
+        var q1 = mb.add_vertex(c + hu - hv, n, 1.0, 0.0)
+        var q2 = mb.add_vertex(c + hu + hv, n, 1.0, 1.0)
+        var q3 = mb.add_vertex(c - hu + hv, n, 0.0, 1.0)
+        mb.add_tri(q0, q1, q2)
+        mb.add_tri(q0, q2, q3)
     return mb^.finish()
 
 
@@ -9670,6 +11871,170 @@ def _draw_asset_dialog(mut studio: FlintStudioState):
         ui.end_modal()
     if not open:
         studio.asset_browser_state.dialog = 0
+def _scene_display_name(path: String) -> String:
+    if path.byte_length() == 0:
+        return String("Untitled")
+    var start = 0
+    for i in range(path.byte_length()):
+        if path.as_bytes()[i] == 47:
+            start = i + 1
+    return String(path[byte=start:])
+
+
+def _emit_play_banner(mut studio: FlintStudioState, vp: RectF):
+    """A strip across the top of the viewport while Play runs, so edits made now are never a surprise."""
+    if studio.pie.mode == PIE_STOPPED:
+        return
+    var th = studio.studio_theme.copy()
+    var paused = studio.pie.mode == PIE_PAUSED
+    var col = th.play_paused if paused else th.play_mode
+    var bh = Float32(22.0)
+    studio.ui_ctx.draw_list.add_rect(vp.x, vp.y, vp.w, bh, col)
+    var msg = String("PAUSED") if paused else String("PLAYING")
+    msg += "  -  changes made during Play are discarded on Stop (Shift+F5)"
+    studio.ui_ctx._draw_text(msg, vp.x + Float32(10.0), vp.y + Float32(4.0), Float32(13.0), th.text_on_accent)
+
+
+def _emit_status_bar(mut studio: FlintStudioState, sw: Float32, sh: Float32):
+    """Bottom status bar: scene + dirty state, mode, selection, tool, and the latest message
+    (click it to open the console)."""
+    var th = studio.studio_theme.copy()
+    var y = sh - STUDIO_STATUS_BAR_H
+    studio.ui_ctx.draw_list.add_rect(Float32(0.0), y, sw, STUDIO_STATUS_BAR_H, th.l1_shell, 0.0, 1.0, th.border_subtle)
+    var fs = Float32(12.0)
+    var ty = y + Float32(4.0)
+    var left = _scene_display_name(studio.scene_file_path)
+    if studio.dirty:
+        left += "  *unsaved"
+    var mode = String("Editing")
+    if studio.pie.mode == PIE_PLAYING:
+        mode = "Playing"
+    elif studio.pie.mode == PIE_PAUSED:
+        mode = "Paused"
+    var tool = String("Move")
+    if studio.gizmo_mode == GIZMO_MODE_ROTATE:
+        tool = "Rotate"
+    elif studio.gizmo_mode == GIZMO_MODE_SCALE:
+        tool = "Scale"
+    elif studio.gizmo_mode == GIZMO_MODE_SELECT:
+        tool = "Select"
+    var mid = mode + "   |   " + String(studio.selected_count()) + " selected   |   " + tool
+    mid += " (" + ("Local" if studio.gizmo_local_space else "World") + ")"
+    if studio.snap_enabled:
+        mid += "   |   Snap " + String(studio.grid_snap_m) + " m"
+    var x = Float32(10.0)
+    studio.ui_ctx._draw_text(left, x, ty, fs, th.text_primary if studio.dirty else th.text_secondary)
+    x += studio.ui_ctx._measure_text(left, fs) + Float32(24.0)
+    studio.ui_ctx._draw_text(mid, x, ty, fs, th.text_secondary)
+    x += studio.ui_ctx._measure_text(mid, fs) + Float32(24.0)
+    var last = String("Console (F1 for shortcuts)")
+    var last_col = th.text_muted
+    if len(studio.console_log) > 0:
+        last = studio.console_log[len(studio.console_log) - 1]
+        if last.startswith("[error]"):
+            last_col = th.status_danger
+        elif last.startswith("[warn]"):
+            last_col = th.status_warn
+    var lw = studio.ui_ctx._measure_text(last, fs)
+    var lx = max(x, sw - lw - Float32(12.0))
+    studio.ui_ctx._draw_text(last, lx, ty, fs, last_col)
+    var blocked = studio.ui_ctx.modal_depth > 0 or studio.ui_ctx.had_modal_prev_frame or studio.confirm_modal_open
+    if (
+        not blocked
+        and studio.ui_ctx.mouse_pressed_l
+        and studio.ui_ctx.mouse_y >= y
+        and studio.ui_ctx.mouse_x >= lx - Float32(6.0)
+    ):
+        studio.console_open = True
+
+
+def _emit_studio_modals(mut studio: FlintStudioState):
+    """File (Open / Save As), Console, Keyboard shortcuts and first-run Welcome dialogs."""
+    if studio.file_modal_open and not studio.confirm_modal_open:
+        var title = String("Save Scene As") if studio.file_modal_save_as else String("Open Scene")
+        if studio.ui_ctx.begin_modal("file_modal", title, Float32(520.0), Float32(330.0), studio.file_modal_open):
+            studio.ui_ctx.label("Scene path (relative to the project, or absolute):", studio.studio_theme.text_secondary)
+            var path_buf = studio.file_modal_path
+            _ = studio.ui_ctx.text_input("file_modal_path", path_buf, Float32(488.0), "scenes/level.flscnb")
+            studio.file_modal_path = path_buf
+            if len(studio.recent_scenes) > 0:
+                studio.ui_ctx.label("Recent:", studio.studio_theme.text_muted)
+                var pick = -1
+                for i in range(min(6, len(studio.recent_scenes))):
+                    if studio.ui_ctx.button("recent_" + String(i), studio.recent_scenes[i], 488.0, 22.0):
+                        pick = i
+                if pick >= 0:
+                    studio.file_modal_path = studio.recent_scenes[pick]
+            studio.ui_ctx.begin_box("file_modal_btns", FlexStyle.row(gap=8.0, pad=2.0))
+            var go = studio.ui_ctx.button("file_modal_ok", "Save" if studio.file_modal_save_as else "Open", 96.0, 26.0)
+            if go or studio.ui_ctx.key_enter_pressed:
+                _ = studio.submit_file_modal()
+            if studio.ui_ctx.button("file_modal_cancel", "Cancel", 86.0, 26.0):
+                studio.file_modal_open = False
+            studio.ui_ctx.end_box()
+            studio.ui_ctx.end_modal()
+
+    if studio.console_open:
+        if studio.ui_ctx.begin_modal("console_modal", "Console", Float32(640.0), Float32(380.0), studio.console_open):
+            var n = len(studio.console_log)
+            var row_h = studio.ui_ctx.theme.row_height
+            studio.ui_ctx.begin_scroll_view("console_scroll", Float32(608.0), Float32(280.0), row_h * Float32(max(1, n)))
+            if n == 0:
+                studio.ui_ctx.label("No messages yet.", studio.studio_theme.text_muted)
+            var i = n - 1
+            while i >= 0:  # newest first
+                var line = studio.console_log[i]
+                var col = studio.studio_theme.text_primary
+                if line.startswith("[error]"):
+                    col = studio.studio_theme.status_danger
+                elif line.startswith("[warn]"):
+                    col = studio.studio_theme.status_warn
+                studio.ui_ctx.label(line, col)
+                i -= 1
+            studio.ui_ctx.end_scroll_view()
+            studio.ui_ctx.begin_box("console_btns", FlexStyle.row(gap=8.0, pad=2.0))
+            if studio.ui_ctx.button("console_clear", "Clear", 86.0, 26.0):
+                studio.console_log.clear()
+            if studio.ui_ctx.button("console_close", "Close", 86.0, 26.0):
+                studio.console_open = False
+            studio.ui_ctx.end_box()
+            studio.ui_ctx.end_modal()
+
+    if studio.help_open or studio.welcome_open:
+        var welcome = studio.welcome_open and not studio.help_open
+        var open_flag = True
+        var title = String("Welcome to Flint Studio") if welcome else String("Keyboard Shortcuts")
+        if studio.ui_ctx.begin_modal("help_modal", title, Float32(560.0), Float32(470.0), open_flag):
+            var mc = studio.studio_theme.text_muted
+            if welcome:
+                studio.ui_ctx.label("Build a scene, press F5 to play it, Shift+F5 to stop.")
+                studio.ui_ctx.label("Ctrl+K opens the command palette: every command is there.", mc)
+            var lines = List[String]()
+            lines.append("Q / W / E / R      Select / Move / Rotate / Scale tool")
+            lines.append("X                  Local / World gizmo space")
+            lines.append("G                  Grid snap on/off")
+            lines.append("F                  Frame selection")
+            lines.append("Esc / right-click  Cancel a gizmo drag (Esc alone clears the selection)")
+            lines.append("Click / drag       Select / marquee (Shift adds, Ctrl toggles)")
+            lines.append("Arrows             Nudge selection over the viewport, else orbit; walk the Hierarchy")
+            lines.append("Wheel / MMB drag   Dolly / pan     Alt+LMB orbit     RMB+WASDQE fly")
+            lines.append("Ctrl+Z / Ctrl+Y    Undo / Redo")
+            lines.append("Ctrl+D  Ctrl+C  Ctrl+V  Del   Duplicate  Copy  Paste  Delete")
+            lines.append("Ctrl+A / F2        Select all / Rename")
+            lines.append("Ctrl+S  Ctrl+Shift+S  Ctrl+O  Ctrl+N   Save / Save As / Open / New")
+            lines.append("F5 / F6 / F7 / Shift+F5   Play / Pause / Step / Stop")
+            lines.append("Ctrl+B             Reload gameplay .so")
+            lines.append("Ctrl+K             Command palette        F1  This list      F8  Source editor")
+            for i in range(len(lines)):
+                studio.ui_ctx.label(lines[i], mc if (welcome and i > 6) else studio.studio_theme.text_secondary)
+            if studio.ui_ctx.button("help_close", "Got it" if welcome else "Close", 96.0, 26.0):
+                open_flag = False
+            studio.ui_ctx.end_modal()
+        if not open_flag:
+            if welcome:
+                studio.dismiss_welcome()
+            studio.help_open = False
+            studio.welcome_open = False
 
 
 def emit_studio_ui_draw_list(
@@ -9701,7 +12066,7 @@ def emit_studio_ui_draw_list(
         studio.ui_ctx.font = font.copy()
     studio.ui_ctx.font_slot = font_slot
     studio.ui_ctx.dock_style_v2 = True
-    studio.ui_ctx.set_studio_theme(studio.studio_theme.copy())
+    studio.ui_ctx.set_studio_theme(studio.studio_theme)
     studio.ui_ctx.set_anim_mode(studio.anim_mode)
     studio.ui_ctx.theme.font_size = studio.studio_theme.font_body
     studio.ui_ctx.theme.row_height = Float32(24.0)
@@ -9713,8 +12078,12 @@ def emit_studio_ui_draw_list(
         scaled_input.delta_x = input.delta_x / ui_sc
         scaled_input.delta_y = input.delta_y / ui_sc
     studio.ui_ctx.begin_frame(scaled_input, sw, sh, dt, studio.input_map)
+    # The command palette is drawn last but is modal: panels drawn before it must not react to the
+    # pointer under its scrim (it reads the mouse directly, so it is unaffected).
+    studio.ui_ctx.pointer_blocked = studio.command_palette.is_open
     if studio.ui_ctx.mouse_pressed_l or studio.ui_ctx.mouse_released_l:
         studio.ui_edit_seq += 1
+        studio._edit_focus_id = UInt64(0)  # a click ends any typing interaction
     if studio.input_rebind_active:
         if input.key_pressed(UI_KEY_ESCAPE):
             studio.cancel_input_rebind()
@@ -9764,11 +12133,11 @@ def emit_studio_ui_draw_list(
     )
     var show_win_ctrls = False
     var win_is_max = False
-    if studio.anim_mode != UI_ANIM_INSTANT:
-        var wc_opt = studio.app.resources.get_ptr[WindowStateResource]()
-        if wc_opt and wc_opt.value()[unsafe_offset=0].initialized and len(wc_opt.value()[unsafe_offset=0].windows) > 0:
-            show_win_ctrls = wc_opt.value()[unsafe_offset=0].windows[0].uses_client_decorations()
-            win_is_max = wc_opt.value()[unsafe_offset=0].windows[0].maximized
+    # Window controls depend only on client-side decorations, not on the reduced-motion setting.
+    var wc_opt = studio.app.resources.get_ptr[WindowStateResource]()
+    if wc_opt and wc_opt.value()[unsafe_offset=0].initialized and len(wc_opt.value()[unsafe_offset=0].windows) > 0:
+        show_win_ctrls = wc_opt.value()[unsafe_offset=0].windows[0].uses_client_decorations()
+        win_is_max = wc_opt.value()[unsafe_offset=0].windows[0].maximized
     var hdr_act = studio.header_bar.draw(
         studio.ui_ctx.draw_list,
         font_slot,
@@ -9827,7 +12196,7 @@ def emit_studio_ui_draw_list(
         Float32(0.0),
         STUDIO_HEADER_BAR_H,
         sw,
-        max(Float32(64.0), sh - STUDIO_HEADER_BAR_H),
+        max(Float32(64.0), sh - STUDIO_HEADER_BAR_H - STUDIO_STATUS_BAR_H),
     )
     studio.ui_ctx.update_dock_space(studio.dock, dock_rect)
 
@@ -9837,65 +12206,72 @@ def emit_studio_ui_draw_list(
         if vp_info[0] >= 0
         else RectF(Float32(240.0), STUDIO_HEADER_BAR_H + Float32(12.0), sw - Float32(520.0), sh - Float32(190.0))
     )
+    # The scene renders over the whole window; `vp` is only the clip/input hole (see `viewport_transform`).
+    var vxf = ViewportTransform.from_logical(vp, sw, sh, ui_sc)
 
     # 2. 3D Viewport Active Selection Gizmo + Visual Agent Theatre HUD + Floating ViewportHud
     var show_edit_gizmo = (studio.pie.mode != PIE_PLAYING) or studio.pie_camera_ejected
     var giz_piv = studio.selection_gizmo_pivot()
-    if studio.active_gizmo_handle == GIZMO_AXIS_NONE:
+    if studio.active_gizmo_handle == GIZMO_AXIS_NONE and not studio.gz_dragging:
         studio.gizmo_drag_delta_text = String("")
     studio.hovered_gizmo_handle = GIZMO_AXIS_NONE
-    if show_edit_gizmo and giz_piv[0]:
-        var giz_rot = studio.selection_gizmo_rotation()
-        if (not overlay_blocked) and vp.contains(studio.ui_ctx.mouse_x, studio.ui_ctx.mouse_y) and not studio.viewport_hud.contains_point(studio.ui_ctx.mouse_x, studio.ui_ctx.mouse_y):
-            studio.hovered_gizmo_handle = pick_gizmo_handle(
-                studio.ui_ctx.mouse_x,
-                studio.ui_ctx.mouse_y,
-                giz_piv[1],
-                studio.gizmo_mode,
-                vp.x,
-                vp.y,
-                vp.w,
-                vp.h,
-                studio.cam_pos,
-                studio.cam_fwd,
-                studio.cam_right,
-                studio.cam_up,
-                studio.fov_y_deg,
-                gizmo_rot=giz_rot,
-            )
-        studio.ui_ctx.draw_list.push_clip(Int(vp.x), Int(vp.y), Int(vp.right()), Int(vp.bottom()))
+    if show_edit_gizmo and giz_piv[0] and studio.gizmo_mode != GIZMO_MODE_SELECT:
+        # Hover highlight: the same physical-pixel pick `gizmo_try_begin` uses for the press.
+        if (
+            (not overlay_blocked)
+            and (not studio.gz_dragging)
+            and vp.contains(studio.ui_ctx.mouse_x, studio.ui_ctx.mouse_y)
+            and not studio.viewport_hud.contains_point(studio.ui_ctx.mouse_x, studio.ui_ctx.mouse_y)
+        ):
+            studio.hovered_gizmo_handle = studio.gizmo_pick(studio.ui_ctx.mouse_x * ui_sc, studio.ui_ctx.mouse_y * ui_sc)
+        # `ui` is in physical pixels (only `ui_ctx.draw_list` is scaled later), so emit the gizmo
+        # in physical space with a scaled target size; `main.mojo` picks with the same numbers.
+        var gvx = vp.x * ui_sc
+        var gvy = vp.y * ui_sc
+        var gvw = vp.w * ui_sc
+        var gvh = vp.h * ui_sc
+        ui.push_clip(Int(gvx), Int(gvy), Int(gvx + gvw), Int(gvy + gvh))
         emit_gizmo_draw_list(
-            studio.ui_ctx.draw_list,
+            ui,
             giz_piv[1],
             studio.gizmo_mode,
             studio.active_gizmo_handle,
-            vp.x,
-            vp.y,
-            vp.w,
-            vp.h,
+            Float32(0.0),
+            Float32(0.0),
+            vxf.proj_phys_w(),
+            vxf.proj_phys_h(),
             studio.cam_pos,
             studio.cam_fwd,
             studio.cam_right,
             studio.cam_up,
             studio.fov_y_deg,
-            gizmo_rot=giz_rot,
+            target_px=GIZMO_TARGET_PX * ui_sc,
+            gizmo_rot=studio.selection_gizmo_rotation(),
             hovered_handle=studio.hovered_gizmo_handle,
             axis_x_color=studio.studio_theme.axis_x,
             axis_y_color=studio.studio_theme.axis_y,
             axis_z_color=studio.studio_theme.axis_z,
             active_color=studio.studio_theme.play_paused,
+            drag_angle_rad=studio.gz_angle if studio.gz_dragging else Float32(0.0),
+            px_scale=ui_sc,
         )
-        studio.ui_ctx.draw_list.pop_clip()
+        ui.pop_clip()
+
+    # Marquee selection rectangle (physical pixels, clipped to the scene panel).
+    if studio.marquee_active:
+        var mq_x = min(studio.marquee_x0, studio.marquee_x1)
+        var mq_y = min(studio.marquee_y0, studio.marquee_y1)
+        var mq_w = abs(studio.marquee_x1 - studio.marquee_x0)
+        var mq_h = abs(studio.marquee_y1 - studio.marquee_y0)
+        var pclip = studio.viewport_xf.panel_phys()
+        ui.push_clip(Int(pclip.x), Int(pclip.y), Int(pclip.x + pclip.w), Int(pclip.y + pclip.h))
+        ui.add_rect(mq_x, mq_y, mq_w, mq_h, UInt32(0x22428BF5), Float32(0.0), Float32(1.5), UInt32(0xCC428BF5))
+        ui.pop_clip()
 
     # Visual Agent Theatre 2D Viewport Overlays (presence pills, Bezier flow beams, PRIM_ARC reticles, inline [✓]/[✗])
     studio._last_theatre_hits.clear()
     if studio.agent_bus.has_active_visuals() and vp.w > Float32(40.0) and vp.h > Float32(40.0):
-        var fov_rad = studio.fov_y_deg * (PI / Float32(180.0))
-        var view_m = make_rh_look_at(studio.cam_pos, studio.cam_pos + studio.cam_fwd, Vec3(0.0, 1.0, 0.0))
-        var proj_m = make_rh_reverse_z_perspective(
-            fov_rad, vp.w / max(Float32(1.0), vp.h), studio.near_z, Float32(1000.0)
-        )
-        var vp_mat = proj_m.multiply(view_m)
+        var vp_mat = vxf.hud_view_proj(studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg, studio.near_z, Float32(1000.0))
         _ = emit_agent_viewport_hud_overlays_with_font(
             studio.agent_bus,
             studio.ui_ctx.draw_list,
@@ -9971,7 +12347,11 @@ def emit_studio_ui_draw_list(
     var vhud_tool = (
         VHUD_TOOL_ROTATE
         if studio.gizmo_mode == GIZMO_MODE_ROTATE
-        else (VHUD_TOOL_SCALE if studio.gizmo_mode == GIZMO_MODE_SCALE else (VHUD_TOOL_SELECT if studio.gizmo_mode == GIZMO_MODE_SELECT else VHUD_TOOL_MOVE))
+        else (
+            VHUD_TOOL_SCALE
+            if studio.gizmo_mode == GIZMO_MODE_SCALE
+            else (VHUD_TOOL_SELECT if studio.gizmo_mode == GIZMO_MODE_SELECT else VHUD_TOOL_MOVE)
+        )
     )
     var vhud_act = studio.viewport_hud.draw(
         studio.ui_ctx.draw_list,
@@ -10042,7 +12422,7 @@ def emit_studio_ui_draw_list(
     elif vhud_act.kind == VHUD_ACT_SNAP_VIEW:
         studio._snap_camera_direction(vhud_act.snap_dir)
     elif vhud_act.kind == VHUD_ACT_TOGGLE_ORTHO:
-        studio.cam_ortho = not studio.cam_ortho
+        studio.toggle_ortho_camera()
 
     # Optional Gameplay HUD overlay (`WORKSPACE_PLAY` / `--gallery 06_play_hud`) inside SceneViewport
     if studio.gallery_play_hud_active and vp.w >= Float32(180.0) and vp.h >= Float32(130.0):
@@ -10055,8 +12435,8 @@ def emit_studio_ui_draw_list(
         var tgt_eid = -1
         if d_low.endswith(".flmat") or d_low.endswith(".flrig") or d_low.endswith(".flanim"):
             if vp.w > Float32(1.0) and vp.h > Float32(1.0) and vp.contains(studio.ui_ctx.mouse_x, studio.ui_ctx.mouse_y):
-                var ray = ViewportRay.from_screen(
-                    studio.ui_ctx.mouse_x, studio.ui_ctx.mouse_y, vp.x, vp.y, vp.w, vp.h,
+                var ray = vxf.ray_logical(
+                    studio.ui_ctx.mouse_x, studio.ui_ctx.mouse_y,
                     studio.cam_pos, studio.cam_fwd, studio.cam_right, studio.cam_up, studio.fov_y_deg,
                 )
                 var hit = studio.raycast_scene(ray.origin, ray.dir, Float32(250.0))
@@ -10069,16 +12449,23 @@ def emit_studio_ui_draw_list(
     # 3. Left Scene Hierarchy Outliner (`DockSpace` -> `"Hierarchy"`, Obsidian v2 Outliner + Agent Badges)
     if studio.ui_ctx.begin_dock_panel(studio.dock, "Hierarchy"):
         var h_info = studio.dock.find_panel("Hierarchy")
-        var query = FlintStudioState._ascii_lower(String(studio.outliner_state.search_query.strip()))
-        var rows = studio.hierarchy_visible_rows(include_collapsed=query.byte_length() > 0)
+        # Search covers collapsed branches, and range-select (Shift+click) walks the filtered rows the
+        # user sees, not the whole tree.
+        var rows = studio.outliner_rows()
         var disp_order = List[Int](capacity=len(rows))
-        var out_rows = List[OutlinerRowView](capacity=len(rows))
         for ri in range(len(rows)):
+            disp_order.append(rows[ri].entity_id)
+        # Build row views only for the rows on screen, with an O(1) selection lookup.
+        var win = outliner_row_window(h_info[3], len(rows), studio.outliner_state, studio.ui_ctx.mouse_wheel)
+        var sel_lookup = Dict[Int, Bool]()
+        for si in range(len(studio.selected_entity_ids)):
+            sel_lookup[studio.selected_entity_ids[si]] = True
+        var sel_fallback = studio.selected_entity_id if len(studio.selected_entity_ids) == 0 else -1
+        var out_rows = List[OutlinerRowView](capacity=win[1] - win[0])
+        for ri in range(win[0], win[1]):
             var row = rows[ri]
             var eid = row.entity_id
             var ename = studio.entities[eid].name if eid < len(studio.entities) else ("Entity_" + String(eid))
-            if query.byte_length() == 0 or FlintStudioState._ascii_lower(ename).find(query) >= 0:
-                disp_order.append(eid)
             var v_row = OutlinerRowView(eid, ename)
             v_row.parent_id = studio.parent_of(eid)
             v_row.depth = row.depth
@@ -10091,10 +12478,10 @@ def emit_studio_ui_draw_list(
                         ch_cnt += 1
                 v_row.child_count = ch_cnt
             v_row.is_expanded = row.expanded
-            v_row.is_selected = studio.is_selected(eid)
+            v_row.is_selected = eid >= 0 and (eid in sel_lookup or eid == sel_fallback)
             v_row.is_primary = studio.selected_entity_id == eid
             v_row.visible = studio.entities[eid].visible if eid < len(studio.entities) else True
-            v_row.locked = studio.entity_locked.get(eid, False)
+            v_row.locked = studio.is_entity_locked(eid)
             out_rows.append(v_row^)
 
         var sel_has_parent = False
@@ -10117,6 +12504,8 @@ def emit_studio_ui_draw_list(
             sel_has_parent,
             studio.agent_bus,
             studio.outliner_state,
+            row_base=win[0],
+            total_rows=len(rows),
         )
         if out_act.unparent_selected:
             _ = studio.reparent_selected_to(-1, preserve_world_transform=True, record_undo=True)
@@ -10127,12 +12516,11 @@ def emit_studio_ui_draw_list(
         if out_act.toggle_visible_entity_id >= 0 and studio.is_alive_id(out_act.toggle_visible_entity_id):
             var vid = out_act.toggle_visible_entity_id
             var vc = studio.entities[vid].copy()
-            vc.visible = not vc.visible
-            vc.enabled = vc.visible
+            vc.visible = not vc.visible  # editor visibility only: it no longer disables gameplay logic
             _ = studio.commit_node_edit(vid, vc^, "Toggle Visibility")
         if out_act.toggle_lock_entity_id >= 0:
             var lid = out_act.toggle_lock_entity_id
-            studio.entity_locked[lid] = not studio.entity_locked.get(lid, False)
+            _ = studio.set_entity_locked(lid, not studio.is_entity_locked(lid))
         if out_act.select_entity_id >= 0:
             studio.select_entity(
                 out_act.select_entity_id,
@@ -10202,30 +12590,26 @@ def emit_studio_ui_draw_list(
                 var b_card = _begin_insp_card_body(studio.ui_ctx, b_hdr, studio.studio_theme)
                 var bw = b_card[2]
                 if studio.ui_ctx.drag_float3_v2("bulk_delta", "Move Delta", bulk_delta, speed=0.05, w=bw, align_property_column=True):
-                    if not studio.ui_ctx.mouse_down_l:
-                        studio.ui_edit_seq += 1
+                    studio.begin_edit_interaction()
                     _ = studio.bulk_translate_selected(bulk_delta, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_delta"))
 
                 var b_col = pri_view.base_color
                 if studio.ui_ctx.color_edit3("bulk_col", "Albedo", b_col, min_val=0.0, max_val=1.0, w=bw, leading_label=True):
-                    if not studio.ui_ctx.mouse_down_l:
-                        studio.ui_edit_seq += 1
+                    studio.begin_edit_interaction()
                     var f_col = InspectedField("base_color", FIELD_COLOR_RGB)
                     f_col.v3_val = b_col
                     _ = studio.bulk_patch_field("base_color", f_col, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_col"))
 
                 var b_rgh = pri_view.roughness
                 if studio.ui_ctx.slider_float_v2("bulk_rgh", "Roughness", b_rgh, Float32(0.04), Float32(1.0), w=bw):
-                    if not studio.ui_ctx.mouse_down_l:
-                        studio.ui_edit_seq += 1
+                    studio.begin_edit_interaction()
                     var f_rgh = InspectedField("roughness", FIELD_F32)
                     f_rgh.f_val = b_rgh
                     _ = studio.bulk_patch_field("roughness", f_rgh, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_rgh"))
 
                 var b_met = pri_view.metallic
                 if studio.ui_ctx.slider_float_v2("bulk_met", "Metallic", b_met, Float32(0.0), Float32(1.0), w=bw):
-                    if not studio.ui_ctx.mouse_down_l:
-                        studio.ui_edit_seq += 1
+                    studio.begin_edit_interaction()
                     var f_met = InspectedField("metallic", FIELD_F32)
                     f_met.f_val = b_met
                     _ = studio.bulk_patch_field("metallic", f_met, coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "bulk_met"))
@@ -10279,6 +12663,9 @@ def emit_studio_ui_draw_list(
             draw_inspector_identity(studio.ui_ctx, studio._classify_entity_kind(eid), eid, parent_label, hdr_inner_w)
             var body_font = studio.ui_ctx.theme.font_size
             studio.ui_ctx.theme.font_size = studio.studio_theme.font_title
+            if studio.rename_focus_requested:
+                studio.rename_focus_requested = False
+                studio.ui_ctx.focused_id = studio.ui_ctx.widget_id("insp_name")
             if studio.ui_ctx.text_input("insp_name", cur.name, hdr_inner_w, "Entity name"):
                 changed = True
             studio.ui_ctx.theme.font_size = body_font
@@ -10292,8 +12679,7 @@ def emit_studio_ui_draw_list(
             var frame_w = hdr_inner_w if stack_actions else min(Float32(76), hdr_inner_w * 0.34)
             var toggle_w = hdr_inner_w if stack_actions else hdr_inner_w - frame_w - 4
             if studio.ui_ctx.toggle_switch("ent_enabled", "Enabled", cur.enabled, w=toggle_w, fit_label=True):
-                cur.visible = cur.enabled
-                changed = True
+                changed = True  # Enabled and Visible are independent switches
             if studio.ui_ctx.button_v2("insp_frame_entity", "Frame", BTN_SECONDARY, ICON_FOCUS_CAM, frame_w, 24.0):
                 studio.frame_selection()
             studio.ui_ctx.end_box()
@@ -10405,6 +12791,9 @@ def emit_studio_ui_draw_list(
                             if mr_sh_m:
                                 mr_sh_m.value()[unsafe_offset=0].cast_shadows = cast_sh
                             _ = studio.commit_ecs_edit(eid, "Toggle Cast Shadows", before_sh^)
+                # Visible is independent of Enabled (a hidden entity still simulates).
+                if studio.ui_ctx.toggle_switch("ent_vis", "Visible", cur.visible, w=cw):
+                    changed = True
                 if _draw_insp_sub_disclosure(studio.ui_ctx, "insp_surface_detail", "Advanced surface", cw, studio.studio_theme, default_open=False):
                     var sub_w = max(Float32(60.0), cw - Float32(16.0))
                     if studio.ui_ctx.slider_float_v2("mat_alpha_cut", "Alpha Cutoff", cur.alpha_cutoff, Float32(0.0), Float32(1.0), w=sub_w):
@@ -10510,8 +12899,7 @@ def emit_studio_ui_draw_list(
                 studio.ui_ctx.box_stack[len(studio.ui_ctx.box_stack) - 1].cursor_y += Float32(4.0)
 
             if changed:
-                if not studio.ui_ctx.mouse_down_l:
-                    studio.ui_edit_seq += 1
+                studio.begin_edit_interaction()
                 _ = studio.commit_node_edit(eid, cur^, "Inspector UI Edit", coalesce_key=_ui_coalesce_key(studio.ui_edit_seq, "insp_main"))
                 cur = studio.entities[eid].copy()
 
@@ -10553,15 +12941,25 @@ def emit_studio_ui_draw_list(
 
                         if not act_mat_ref.is_empty():
                             var mat_disk = studio._resolve_asset_disk_path(act_mat_ref.rel_path)
+                            if studio.flmat_pending_path.byte_length() > 0 and (
+                                studio.flmat_pending_path != mat_disk or studio.flmat_pending_eid != eid
+                            ):
+                                _ = studio.commit_pending_flmat_edit()  # selection moved on mid-edit
                             var flm_loaded = False
                             var flm = FlmatAsset()
-                            try:
-                                flm = load_flmat_file(mat_disk)
+                            if studio.flmat_pending_path == mat_disk:
+                                flm = studio.flmat_pending.copy()
                                 flm_loaded = True
-                            except:
-                                pass
+                                studio.flmat_pending_touch_sec = studio.ui_time_sec
+                            else:
+                                try:
+                                    flm = load_flmat_file(mat_disk)
+                                    flm_loaded = True
+                                except:
+                                    pass
                             if flm_loaded:
                                 var flm_dirty = False
+                                var flm_text_dirty = False
                                 var sh_items = List[String]()
                                 sh_items.append("PBR")
                                 sh_items.append("NPR Cel")
@@ -10574,7 +12972,7 @@ def emit_studio_ui_draw_list(
                                 var alb_s = flm.albedo_tex.rel_path
                                 if studio.ui_ctx.text_input("flmat_alb_tex", alb_s, mr_card[2], "albedo_tex (.png/.jpg)"):
                                     flm.albedo_tex = studio._authored_asset_ref(alb_s, ASSET_KIND_TEXTURE) if alb_s.byte_length() > 0 else AssetRef()
-                                    flm_dirty = True
+                                    flm_text_dirty = True
                                 var d_alb = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
                                 if d_alb[0]:
                                     var dl = FlintStudioState._ascii_lower(d_alb[2])
@@ -10585,7 +12983,7 @@ def emit_studio_ui_draw_list(
                                 var nrm_s = flm.normal_tex.rel_path
                                 if studio.ui_ctx.text_input("flmat_nrm_tex", nrm_s, mr_card[2], "normal_tex (.png/.jpg)"):
                                     flm.normal_tex = studio._authored_asset_ref(nrm_s, ASSET_KIND_TEXTURE) if nrm_s.byte_length() > 0 else AssetRef()
-                                    flm_dirty = True
+                                    flm_text_dirty = True
                                 var d_nrm = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
                                 if d_nrm[0]:
                                     var dl = FlintStudioState._ascii_lower(d_nrm[2])
@@ -10596,7 +12994,7 @@ def emit_studio_ui_draw_list(
                                 var orm_s = flm.orm_tex.rel_path
                                 if studio.ui_ctx.text_input("flmat_orm_tex", orm_s, mr_card[2], "orm_tex (.png/.jpg)"):
                                     flm.orm_tex = studio._authored_asset_ref(orm_s, ASSET_KIND_TEXTURE) if orm_s.byte_length() > 0 else AssetRef()
-                                    flm_dirty = True
+                                    flm_text_dirty = True
                                 var d_orm = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
                                 if d_orm[0]:
                                     var dl = FlintStudioState._ascii_lower(d_orm[2])
@@ -10607,7 +13005,7 @@ def emit_studio_ui_draw_list(
                                 var emi_s = flm.emissive_tex.rel_path
                                 if studio.ui_ctx.text_input("flmat_emi_tex", emi_s, mr_card[2], "emissive_tex (.png/.jpg)"):
                                     flm.emissive_tex = studio._authored_asset_ref(emi_s, ASSET_KIND_TEXTURE) if emi_s.byte_length() > 0 else AssetRef()
-                                    flm_dirty = True
+                                    flm_text_dirty = True
                                 var d_emi = studio.ui_ctx.accept_drag_target("ASSET_ENTRY")
                                 if d_emi[0]:
                                     var dl = FlintStudioState._ascii_lower(d_emi[2])
@@ -10615,9 +13013,30 @@ def emit_studio_ui_draw_list(
                                         flm.emissive_tex = studio._authored_asset_ref(studio._project_rel_for_entry(d_emi[2]), ASSET_KIND_TEXTURE)
                                         flm_dirty = True
 
-                                if flm_dirty:
-                                    _ = save_flmat_file(mat_disk, flm)
-                                    _ = studio._assign_flmat_to_entity(eid, act_mat_ref.rel_path)
+                                var tex_field_focused = False
+                                var tex_field_ids = List[String]()
+                                tex_field_ids.append("flmat_alb_tex")
+                                tex_field_ids.append("flmat_nrm_tex")
+                                tex_field_ids.append("flmat_orm_tex")
+                                tex_field_ids.append("flmat_emi_tex")
+                                for fi in range(len(tex_field_ids)):
+                                    if studio.ui_ctx.focused_id == studio.ui_ctx.widget_id(tex_field_ids[fi]):
+                                        tex_field_focused = True
+                                if flm_text_dirty or (flm_dirty and studio.flmat_pending_path == mat_disk):
+                                    if studio.flmat_pending_path != mat_disk:
+                                        studio.flmat_pending_stamp = file_stamp(mat_disk)
+                                    studio.flmat_pending = flm.copy()
+                                    studio.flmat_pending_path = mat_disk
+                                    studio.flmat_pending_eid = eid
+                                    studio.flmat_pending_editor_id = studio.editor_id_of(eid)
+                                    studio.flmat_pending_ref = act_mat_ref.rel_path
+                                    studio.flmat_pending_touch_sec = studio.ui_time_sec
+                                if flm_dirty or (studio.flmat_pending_path == mat_disk and not tex_field_focused):
+                                    if studio.flmat_pending_path == mat_disk:
+                                        _ = studio.commit_pending_flmat_edit()
+                                    else:
+                                        _ = save_flmat_file(mat_disk, flm)
+                                        _ = studio._assign_flmat_to_entity(eid, act_mat_ref.rel_path)
                         _ = studio.ui_ctx.id_stack.pop()
                         _end_insp_card_body(studio.ui_ctx, mr_card[0], mr_card[1], Float32(6.0))
                     else:
@@ -11025,8 +13444,7 @@ def emit_studio_ui_draw_list(
                                         var hi_f = f.max_val if f.max_val > f.min_val else Float32(1.0e6)
                                         var sp_f = f.step if f.step > Float32(0.0) else Float32(0.05)
                                         if studio.ui_ctx.drag_float(fid, f.name, fv, speed=sp_f, min_val=lo_f, max_val=hi_f, w=insp_w):
-                                            if not studio.ui_ctx.mouse_down_l:
-                                                studio.ui_edit_seq += 1
+                                            studio.begin_edit_interaction()
                                             var before_blob = studio._capture_world_blob()
                                             var mptr = studio.app.world.get_raw_ptr_mut(sel_e, tid)
                                             if mptr != 0:
@@ -11043,8 +13461,7 @@ def emit_studio_ui_draw_list(
                                         var hi_v = f.max_val if f.max_val > f.min_val else Float32(1.0e6)
                                         var sp_v = f.step if f.step > Float32(0.0) else Float32(0.05)
                                         if studio.ui_ctx.drag_float3(fid, f.name, vv, speed=sp_v, min_val=lo_v, max_val=hi_v, w=insp_w):
-                                            if not studio.ui_ctx.mouse_down_l:
-                                                studio.ui_edit_seq += 1
+                                            studio.begin_edit_interaction()
                                             var before_blob = studio._capture_world_blob()
                                             var mptr = studio.app.world.get_raw_ptr_mut(sel_e, tid)
                                             if mptr != 0:
@@ -11062,8 +13479,7 @@ def emit_studio_ui_draw_list(
                                         var lo_c = f.min_val if f.max_val > f.min_val else Float32(0.0)
                                         var hi_c = f.max_val if f.max_val > f.min_val else Float32(1.0)
                                         if studio.ui_ctx.color_edit3(fid, f.name, cv, min_val=lo_c, max_val=hi_c, w=insp_w):
-                                            if not studio.ui_ctx.mouse_down_l:
-                                                studio.ui_edit_seq += 1
+                                            studio.begin_edit_interaction()
                                             var before_blob = studio._capture_world_blob()
                                             var mptr = studio.app.world.get_raw_ptr_mut(sel_e, tid)
                                             if mptr != 0:
@@ -11081,8 +13497,7 @@ def emit_studio_ui_draw_list(
                                         )
                                         var edeg = _quat_to_euler_deg(qv)
                                         if studio.ui_ctx.drag_float3(fid, f.name, edeg, speed=0.5, min_val=-360.0, max_val=360.0, w=insp_w):
-                                            if not studio.ui_ctx.mouse_down_l:
-                                                studio.ui_edit_seq += 1
+                                            studio.begin_edit_interaction()
                                             var nq = _euler_deg_to_quat(edeg)
                                             var before_blob = studio._capture_world_blob()
                                             var mptr = studio.app.world.get_raw_ptr_mut(sel_e, tid)
@@ -11170,8 +13585,7 @@ def emit_studio_ui_draw_list(
                                             bb_dirty_idx = bbi
                                             bt_dirty = True
                                     if bt_dirty:
-                                        if not studio.ui_ctx.mouse_down_l:
-                                            studio.ui_edit_seq += 1
+                                        studio.begin_edit_interaction()
                                         var before_blob = studio._capture_world_blob()
                                         var bt_m = studio.app.world.get_ptr_mut[BehaviorTreeComponent](sel_e)
                                         if bt_m:
@@ -11199,8 +13613,7 @@ def emit_studio_ui_draw_list(
                                     if studio.ui_ctx.drag_float("insp_pl_rng", "Radius", pl_rng, speed=0.1, min_val=0.1, max_val=500.0, w=insp_w):
                                         pl_dirty = True
                                     if pl_dirty:
-                                        if not studio.ui_ctx.mouse_down_l:
-                                            studio.ui_edit_seq += 1
+                                        studio.begin_edit_interaction()
                                         var before_blob = studio._capture_world_blob()
                                         var pl_m = studio.app.world.get_ptr_mut[PointLightComponent](sel_e)
                                         if pl_m:
@@ -11232,8 +13645,7 @@ def emit_studio_ui_draw_list(
                                     if studio.ui_ctx.drag_float3("insp_sl_dir", "Direction", sl_dir, speed=0.02, min_val=-1.0, max_val=1.0, w=insp_w):
                                         sl_dirty = True
                                     if sl_dirty:
-                                        if not studio.ui_ctx.mouse_down_l:
-                                            studio.ui_edit_seq += 1
+                                        studio.begin_edit_interaction()
                                         var before_blob = studio._capture_world_blob()
                                         var sl_m = studio.app.world.get_ptr_mut[SpotLightComponent](sel_e)
                                         if sl_m:
@@ -11265,8 +13677,7 @@ def emit_studio_ui_draw_list(
                                     if studio.ui_ctx.drag_float("insp_cm_exp", "Exposure", cm_exp, speed=0.02, min_val=0.05, max_val=20.0, w=insp_w):
                                         cm_dirty = True
                                     if cm_dirty:
-                                        if not studio.ui_ctx.mouse_down_l:
-                                            studio.ui_edit_seq += 1
+                                        studio.begin_edit_interaction()
                                         var before_blob = studio._capture_world_blob()
                                         var cm_m = studio.app.world.get_ptr_mut[CameraComponent](sel_e)
                                         if cm_m:
@@ -11300,8 +13711,7 @@ def emit_studio_ui_draw_list(
                                     if studio.ui_ctx.drag_float("insp_env_turb", "Turbidity", ev_turb, speed=0.05, min_val=1.0, max_val=20.0, w=insp_w):
                                         ev_dirty = True
                                     if ev_dirty:
-                                        if not studio.ui_ctx.mouse_down_l:
-                                            studio.ui_edit_seq += 1
+                                        studio.begin_edit_interaction()
                                         var before_blob = studio._capture_world_blob()
                                         var ev_m = studio.app.world.get_ptr_mut[EnvironmentComponent](sel_e)
                                         if ev_m:
@@ -11448,6 +13858,8 @@ def emit_studio_ui_draw_list(
             _ = studio._export_mocap_take(True)
         studio.ui_ctx.end_dock_panel()
 
+    _ = studio.poll_code_build()
+    _ = studio.code_drawer.poll_disk_changes()
     if studio.ui_ctx.begin_dock_panel(studio.dock, "CodeDrawer"):
         var cd_info = studio.dock.find_panel("CodeDrawer")
         var cd_r = cd_info[3]
@@ -11465,7 +13877,9 @@ def emit_studio_ui_draw_list(
             mono_font_slot=studio.ui_ctx.font_mono_slot,
             mono_font=studio.ui_ctx.font_mono,
         )
-        if cd_act.kind == CODE_ACT_BUILD_HOT_RELOAD:
+        if cd_act.kind == CODE_ACT_CLOSE_TAB:
+            studio.code_drawer.close_tab(cd_act.tab_index)
+        elif cd_act.kind == CODE_ACT_BUILD_HOT_RELOAD:
             _ = studio.execute_palette_command(PAL_CMD_BUILD_HOT_RELOAD)
         elif cd_act.kind == CODE_ACT_OPEN_EXTERNAL_IDE:
             studio.source_editor.requested = True
@@ -11482,8 +13896,38 @@ def emit_studio_ui_draw_list(
                 0,
                 2.2,
             )
+        elif cd_act.kind == CODE_ACT_ACCEPT_HUNK or cd_act.kind == CODE_ACT_REJECT_HUNK:
+            # The drawer already recorded the hunk decision. Once no hunk is pending, the proposal is
+            # settled: write exactly the accepted hunks (`materialized_text`) through the approval, or
+            # reject it when every hunk was rejected.
+            var hti = studio.code_drawer.find_tab(cd_act.path)
+            if hti >= 0 and studio.code_drawer.tabs[hti].diff_doc.pending_count() == 0:
+                var merged = studio.code_drawer.tabs[hti].diff_doc.materialized_text()
+                for pi in range(len(studio.agent_bus.pending_approvals)):
+                    if (
+                        not studio.agent_bus.pending_approvals[pi].resolved
+                        and studio.agent_bus.pending_approvals[pi].source == APPROVAL_SRC_ACP_WRITE
+                        and studio.agent_bus.pending_approvals[pi].file_path == cd_act.path
+                    ):
+                        var keep = merged != studio.agent_bus.pending_approvals[pi].old_text
+                        if keep:
+                            studio.agent_bus.pending_approvals[pi].new_text = merged
+                        var ha = AgentPanelAction(PANEL_ACT_APPROVE if keep else PANEL_ACT_REJECT)
+                        ha.approval_id = studio.agent_bus.pending_approvals[pi].approval_id
+                        studio.apply_agent_panel_action(ha)
+                        studio.push_toast(
+                            ("Applied accepted hunks: " if keep else "Rejected all hunks: ") + cd_act.path,
+                            0,
+                            2.2,
+                        )
+                        break
         elif cd_act.kind == CODE_ACT_JUMP_DIAGNOSTIC and cd_act.path.byte_length() > 0:
-            _ = studio.code_drawer.open_file(studio._resolve_asset_disk_path(cd_act.path), cd_act.line)
+            _ = studio.open_code_location(cd_act.path, cd_act.line)
+        elif cd_act.kind == CODE_ACT_SAVE_TAB or cd_act.kind == CODE_ACT_RELOAD_FROM_DISK:
+            if cd_act.message.byte_length() > 0:
+                studio.push_toast(cd_act.message, 2, 3.0)
+            elif cd_act.kind == CODE_ACT_SAVE_TAB:
+                studio.push_toast("Saved " + cd_act.path, 0, 1.6)
         elif cd_act.kind == CODE_ACT_ASK_AGENT_FIX:
             _ = studio.apply_workspace_preset(WORKSPACE_AGENT_STUDIO, sw, sh)
             var a_fix = AgentPanelAction(PANEL_ACT_RUN_PROMPT)
@@ -11700,6 +14144,9 @@ def emit_studio_ui_draw_list(
 
     if studio.asset_browser_state.dialog != 0 and not studio.confirm_modal_open:
         _draw_asset_dialog(studio)
+    _emit_play_banner(studio, vp)
+    _emit_status_bar(studio, sw, sh)
+    _emit_studio_modals(studio)
 
     # Unsaved changes confirmation modal (`Ctrl+Q`, window close, or `File -> New scene`)
     if studio.confirm_modal_open:
@@ -11721,15 +14168,21 @@ def emit_studio_ui_draw_list(
                         studio.quit_requested = True
                     elif act == 2:
                         _ = studio.new_scene(force=True)
+                    elif act == 3:
+                        var pend_path = studio.pending_load_path
+                        _ = studio.request_load_scene(pend_path, force=True)
             if studio.ui_ctx.button_v2("modal_discard", "Discard", BTN_DANGER, -1, 96.0, 26.0):
                 var act = studio.confirm_modal_action
                 studio.confirm_modal_open = False
                 studio.confirm_modal_action = 0
                 if act == 1:
-                    discard_snapshot(studio.project_root, studio.scene_file_path)
+                    studio.discard_autosave()  # Discard means discard: no recovery offer next launch
                     studio.quit_requested = True
                 elif act == 2:
                     _ = studio.new_scene(force=True)
+                elif act == 3:
+                    var pend_path = studio.pending_load_path
+                    _ = studio.request_load_scene(pend_path, force=True)
             if studio.ui_ctx.button_v2("modal_cancel", "Cancel", BTN_GHOST, -1, 86.0, 26.0):
                 studio.confirm_modal_open = False
                 studio.confirm_modal_action = 0
@@ -11739,6 +14192,7 @@ def emit_studio_ui_draw_list(
             studio.confirm_modal_action = 0
 
     studio.ui_ctx.end_frame()
+    studio.publish_text_input_request(ui_sc)
 
     for i in range(len(studio.ui_ctx.draw_list.prims)):
         if (studio.ui_ctx.draw_list.prims[i].header & 0xF) == PRIM_GLYPH and studio.ui_ctx.draw_list.prims[i].param0 < Float32(0.5):

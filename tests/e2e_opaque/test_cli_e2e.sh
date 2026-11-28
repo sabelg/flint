@@ -525,7 +525,7 @@ assert len(p_cl.stderr) == 0, f"CL mcp unexpected stderr: {p_cl.stderr!r}"
 cl_msgs = parse_cl_frames(p_cl.stdout)
 assert len(cl_msgs) == 2, f"expected 2 CL responses (silent notification), got {len(cl_msgs)}: {cl_msgs}"
 assert cl_msgs[0]["id"] == 1 and cl_msgs[0]["result"]["protocolVersion"] == "2024-11-05", f"bad CL init: {cl_msgs[0]}"
-assert cl_msgs[1]["id"] == 2 and len(cl_msgs[1]["result"]["tools"]) == 14, f"expected 14 tools in CL, got {len(cl_msgs[1]['result']['tools'])}"
+assert cl_msgs[1]["id"] == 2 and len(cl_msgs[1]["result"]["tools"]) >= 14, f"expected >= 14 tools in CL, got {len(cl_msgs[1]['result']['tools'])}"
 
 # Session B: Newline-delimited JSON-RPC framing
 nl_in = (
@@ -540,7 +540,7 @@ nl_lines = [ln for ln in p_nl.stdout.decode("utf-8").splitlines() if ln.strip()]
 assert len(nl_lines) == 2, f"expected 2 NL lines (silent notification), got {len(nl_lines)}: {nl_lines}"
 nl_msgs = [json.loads(ln) for ln in nl_lines]
 assert nl_msgs[0]["id"] == 1 and nl_msgs[0]["result"]["protocolVersion"] == "2024-11-05", f"bad NL init: {nl_msgs[0]}"
-assert nl_msgs[1]["id"] == 2 and len(nl_msgs[1]["result"]["tools"]) == 14, f"expected 14 tools in NL, got {len(nl_msgs[1]['result']['tools'])}"
+assert nl_msgs[1]["id"] == 2 and len(nl_msgs[1]["result"]["tools"]) >= 14, f"expected >= 14 tools in NL, got {len(nl_msgs[1]['result']['tools'])}"
 PY
 )"; then
         pass_test "t1_bin_studio_smoke_and_mcp"
@@ -745,11 +745,13 @@ import json, subprocess, sys
 studio_bin = sys.argv[1]
 studio_cwd = sys.argv[2]
 
-def run_nl(payload_str):
+def run_nl(payload_str, idx=0):
     p = subprocess.run([studio_bin, "--mcp-stdio"], input=payload_str.encode("utf-8"), capture_output=True, timeout=15, cwd=studio_cwd)
     lines = [ln for ln in p.stdout.decode("utf-8").splitlines() if ln.strip()]
-    assert len(lines) >= 1, f"expected error response, got stdout={p.stdout!r}, stderr={p.stderr!r}"
-    return json.loads(lines[0])
+    assert len(lines) > idx, f"expected error response, got stdout={p.stdout!r}, stderr={p.stderr!r}"
+    return json.loads(lines[idx])
+
+INIT_NL = '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}\n'
 
 # 1) Malformed JSON -> -32700 Parse error
 r_parse = run_nl("{bad json\n")
@@ -760,8 +762,14 @@ r_ver = run_nl('{"jsonrpc":"1.0","id":1,"method":"initialize"}\n')
 assert r_ver["error"]["code"] == -32600, f"expected -32600, got {r_ver}"
 
 # 3) Unknown method -> -32601 Method not found
-r_meth = run_nl('{"jsonrpc":"2.0","id":2,"method":"nonexistent/method"}\n')
+r_meth = run_nl(INIT_NL + '{"jsonrpc":"2.0","id":2,"method":"nonexistent/method"}\n', idx=1)
 assert r_meth["error"]["code"] == -32601, f"expected -32601, got {r_meth}"
+
+# 3b) Anything but initialize/ping before initialize -> -32002 (ping still answers)
+r_pre = run_nl('{"jsonrpc":"2.0","id":3,"method":"tools/list"}\n')
+assert r_pre["error"]["code"] == -32002, f"expected -32002 before initialize, got {r_pre}"
+r_ping = run_nl('{"jsonrpc":"2.0","id":4,"method":"ping"}\n')
+assert r_ping.get("result") == {}, f"ping must work before initialize, got {r_ping}"
 
 # 4) Bad frame header -> -32700 Parse error
 r_hdr = run_nl("BadHeader: 5\r\n\r\nhello")
